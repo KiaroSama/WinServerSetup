@@ -1,0 +1,2758 @@
+# WinServerSetup.ps1
+# Main provisioning script for Windows / Windows Server after a clean install.
+# Designed to be re-runnable, idempotent, admin-only, and to leave the machine
+# in a known good state at the end (with an optional auto-restart).
+#
+# All CLI text, logs, and inline comments are in English by design.
+
+[CmdletBinding()]
+param(
+    [switch]$Full,
+    [switch]$NoPause,
+    [switch]$NoColor,
+    [switch]$NoReboot,
+    [switch]$NoRelocate
+)
+
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor `
+    [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11
+
+$Global:NoColor    = [bool]$NoColor
+$Global:NoPause    = [bool]$NoPause
+$Global:NoReboot   = [bool]$NoReboot
+$Global:NoRelocate = [bool]$NoRelocate
+$Global:Full       = [bool]$Full
+
+function Get-ProjectRoot {
+    if ($PSScriptRoot) { return $PSScriptRoot }
+    return Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+
+$Global:ProjectRoot      = Get-ProjectRoot
+$Global:ConfigPath       = Join-Path $Global:ProjectRoot "WinServerSetup.config.json"
+$Global:Config           = $null
+$Global:TranscriptStarted= $false
+$Global:LogFile          = $null
+$Global:StructuredLog    = $null
+
+# Summary tracking used by Show-FinalSummary at the end of Full setup.
+$Global:RunStats = [pscustomobject]@{
+    StartedTasks    = New-Object System.Collections.Generic.List[string]
+    CompletedTasks  = New-Object System.Collections.Generic.List[string]
+    FailedTasks     = New-Object System.Collections.Generic.List[string]
+    SkippedTasks    = New-Object System.Collections.Generic.List[string]
+    Warnings        = New-Object System.Collections.Generic.List[string]
+    InstalledApps   = New-Object System.Collections.Generic.List[string]
+    FailedApps      = New-Object System.Collections.Generic.List[string]
+    RebootRequired  = $false
+}
+
+# =============================================================================
+# COLORED TERMINAL OUTPUT
+# =============================================================================
+# All terminal output goes through Write-Themed or a semantic wrapper. The
+# palette can be retuned from $Global:WinServerSetupColors. Color is disabled
+# by any of: -NoColor switch, $env:NO_COLOR, $env:WINSERVERSETUP_NOCOLOR.
+# We use Write-Host -ForegroundColor (ConsoleColor) so transcripts stay clean.
+
+$Global:WinServerSetupColors = @{
+    Success    = 'Green'
+    Error      = 'Red'
+    Warning    = 'Yellow'
+    Info       = 'Cyan'
+    Prompt     = 'Yellow'
+    Title      = 'Cyan'
+    TitleRule  = 'DarkCyan'
+    Section    = 'Magenta'
+    Option     = ''
+    OptionNum  = 'Cyan'
+    Status     = 'DarkCyan'
+    Summary    = 'Magenta'
+    SummaryDim = 'DarkGray'
+}
+
+function Test-ColorSupported {
+    if ($Global:NoColor) { return $false }
+    if (-not [string]::IsNullOrEmpty($env:NO_COLOR)) { return $false }
+    if (-not [string]::IsNullOrEmpty($env:WINSERVERSETUP_NOCOLOR)) { return $false }
+    return $true
+}
+
+function Set-ColorEnabled {
+    param([Parameter(Mandatory)][bool]$Enabled)
+    $Global:NoColor = -not $Enabled
+}
+
+function Write-Themed {
+    param(
+        [Parameter(Mandatory, Position=0)][AllowEmptyString()][string]$Message,
+        [ValidateSet('Success','Error','Warning','Info','Prompt','Title','TitleRule','Section','Option','OptionNum','Status','Summary','SummaryDim','Plain')]
+        [string]$Kind = 'Plain',
+        [switch]$NoNewline
+    )
+    $useColor = (Test-ColorSupported) -and ($Kind -ne 'Plain')
+    $color = $null
+    if ($useColor) {
+        $color = $Global:WinServerSetupColors[$Kind]
+        if ([string]::IsNullOrEmpty($color)) { $useColor = $false }
+    }
+    try {
+        if ($useColor) {
+            Write-Host $Message -ForegroundColor $color -NoNewline:$NoNewline
+        } else {
+            Write-Host $Message -NoNewline:$NoNewline
+        }
+    } catch {
+        Write-Host $Message -NoNewline:$NoNewline
+    }
+}
+
+function Write-Color {
+    param([Parameter(Mandatory)][string]$Message, [string]$Color = "White")
+    if (Test-ColorSupported) {
+        try { Write-Host $Message -ForegroundColor $Color; return } catch { }
+    }
+    Write-Host $Message
+}
+
+# Semantic console helpers (also forward to the structured log when active).
+function Write-Info    { param([string]$Message) Write-Themed "[INFO]  $Message" -Kind Info;    Write-StructuredLog -Level INFO    -Message $Message }
+function Write-Ok      { param([string]$Message) Write-Themed "[OK]    $Message" -Kind Success; Write-StructuredLog -Level OK      -Message $Message }
+function Write-Warn    { param([string]$Message) Write-Themed "[WARN]  $Message" -Kind Warning; Write-StructuredLog -Level WARN    -Message $Message; $null = $Global:RunStats.Warnings.Add($Message) }
+function Write-Fail    { param([string]$Message) Write-Themed "[ERROR] $Message" -Kind Error;   Write-StructuredLog -Level ERROR   -Message $Message }
+function Write-Status  { param([string]$Message) Write-Themed $Message -Kind Status;            Write-StructuredLog -Level STATUS  -Message $Message }
+function Write-Summary { param([string]$Message) Write-Themed $Message -Kind Summary;           Write-StructuredLog -Level SUMMARY -Message $Message }
+
+function Write-Section {
+    param([Parameter(Mandatory)][string]$Title)
+    Write-Host ""
+    Write-Themed ("==== {0} ====" -f $Title) -Kind Section
+    Write-StructuredLog -Level SECTION -Message $Title
+}
+
+function Write-Title {
+    param([Parameter(Mandatory)][string]$Title)
+    Write-Themed $Title -Kind Title
+}
+
+function Write-Rule {
+    param([int]$Width = 30, [string]$Char = '=')
+    Write-Themed ($Char * $Width) -Kind TitleRule
+}
+
+function Write-Option {
+    param([Parameter(Mandatory)][string]$Number, [Parameter(Mandatory)][string]$Label)
+    Write-Themed ("{0,3}. " -f $Number) -Kind OptionNum -NoNewline
+    Write-Themed $Label -Kind Option
+}
+
+# In-place status line (overwrites previous line, no spinner spam).
+function Write-StatusInPlace {
+    param([Parameter(Mandatory)][string]$Message)
+    $line = "`r{0,-100}" -f $Message
+    if (Test-ColorSupported) {
+        try { Write-Host $line -ForegroundColor $Global:WinServerSetupColors['Status'] -NoNewline; return } catch { }
+    }
+    Write-Host $line -NoNewline
+}
+
+function Clear-StatusInPlace {
+    Write-Host ("`r{0,-100}`r" -f " ") -NoNewline
+}
+
+# =============================================================================
+# STRUCTURED LOGGING (UTF-8)
+# =============================================================================
+# Two log streams:
+#   1) Transcript (Start-Transcript) -> human-readable copy of the console
+#   2) Structured log  -> machine-friendly:  [timestamp] [level] [section] message
+# Both are written under logs/ in UTF-8.
+
+function Initialize-StructuredLog {
+    param([Parameter(Mandatory)][string]$LogDirectory)
+    if (-not (Test-Path $LogDirectory)) {
+        New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+    }
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $Global:StructuredLog = Join-Path $LogDirectory ("WinServerSetup-structured-{0}.log" -f $stamp)
+    Set-Content -LiteralPath $Global:StructuredLog -Value ("# WinServerSetup structured log started {0}" -f (Get-Date -Format "u")) -Encoding utf8
+}
+
+function Write-StructuredLog {
+    param(
+        [string]$Level = 'INFO',
+        [string]$Message = '',
+        [string]$Section = ''
+    )
+    if (-not $Global:StructuredLog) { return }
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = if ($Section) {
+        "[{0}] [{1,-7}] [{2}] {3}" -f $ts, $Level, $Section, $Message
+    } else {
+        "[{0}] [{1,-7}] {2}" -f $ts, $Level, $Message
+    }
+    try { Add-Content -LiteralPath $Global:StructuredLog -Value $line -Encoding utf8 } catch { }
+}
+
+# =============================================================================
+# ACTIVE OPERATION TIMER
+# =============================================================================
+function Initialize-ActiveTimer {
+    if (-not $Global:OpStopwatch) { $Global:OpStopwatch = [System.Diagnostics.Stopwatch]::new() }
+}
+function Start-ActiveTimer    { Initialize-ActiveTimer; $Global:OpStopwatch.Reset(); $Global:OpStopwatch.Start() }
+function Suspend-ActiveTimer  { if ($Global:OpStopwatch -and $Global:OpStopwatch.IsRunning) { $Global:OpStopwatch.Stop() } }
+function Resume-ActiveTimer   { if ($Global:OpStopwatch -and -not $Global:OpStopwatch.IsRunning -and $Global:OpStopwatch.Elapsed -gt [TimeSpan]::Zero) { $Global:OpStopwatch.Start() } }
+function Stop-ActiveTimer     { if ($Global:OpStopwatch -and $Global:OpStopwatch.IsRunning) { $Global:OpStopwatch.Stop() } }
+function Get-ActiveTimerElapsed { if (-not $Global:OpStopwatch) { return [TimeSpan]::Zero }; return $Global:OpStopwatch.Elapsed }
+function Format-ActiveTimerElapsed {
+    $ts = Get-ActiveTimerElapsed
+    $hours = [int][Math]::Floor($ts.TotalHours)
+    return ('{0:00}:{1:00}:{2:00}' -f $hours, $ts.Minutes, $ts.Seconds)
+}
+function Write-ActiveTimerSummary {
+    param([string]$Name = "")
+    $elapsed = Format-ActiveTimerElapsed
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        Write-Summary ("Total time elapsed: {0}" -f $elapsed)
+    } else {
+        Write-Summary ("Total time elapsed: {0}  ({1})" -f $elapsed, $Name)
+    }
+    Write-Themed "(active operation time only; user prompts and menu waits are excluded)" -Kind SummaryDim
+}
+
+function Invoke-Timed {
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][scriptblock]$Action)
+    $null = $Global:RunStats.StartedTasks.Add($Name)
+    Start-ActiveTimer
+    try {
+        & $Action
+        $null = $Global:RunStats.CompletedTasks.Add($Name)
+    } catch {
+        $null = $Global:RunStats.FailedTasks.Add($Name)
+        Write-Fail ("Task '{0}' failed: {1}" -f $Name, $_.Exception.Message)
+        throw
+    } finally {
+        Stop-ActiveTimer
+        Write-Host ""
+        Write-ActiveTimerSummary -Name $Name
+    }
+}
+
+# =============================================================================
+# PRESS-ANY-KEY PROMPTS
+# =============================================================================
+# Uses [Console]::ReadKey($true) where supported (true any-key). Falls back to
+# Read-Host (Enter-only) for non-interactive hosts. Both forms suspend the
+# active timer so user-wait time is never counted as work time.
+
+function Read-AnyKeyThemed {
+    param([string]$Prompt = "Press any key to continue...")
+    $wasRunning = ($Global:OpStopwatch -and $Global:OpStopwatch.IsRunning)
+    Suspend-ActiveTimer
+    try {
+        Write-Themed $Prompt -Kind Prompt
+        try {
+            if ($Host.UI.RawUI -and [Console]::IsInputRedirected -eq $false) {
+                [void][Console]::ReadKey($true)
+                return
+            }
+        } catch { }
+        # Fallback for hosts without RawUI:
+        Read-Host | Out-Null
+    } finally {
+        if ($wasRunning) { Resume-ActiveTimer }
+    }
+}
+
+function Read-HostThemed {
+    param([Parameter(Mandatory)][string]$Prompt)
+    $wasRunning = ($Global:OpStopwatch -and $Global:OpStopwatch.IsRunning)
+    Suspend-ActiveTimer
+    try {
+        Write-Themed ($Prompt + ": ") -Kind Prompt -NoNewline
+        return Read-Host
+    } finally {
+        if ($wasRunning) { Resume-ActiveTimer }
+    }
+}
+
+function Read-HostUntimed { param([string]$Prompt) Read-HostThemed -Prompt $Prompt }
+
+function Pause-IfNeeded {
+    if (-not $Global:NoPause) {
+        Write-Host ""
+        Read-AnyKeyThemed
+    }
+}
+
+# =============================================================================
+# ADMIN / CONFIG / PATH HELPERS
+# =============================================================================
+function Assert-Admin {
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Fail "Run this script as Administrator."
+        Pause-IfNeeded
+        exit 1
+    }
+}
+
+function Load-Config {
+    if (-not (Test-Path $Global:ConfigPath)) {
+        throw "Config file not found: $Global:ConfigPath"
+    }
+    $Global:Config = Get-Content -LiteralPath $Global:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+
+function Resolve-RelativePath {
+    param([Parameter(Mandatory)][string]$Path)
+    if ([System.IO.Path]::IsPathRooted($Path)) { return $Path }
+    return Join-Path $Global:ProjectRoot $Path
+}
+
+function Set-RegistryDefaultValue {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+    (Get-Item -Path $Path).SetValue('', $Value, [Microsoft.Win32.RegistryValueKind]::String)
+}
+
+function Get-RegistryDefaultValue {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path)) { return $null }
+    return (Get-Item -Path $Path).GetValue('', $null)
+}
+
+function Ensure-Directory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        Write-Ok "Created directory: $Path"
+    }
+}
+
+function Get-DownloadCachePath {
+    # downloadRoot, if empty, defaults to a per-user temp folder so the script
+    # never silently creates C:\portable\_downloads. Override via config.
+    $cfgValue = ''
+    if ($Global:Config) { $cfgValue = [string]$Global:Config.downloadRoot }
+    if ([string]::IsNullOrWhiteSpace($cfgValue)) {
+        $cfgValue = Join-Path $env:TEMP "WinServerSetup-downloads"
+    }
+    Ensure-Directory $cfgValue
+    return $cfgValue
+}
+
+function Initialize-Environment {
+    Load-Config
+
+    $logRoot = Resolve-RelativePath ([string]$Global:Config.logRoot)
+    Ensure-Directory $logRoot
+    Ensure-Directory (Resolve-RelativePath "backups")
+
+    Initialize-StructuredLog -LogDirectory $logRoot
+
+    $portableRoot = [string]$Global:Config.portableRoot
+    if (-not [string]::IsNullOrWhiteSpace($portableRoot)) { Ensure-Directory $portableRoot }
+
+    if (-not $Global:TranscriptStarted) {
+        $Global:LogFile = Join-Path $logRoot ("WinServerSetup-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+        try {
+            Start-Transcript -Path $Global:LogFile -Append -Encoding utf8 -Force | Out-Null
+            $Global:TranscriptStarted = $true
+            Write-Info "Console transcript:  $Global:LogFile"
+            Write-Info "Structured log file: $Global:StructuredLog"
+        } catch {
+            Write-Warn "Could not start transcript: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Test-CommandExists {
+    param([Parameter(Mandatory)][string]$Command)
+    return [bool](Get-Command $Command -ErrorAction SilentlyContinue)
+}
+
+# =============================================================================
+# PENDING REBOOT TRACKER
+# =============================================================================
+function Set-PendingReboot {
+    param([string]$Reason = "")
+    $Global:RunStats.RebootRequired = $true
+    if (-not [string]::IsNullOrWhiteSpace($Reason)) {
+        Write-Warn "Pending reboot flagged: $Reason"
+    } else {
+        Write-Warn "Pending reboot flagged."
+    }
+}
+
+function Test-WindowsRebootRequired {
+    $signals = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+    )
+    foreach ($p in $signals) { if (Test-Path $p) { return $true } }
+    try {
+        $pending = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue)
+        if ($pending) { return $true }
+    } catch { }
+    return $false
+}
+
+# =============================================================================
+# SELF-RELOCATE
+# =============================================================================
+# Move the entire project folder to C:\portable\Scripts\WinServerSetup on first
+# run. Uses robocopy to preserve everything, then re-launches at the new path
+# and exits the current process cleanly.
+
+function Invoke-SelfRelocateIfNeeded {
+    if ($Global:NoRelocate) {
+        Write-Info "Self-relocate skipped: -NoRelocate switch is set."
+        return $false
+    }
+    if (-not $Global:Config.selfRelocate -or -not $Global:Config.selfRelocate.enabled) {
+        Write-Info "Self-relocate skipped: disabled in config."
+        return $false
+    }
+
+    $target = [string]$Global:Config.targetProjectRoot
+    if ([string]::IsNullOrWhiteSpace($target)) { $target = "C:\portable\Scripts\WinServerSetup" }
+
+    $currentFull = (Resolve-Path -LiteralPath $Global:ProjectRoot).Path.TrimEnd('\')
+    $targetFull  = $target.TrimEnd('\')
+
+    if ([string]::Equals($currentFull, $targetFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Info "Project is already running from target location: $target"
+        return $false
+    }
+
+    Write-Section "Self-relocating project to $target"
+    $parent = Split-Path -Parent $target
+    Ensure-Directory $parent
+    $targetLogDir = Join-Path $targetFull "logs"
+    $relocateLog = Join-Path $targetLogDir ("WinServerSetup-relocate-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+
+    # Copy with robocopy, then schedule removal of the original source after the
+    # relaunched target process starts. /E updates/merges without deleting
+    # unexpected destination files.
+    Write-Info "Copying files from '$currentFull' to '$targetFull' ..."
+    $robocopyLog = Join-Path $env:TEMP "WinServerSetup-relocate.log"
+    $proc = Start-Process robocopy.exe `
+        -ArgumentList @("`"$currentFull`"", "`"$targetFull`"", "/E", "/COPY:DAT", "/R:1", "/W:2", "/NFL", "/NDL", "/NJH", "/NJS", "/NC", "/NS", "/LOG:`"$robocopyLog`"") `
+        -Wait -PassThru -WindowStyle Hidden
+    # robocopy exit codes <=7 are success (8+ are real failures).
+    if ($proc.ExitCode -ge 8) {
+        throw "robocopy failed with exit code $($proc.ExitCode). See $robocopyLog"
+    }
+    Write-Ok "Project files copied. robocopy exit code $($proc.ExitCode)."
+    Ensure-Directory $targetLogDir
+    @(
+        ("[{0}] [INFO] Source: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $currentFull),
+        ("[{0}] [INFO] Target: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $targetFull),
+        ("[{0}] [INFO] robocopy exit code: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $proc.ExitCode),
+        ("[{0}] [INFO] robocopy log: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $robocopyLog)
+    ) | Set-Content -LiteralPath $relocateLog -Encoding utf8
+
+    # Relaunch from the new location and exit this process.
+    $newScript = Join-Path $targetFull "WinServerSetup.ps1"
+    $childArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$newScript`"", "-NoRelocate")
+    if ($Global:Full)    { $childArgs += "-Full" }
+    if ($Global:NoPause) { $childArgs += "-NoPause" }
+    if ($Global:NoColor) { $childArgs += "-NoColor" }
+    if ($Global:NoReboot){ $childArgs += "-NoReboot" }
+
+    Write-Info ("Relaunching from new location: {0}" -f $newScript)
+    Start-Process powershell.exe -ArgumentList $childArgs
+    try {
+        $cleanupScript = Join-Path $env:TEMP ("WinServerSetup-clean-source-{0}.ps1" -f ([guid]::NewGuid().ToString("N")))
+        $parentPid = $PID
+        $cleanup = @"
+param(
+    [Parameter(Mandatory = `$true)][string]`$SourcePath,
+    [Parameter(Mandatory = `$true)][string]`$TargetPath,
+    [Parameter(Mandatory = `$true)][int]`$ParentProcessId,
+    [Parameter(Mandatory = `$true)][string]`$RelocateLog
+)
+`$ErrorActionPreference = 'SilentlyContinue'
+try { Wait-Process -Id `$ParentProcessId -Timeout 60 } catch { Start-Sleep -Seconds 5 }
+try {
+    `$src = [System.IO.Path]::GetFullPath(`$SourcePath).TrimEnd('\')
+    `$dst = [System.IO.Path]::GetFullPath(`$TargetPath).TrimEnd('\')
+    if (`$src -and `$dst -and -not [string]::Equals(`$src, `$dst, [System.StringComparison]::OrdinalIgnoreCase) -and -not `$dst.StartsWith(`$src + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath `$src -Recurse -Force -ErrorAction Stop
+        Add-Content -LiteralPath `$RelocateLog -Encoding utf8 -Value ("[{0}] [OK] Removed original source folder: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `$src)
+    }
+} catch {
+    Add-Content -LiteralPath `$RelocateLog -Encoding utf8 -Value ("[{0}] [WARN] Could not remove original source folder: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `$_.Exception.Message)
+}
+"@
+        Set-Content -LiteralPath $cleanupScript -Value $cleanup -Encoding utf8 -Force
+        Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$cleanupScript`"",
+            "-SourcePath", "`"$currentFull`"", "-TargetPath", "`"$targetFull`"",
+            "-ParentProcessId", "$parentPid", "-RelocateLog", "`"$relocateLog`""
+        )
+        Write-Info "Original source folder cleanup scheduled after this process exits."
+    } catch {
+        Write-Warn "Could not schedule source cleanup after relocation: $($_.Exception.Message)"
+    }
+    Write-Info "Original script will now exit. Future runs should use the new location."
+    return $true
+}
+
+# =============================================================================
+# CONTROLLED PARALLEL RUNNER
+# =============================================================================
+# Runs a set of safe, independent script blocks concurrently with a hard cap on
+# how many can be in flight at once. Prefers Start-ThreadJob (lightweight, same
+# process) and falls back to Start-Job. Designed for VM-friendly limits.
+
+function Test-ThreadJobAvailable {
+    if (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue) { return $true }
+    if (Get-Module -ListAvailable -Name ThreadJob) { return $true }
+    return $false
+}
+
+function Invoke-Parallel {
+    param(
+        [Parameter(Mandatory)][array]$Tasks,        # each item: @{ Name='...'; Action={ ... } }
+        [int]$MaxParallel = 2
+    )
+    if (-not $Tasks -or $Tasks.Count -eq 0) { return }
+    if ($MaxParallel -lt 1) { $MaxParallel = 1 }
+
+    $useThreadJob = Test-ThreadJobAvailable
+    if ($useThreadJob -and -not (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)) {
+        try { Import-Module ThreadJob -ErrorAction Stop } catch { $useThreadJob = $false }
+    }
+    $runnerLabel = if ($useThreadJob) { 'ThreadJob' } else { 'Process Job' }
+    Write-Info ("Parallel runner: {0} task(s), max {1} concurrent ({2})." -f $Tasks.Count, $MaxParallel, $runnerLabel)
+
+    $jobs    = @{}
+    $pending = New-Object System.Collections.Generic.Queue[object]
+    foreach ($t in $Tasks) { $pending.Enqueue($t) }
+
+    while ($pending.Count -gt 0 -or $jobs.Count -gt 0) {
+        while ($jobs.Count -lt $MaxParallel -and $pending.Count -gt 0) {
+            $task = $pending.Dequeue()
+            $name = [string]$task.Name
+            $sb   = [scriptblock]$task.Action
+            try {
+                $job = if ($useThreadJob) { Start-ThreadJob -Name $name -ScriptBlock $sb } else { Start-Job -Name $name -ScriptBlock $sb }
+                $jobs[$job.Id] = @{ Name = $name; Job = $job; Started = Get-Date }
+                Write-Info ("Parallel start: {0}" -f $name)
+            } catch {
+                Write-Fail ("Parallel start failed for {0}: {1}" -f $name, $_.Exception.Message)
+                $null = $Global:RunStats.FailedTasks.Add("(parallel) $name")
+            }
+        }
+
+        if ($jobs.Count -eq 0) { break }
+
+        $finished = $jobs.Values | Where-Object { $_.Job.State -in @('Completed','Failed','Stopped') } | Select-Object -First 1
+        if ($finished) {
+            $j = $finished.Job
+            $elapsed = (Get-Date) - $finished.Started
+            try { $output = Receive-Job -Job $j -ErrorAction Stop -Keep } catch { $output = $_.Exception.Message }
+            if ($j.State -eq 'Completed') {
+                Write-Ok ("Parallel done : {0}  [{1:N1}s]" -f $finished.Name, $elapsed.TotalSeconds)
+            } else {
+                Write-Fail ("Parallel fail : {0}  [{1:N1}s]  {2}" -f $finished.Name, $elapsed.TotalSeconds, ($output -join '; '))
+                $null = $Global:RunStats.FailedTasks.Add("(parallel) $($finished.Name)")
+            }
+            Remove-Job -Job $j -Force -ErrorAction SilentlyContinue | Out-Null
+            $jobs.Remove($j.Id) | Out-Null
+        } else {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+}
+
+function Start-ParallelTasks {
+    param(
+        [Parameter(Mandatory)][array]$Tasks,
+        [int]$MaxParallel = 2
+    )
+    if (-not $Tasks -or $Tasks.Count -eq 0) { return @() }
+    if ($MaxParallel -lt 1) { $MaxParallel = 1 }
+
+    $useThreadJob = Test-ThreadJobAvailable
+    if ($useThreadJob -and -not (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)) {
+        try { Import-Module ThreadJob -ErrorAction Stop } catch { $useThreadJob = $false }
+    }
+
+    $started = New-Object System.Collections.Generic.List[object]
+    foreach ($task in $Tasks | Select-Object -First $MaxParallel) {
+        $name = [string]$task.Name
+        $sb = [scriptblock]$task.Action
+        try {
+            $job = if ($useThreadJob) { Start-ThreadJob -Name $name -ScriptBlock $sb } else { Start-Job -Name $name -ScriptBlock $sb }
+            $started.Add([pscustomobject]@{ Name = $name; Job = $job; Started = Get-Date }) | Out-Null
+            Write-Info ("Parallel start: {0}" -f $name)
+        } catch {
+            Write-Warn ("Parallel start failed for {0}: {1}" -f $name, $_.Exception.Message)
+            $null = $Global:RunStats.FailedTasks.Add("(parallel) $name")
+        }
+    }
+    return @($started)
+}
+
+function Wait-ParallelTasks {
+    param([array]$StartedTasks)
+    foreach ($item in @($StartedTasks)) {
+        if (-not $item -or -not $item.Job) { continue }
+        $job = $item.Job
+        try {
+            Wait-Job -Job $job | Out-Null
+            $elapsed = (Get-Date) - $item.Started
+            $output = @()
+            try { $output = @(Receive-Job -Job $job -ErrorAction SilentlyContinue) } catch { $output = @($_.Exception.Message) }
+            foreach ($line in $output) {
+                $text = [string]$line
+                if (-not [string]::IsNullOrWhiteSpace($text)) {
+                    Write-StructuredLog -Level OUTPUT -Message ("parallel {0}> {1}" -f $item.Name, $text.TrimEnd())
+                }
+            }
+            if ($job.State -eq 'Completed') {
+                Write-Ok ("Parallel done : {0}  [{1:N1}s]" -f $item.Name, $elapsed.TotalSeconds)
+                $null = $Global:RunStats.CompletedTasks.Add("(parallel) $($item.Name)")
+            } else {
+                Write-Warn ("Parallel fail : {0}  [{1:N1}s] state={2}" -f $item.Name, $elapsed.TotalSeconds, $job.State)
+                $null = $Global:RunStats.FailedTasks.Add("(parallel) $($item.Name)")
+            }
+        } finally {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+}
+
+function Start-ApplicationDownloadPrefetch {
+    param([int]$MaxParallel = 4)
+    $prefetchScript = Join-Path $Global:ProjectRoot "scripts\Prefetch-AppDownloads.ps1"
+    if (-not (Test-Path $prefetchScript)) {
+        Write-Warn "Application prefetch helper not found: $prefetchScript"
+        return $null
+    }
+    if ($MaxParallel -lt 1) { $MaxParallel = 1 }
+
+    $logRoot = Resolve-RelativePath ([string]$Global:Config.logRoot)
+    Ensure-Directory $logRoot
+    $prefetchLog = Join-Path $logRoot ("WinServerSetup-prefetch-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+    $psExe = Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $args = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", "`"$prefetchScript`"",
+        "-ProjectRoot", "`"$Global:ProjectRoot`"",
+        "-ConfigPath", "`"$Global:ConfigPath`"",
+        "-MaxParallel", "$MaxParallel",
+        "-LogPath", "`"$prefetchLog`""
+    )
+
+    try {
+        $proc = Start-Process -FilePath $psExe -ArgumentList $args -PassThru -WindowStyle Hidden
+        Write-Ok "Application download prefetch started in the background (max $MaxParallel downloads)."
+        Write-Info "Prefetch log: $prefetchLog"
+        Write-StructuredLog -Level PREFETCH -Message ("Started process {0}; log={1}" -f $proc.Id, $prefetchLog)
+        return [pscustomobject]@{ Process = $proc; LogPath = $prefetchLog; Started = Get-Date }
+    } catch {
+        Write-Warn "Could not start application download prefetch: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Wait-ApplicationDownloadPrefetch {
+    param([object]$Prefetch)
+    if (-not $Prefetch -or -not $Prefetch.Process) { return }
+    $proc = $Prefetch.Process
+    Write-Info "Waiting for application prefetch to finish before sequential installs..."
+    while (-not $proc.HasExited) {
+        $elapsed = (Get-Date) - $Prefetch.Started
+        Write-StatusInPlace ("Application downloads still running... elapsed {0:hh\:mm\:ss}" -f $elapsed)
+        Start-Sleep -Seconds 2
+        try { $proc.Refresh() } catch { break }
+    }
+    Clear-StatusInPlace
+    try { $proc.Refresh() } catch { }
+    if ($proc.ExitCode -eq 0) {
+        Write-Ok "Application download prefetch completed."
+    } else {
+        Write-Warn "Application prefetch exited with code $($proc.ExitCode). Sequential install will continue and may download missing installers."
+    }
+    Write-StructuredLog -Level PREFETCH -Message ("Finished process {0}; exit={1}; log={2}" -f $proc.Id, $proc.ExitCode, $Prefetch.LogPath)
+}
+
+# =============================================================================
+# DOWNLOAD / INSTALL HELPERS
+# =============================================================================
+function Invoke-DownloadFile {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$Destination,
+        [int]$RetryCount = 2
+    )
+    $dir = Split-Path -Parent $Destination
+    Ensure-Directory $dir
+    if ((Test-Path $Destination) -and ((Get-Item -LiteralPath $Destination).Length -gt 0)) {
+        Write-Ok ("Using cached download: {0}" -f (Split-Path -Leaf $Destination))
+        Write-StructuredLog -Level DOWNLOAD -Message ("Cache hit: {0}" -f $Destination)
+        return $true
+    }
+
+    for ($i = 0; $i -le $RetryCount; $i++) {
+        try {
+            Write-StructuredLog -Level DOWNLOAD -Message ("URL={0}; Destination={1}" -f $Url, $Destination)
+            Write-StatusInPlace ("Downloading: {0}" -f (Split-Path -Leaf $Destination))
+            Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -ErrorAction Stop
+            Clear-StatusInPlace
+            Write-Ok ("Downloaded: {0}" -f (Split-Path -Leaf $Destination))
+            return $true
+        } catch {
+            Clear-StatusInPlace
+            if ($i -ge $RetryCount) {
+                Write-Fail ("Download failed: {0}  ({1})" -f $Url, $_.Exception.Message)
+                return $false
+            }
+            Write-Warn ("Download retry {0} for {1}: {2}" -f ($i + 1), $Url, $_.Exception.Message)
+            Start-Sleep -Seconds 2
+        }
+    }
+    return $false
+}
+
+function Get-InstalledRegistryDisplayName {
+    param([Parameter(Mandatory)][string]$NameLike)
+    $roots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    foreach ($r in $roots) {
+        try {
+            Get-ChildItem $r -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                    if ($p -and $p.DisplayName -like "*$NameLike*") { return $p.DisplayName }
+                } catch { }
+            }
+        } catch { }
+    }
+    return $null
+}
+
+function Invoke-SilentExeInstall {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$Arguments = @("/S"),
+        [int]$TimeoutSeconds = 600
+    )
+    Write-Info ("Running silent installer: {0} {1}" -f (Split-Path -Leaf $Path), ($Arguments -join ' '))
+    Write-StructuredLog -Level COMMAND -Message ("Installer path: {0}" -f $Path)
+    $proc = Start-Process -FilePath $Path -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $proc.Kill() } catch { }
+        throw "Installer did not complete within $TimeoutSeconds seconds: $Path"
+    }
+    Write-StructuredLog -Level COMMAND -Message ("Installer exit code: {0}" -f $proc.ExitCode)
+    return $proc.ExitCode
+}
+
+function Invoke-LoggedCommand {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [string]$DisplayName = ""
+    )
+    $label = if ([string]::IsNullOrWhiteSpace($DisplayName)) { (Split-Path -Leaf $FilePath) } else { $DisplayName }
+    $commandLine = "{0} {1}" -f $FilePath, ($Arguments -join ' ')
+    Write-StructuredLog -Level COMMAND -Message $commandLine
+    $output = @()
+    $exitCode = 1
+    try {
+        $output = @(& $FilePath @Arguments 2>&1)
+        $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+    } catch {
+        $output = @($_.Exception.Message)
+        $exitCode = 1
+    }
+    foreach ($line in $output) {
+        $text = [string]$line
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            Write-StructuredLog -Level OUTPUT -Message ("{0}> {1}" -f $label, $text.TrimEnd())
+        }
+    }
+    Write-StructuredLog -Level COMMAND -Message ("{0} exit code: {1}" -f $label, $exitCode)
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output   = $output
+    }
+}
+
+# =============================================================================
+# WINGET ENSURE + MSSTORE FIX (item 9)
+# =============================================================================
+function Ensure-Winget {
+    if (Test-CommandExists "winget") {
+        Write-Ok "WinGet is available."
+        Repair-WingetSources
+        return $true
+    }
+    if (-not $Global:Config.winget.installIfMissing) {
+        Write-Warn "WinGet is missing and installIfMissing is disabled."
+        return $false
+    }
+    Write-Info "WinGet was not found. Downloading Microsoft App Installer package..."
+    $download = Get-DownloadCachePath
+    $bundle = Join-Path $download "Microsoft.DesktopAppInstaller.msixbundle"
+    if (Invoke-DownloadFile -Url "https://aka.ms/getwinget" -Destination $bundle) {
+        try {
+            Add-AppxPackage -Path $bundle
+            Write-Ok "WinGet package installed. A new shell may be required to pick it up."
+        } catch {
+            Write-Fail "Could not install WinGet automatically: $($_.Exception.Message)"
+            return $false
+        }
+    }
+    if (-not (Test-CommandExists "winget")) {
+        Write-Warn "WinGet still not detected. Install App Installer manually and re-run."
+        return $false
+    }
+    Repair-WingetSources
+    return $true
+}
+
+function Repair-WingetSources {
+    if (-not $Global:Config.winget.removeMsstoreSource) { return }
+    try {
+        $sourcesResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "list") -DisplayName "winget source list"
+        $sources = ($sourcesResult.Output -join "`n")
+        if ($sources -match '(?im)^\s*msstore\b') {
+            Write-Info "Removing msstore winget source (avoids 0x8a15005e certificate errors)."
+            $removeResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "remove", "msstore") -DisplayName "winget source remove msstore"
+            if ($removeResult.ExitCode -eq 0) { Write-Ok "Removed winget source: msstore" }
+            else { Write-Warn "winget could not remove msstore source; details are in the structured log." }
+        } else {
+            Write-Info "winget msstore source is already absent."
+        }
+    } catch { Write-Warn "winget source listing failed: $($_.Exception.Message)" }
+
+    try {
+        Write-Info "Refreshing winget sources..."
+        $updateResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "update") -DisplayName "winget source update"
+        if ($updateResult.ExitCode -eq 0) { Write-Ok "winget sources refreshed." }
+        else { Write-Warn "winget source update exited with code $($updateResult.ExitCode). Details are in the structured log." }
+    } catch {
+        Write-Warn "winget source update failed: $($_.Exception.Message)"
+    }
+}
+
+# =============================================================================
+# SECTION 1: SHOW FILE EXTENSIONS (item 1)
+# =============================================================================
+function Enable-FileExtensions {
+    if ($Global:Config.appearance -and -not $Global:Config.appearance.showFileExtensions) {
+        Write-Info "File-extension toggle disabled in config."
+        return
+    }
+    $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    $cur = (Get-ItemProperty -Path $path -Name "HideFileExt" -ErrorAction SilentlyContinue).HideFileExt
+    if ($cur -eq 0) {
+        Write-Ok "File extensions are already shown in Explorer."
+    } else {
+        Set-ItemProperty -Path $path -Name "HideFileExt" -Type DWord -Value 0
+        Write-Ok "Enabled 'Show file extensions' in Explorer for current user."
+        try {
+            $sig = '[DllImport("shell32.dll")] public static extern int SHChangeNotify(int eventId, int flags, IntPtr item1, IntPtr item2);'
+            $shell = Add-Type -MemberDefinition $sig -Namespace WinShell -Name ExplorerSettingsNotify -PassThru -ErrorAction SilentlyContinue
+            if ($shell) { [void]$shell::SHChangeNotify(0x8000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero) }
+        } catch { }
+    }
+}
+
+# =============================================================================
+# SECTION 2: DARK MODE + TASKBAR (item 12)
+# =============================================================================
+function Set-WindowsDarkMode {
+    if (-not $Global:Config.appearance.darkMode) {
+        Write-Info "Dark mode disabled in config."
+        return
+    }
+    $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    Set-ItemProperty -Path $path -Name "AppsUseLightTheme"   -Type DWord -Value 0
+    Set-ItemProperty -Path $path -Name "SystemUsesLightTheme" -Type DWord -Value 0
+
+    # Some Windows 10/11 builds need the shell colorization keys touched too
+    # before Start/taskbar pick up the system dark state.
+    $colorPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes"
+    if (Test-Path $colorPath) {
+        try { Set-ItemProperty -Path $colorPath -Name "ThemeChangesDesktopIcons" -Value 0 -ErrorAction SilentlyContinue } catch { }
+    }
+    $dwmPath = "HKCU:\Software\Microsoft\Windows\DWM"
+    if (-not (Test-Path $dwmPath)) { New-Item -Path $dwmPath -Force | Out-Null }
+    Set-ItemProperty -Path $dwmPath -Name "ColorPrevalence" -Type DWord -Value 0 -ErrorAction SilentlyContinue
+    $accentPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"
+    if (-not (Test-Path $accentPath)) { New-Item -Path $accentPath -Force | Out-Null }
+    Set-ItemProperty -Path $accentPath -Name "StartColorMenu" -Type DWord -Value 0xff202020 -ErrorAction SilentlyContinue
+    Write-Ok "Dark mode registry keys set for apps + system."
+
+    if ($Global:Config.appearance.restartExplorer) {
+        Restart-ExplorerGracefully
+    } else {
+        Write-Info "Sign out / sign in to fully apply the taskbar dark theme, or enable restartExplorer in config."
+    }
+}
+
+function Restart-ExplorerGracefully {
+    Write-Info "Restarting Explorer to apply theme + Explorer settings..."
+    try {
+        Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 600
+        # Windows auto-starts Explorer; only start manually if it didn't come back.
+        if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) {
+            Start-Process explorer.exe
+        }
+        Write-Ok "Explorer restarted."
+    } catch {
+        Write-Warn "Could not restart Explorer cleanly: $($_.Exception.Message)"
+    }
+}
+
+# =============================================================================
+# SECTION 3: PERSIAN KEYBOARD LAYOUT (item 7)
+# =============================================================================
+function Add-PersianKeyboardLayout {
+    if (-not $Global:Config.keyboard -or -not $Global:Config.keyboard.addPersianLayout) {
+        Write-Info "Persian keyboard step disabled in config."
+        return
+    }
+    try {
+        $existing = Get-WinUserLanguageList -ErrorAction Stop
+        if ($existing | Where-Object { $_.LanguageTag -eq 'fa-IR' }) {
+            Write-Ok "Persian (fa-IR) keyboard layout is already in the user language list."
+            return
+        }
+        $existing.Add("fa-IR")
+        Set-WinUserLanguageList -LanguageList $existing -Force
+        Write-Ok "Added Persian (fa-IR) to the user language list."
+    } catch {
+        Write-Warn "Could not modify user language list with Set-WinUserLanguageList: $($_.Exception.Message)"
+        Write-Warn "Try adding the Persian keyboard layout manually from Settings -> Time & Language -> Language."
+    }
+}
+
+# =============================================================================
+# SECTION 4: CUSTOM FOLDERS + DEFENDER + SCRIPTS PATH (items 14, 15, 20)
+# =============================================================================
+function Get-CurrentUserDownloadsFolder {
+    $shf = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+    $guid = "{374DE290-123F-4565-9164-39C4925E467B}"
+    try {
+        $p = Get-ItemProperty -Path $shf -ErrorAction SilentlyContinue
+        if ($p) {
+            $prop = $p.PSObject.Properties[$guid]
+            if ($prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+                return [Environment]::ExpandEnvironmentVariables([string]$prop.Value)
+            }
+        }
+    } catch { }
+    $up = [Environment]::GetFolderPath("UserProfile")
+    if ([string]::IsNullOrWhiteSpace($up)) { $up = $env:USERPROFILE }
+    return (Join-Path $up "Downloads")
+}
+
+function Test-DefenderExclusionPath {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Get-Command Get-MpPreference -ErrorAction SilentlyContinue)) { return $false }
+    try {
+        $fp = [System.IO.Path]::GetFullPath($Path).TrimEnd("\")
+        $prefs = Get-MpPreference
+        foreach ($e in @($prefs.ExclusionPath)) {
+            if ([string]::IsNullOrWhiteSpace([string]$e)) { continue }
+            $n = [System.IO.Path]::GetFullPath([string]$e).TrimEnd("\")
+            if ([string]::Equals($n, $fp, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+    } catch { }
+    return $false
+}
+
+function Add-DefenderExclusionPathSafe {
+    param([Parameter(Mandatory)][string]$Path)
+    $fp = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Get-Command Add-MpPreference -ErrorAction SilentlyContinue)) {
+        Write-Warn "Defender PowerShell module not available; cannot add exclusion: $fp"
+        return
+    }
+    if (Test-DefenderExclusionPath -Path $fp) {
+        Write-Ok "Defender exclusion already present: $fp"
+        return
+    }
+    try {
+        Add-MpPreference -ExclusionPath $fp
+        Write-Ok "Added Defender exclusion: $fp"
+    } catch {
+        Write-Warn ("Could not add Defender exclusion for {0}: {1}" -f $fp, $_.Exception.Message)
+    }
+}
+
+function Configure-CustomFoldersAndDefenderExclusions {
+    $s = $Global:Config.customFolders
+    if (-not $s -or -not $s.enabled) { return }
+
+    Ensure-Directory ([string]$s.portablePath)
+    Ensure-Directory ([string]$s.scriptsPath)
+
+    if ($s.createCompressedInDownloads) {
+        $downloads = Get-CurrentUserDownloadsFolder
+        Ensure-Directory $downloads
+        $name = [string]$s.compressedFolderName
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = "compressed" }
+        $cmp = Join-Path $downloads $name
+        Ensure-Directory $cmp
+        if ($s.excludeCompressedFromDefender) { Add-DefenderExclusionPathSafe -Path $cmp }
+    }
+}
+
+# =============================================================================
+# SECTION 5: WINGET INSTALL (items 9 indirect)
+# =============================================================================
+function Install-WingetPackages {
+    if (-not (Ensure-Winget)) { return }
+    $interactive = [bool]$Global:Config.winget.interactiveInstallers
+    foreach ($pkg in $Global:Config.winget.packages) {
+        if (-not $pkg.enabled) { continue }
+        $name = [string]$pkg.name
+        $id   = [string]$pkg.id
+        if ([string]::IsNullOrWhiteSpace($id)) { Write-Warn "Skipping $name (empty id)."; continue }
+
+        Write-Info "Checking package: $name ($id)"
+        $listOutput = winget list --id $id --exact --accept-source-agreements --source winget 2>$null
+        if ($LASTEXITCODE -eq 0 -and ($listOutput -join "`n") -match [regex]::Escape($id)) {
+            Write-Ok "$name is already installed."
+            if ($Global:Config.winget.upgradeExistingPackages) {
+                try {
+                    $upgradeResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("upgrade", "--id", $id, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget", "--silent") -DisplayName "winget upgrade $name"
+                    if ($upgradeResult.ExitCode -ne 0) { Write-Warn "Upgrade check for $name exited with code $($upgradeResult.ExitCode)." }
+                } catch { Write-Warn "Upgrade failed for $name : $($_.Exception.Message)" }
+            }
+            $null = $Global:RunStats.InstalledApps.Add($name)
+            continue
+        }
+
+        $wingetArgs = @("install", "--id", $id, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget")
+        if ($interactive) { $wingetArgs += "--interactive" } else { $wingetArgs += "--silent" }
+        Write-Info "Installing $name ..."
+        try {
+            $installResult = Invoke-LoggedCommand -FilePath "winget" -Arguments $wingetArgs -DisplayName "winget install $name"
+            if ($installResult.ExitCode -eq 0) {
+                Write-Ok "$name installed."
+                $null = $Global:RunStats.InstalledApps.Add($name)
+            } else {
+                Write-Warn "$name install exited with code $($installResult.ExitCode). See structured log for winget output."
+                $null = $Global:RunStats.FailedApps.Add($name)
+            }
+        } catch {
+            Write-Warn "winget install failed for $name : $($_.Exception.Message)"
+            $null = $Global:RunStats.FailedApps.Add($name)
+        }
+    }
+}
+
+# =============================================================================
+# SECTION 6: DIRECT INSTALLERS (items 10, 16, 25)
+# =============================================================================
+function Install-DirectInstaller {
+    param([Parameter(Mandatory)][object]$Spec)
+    if (-not $Spec.enabled) { return }
+    $name        = [string]$Spec.name
+    $url         = [string]$Spec.url
+    $fileName    = [string]$Spec.fileName
+    $silentArgs  = if ($Spec.silentArgs) { [string]$Spec.silentArgs } else { "/S" }
+    $verifyName  = [string]$Spec.verifyRegistryName
+
+    if (-not [string]::IsNullOrWhiteSpace($verifyName)) {
+        $existing = Get-InstalledRegistryDisplayName -NameLike $verifyName
+        if ($existing) {
+            Write-Ok "$name already installed (registry: $existing)."
+            $null = $Global:RunStats.InstalledApps.Add($name)
+            return
+        }
+    }
+
+    $download = Get-DownloadCachePath
+    if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = "${name}-installer.exe" -replace '\s','' }
+
+    if ($name -ieq "Everything" -and $url -match 'voidtools\.com/.*/?downloads/?$|voidtools\.com/downloads/?$') {
+        $resolvedEverything = $false
+        try {
+            Write-Info "Resolving latest Everything x64 installer from Voidtools downloads page..."
+            $page = Invoke-WebRequest -Uri $url -UseBasicParsing -ErrorAction Stop
+            $matches = [regex]::Matches([string]$page.Content, 'Everything-(\d+\.\d+\.\d+\.\d+)\.x64-Setup\.exe')
+            $latest = $matches | ForEach-Object {
+                [pscustomobject]@{ Version = [version]$_.Groups[1].Value; File = $_.Value }
+            } | Sort-Object Version -Descending | Select-Object -First 1
+            if ($latest) {
+                $url = "https://www.voidtools.com/{0}" -f $latest.File
+                $fileName = $latest.File
+                $resolvedEverything = $true
+                Write-Ok "Latest Everything installer resolved: $($latest.File)"
+            } else {
+                Write-Warn "Could not parse the Voidtools downloads page; using configured URL as-is."
+            }
+        } catch {
+            Write-Warn "Could not resolve latest Everything installer: $($_.Exception.Message)"
+        }
+        if (-not $resolvedEverything) {
+            $fileName = "Everything-1.4.1.1032.x64-Setup.exe"
+            $url = "https://www.voidtools.com/$fileName"
+            Write-Warn "Falling back to known Everything x64 installer: $fileName"
+        }
+    }
+
+    $exePath  = Join-Path $download $fileName
+
+    if (-not (Invoke-DownloadFile -Url $url -Destination $exePath)) {
+        Write-Warn "$name download failed; skipping install."
+        $null = $Global:RunStats.FailedApps.Add($name)
+        return
+    }
+
+    Write-Info "Installing $name silently with args: $silentArgs"
+    try {
+        $code = Invoke-SilentExeInstall -Path $exePath -Arguments @($silentArgs)
+        if ($code -eq 0) {
+            Write-Ok "$name silent install succeeded."
+            $null = $Global:RunStats.InstalledApps.Add($name)
+        } else {
+            Write-Warn "$name installer exited with code $code."
+            if ($Spec.fallbackInteractive) {
+                Write-Warn "Silent install may not be supported. Launching the installer interactively..."
+                Start-Process -FilePath $exePath -Wait -ErrorAction SilentlyContinue
+                Write-Info "$name interactive install finished. Verify manually."
+                $null = $Global:RunStats.InstalledApps.Add("$name (interactive)")
+            } else {
+                $null = $Global:RunStats.FailedApps.Add($name)
+            }
+        }
+    } catch {
+        Write-Warn "$name silent install failed: $($_.Exception.Message)"
+        if ($Spec.fallbackInteractive) {
+            try { Start-Process -FilePath $exePath -Wait -ErrorAction SilentlyContinue } catch { }
+            Write-Info "$name interactive install attempted. Verify manually."
+            $null = $Global:RunStats.InstalledApps.Add("$name (interactive)")
+        } else {
+            $null = $Global:RunStats.FailedApps.Add($name)
+        }
+    }
+
+    if ($Spec.enableService -and $name -ieq 'Everything') {
+        try {
+            $svc = Get-Service -Name "Everything" -ErrorAction SilentlyContinue
+            if ($svc) {
+                Set-Service -Name "Everything" -StartupType Automatic -ErrorAction SilentlyContinue
+                Start-Service -Name "Everything" -ErrorAction SilentlyContinue
+                Write-Ok "Everything service set to Automatic + started."
+            }
+        } catch { Write-Warn "Could not configure Everything service: $($_.Exception.Message)" }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($verifyName)) {
+        $verified = Get-InstalledRegistryDisplayName -NameLike $verifyName
+        if ($verified) { Write-Ok "$name verified after install (registry: $verified)." }
+        else { Write-Warn "$name was not found in uninstall registry after install; verify manually if the installer used a per-user or portable layout." }
+    }
+}
+
+function Install-DirectInstallers {
+    if (-not $Global:Config.directInstallers) { return }
+    foreach ($spec in $Global:Config.directInstallers) {
+        Install-DirectInstaller -Spec $spec
+    }
+}
+
+# =============================================================================
+# SECTION 7: v2rayN INSTALL + RENAME (item 14)
+# =============================================================================
+function New-Shortcut {
+    param([Parameter(Mandatory)][string]$TargetPath,[Parameter(Mandatory)][string]$ShortcutPath,[string]$WorkingDirectory = "",[string]$Description = "")
+    $shell = New-Object -ComObject WScript.Shell
+    $s = $shell.CreateShortcut($ShortcutPath)
+    $s.TargetPath = $TargetPath
+    if ($WorkingDirectory) { $s.WorkingDirectory = $WorkingDirectory }
+    if ($Description)      { $s.Description      = $Description }
+    $s.Save()
+}
+
+function Install-V2RayN {
+    $settings = $Global:Config.v2rayN
+    if (-not $settings.enabled) { return }
+
+    $installRoot   = [string]$settings.installDir
+    $finalFolder   = [string]$settings.finalFolderName
+    if ([string]::IsNullOrWhiteSpace($finalFolder)) { $finalFolder = "V2rayN" }
+    $finalDir      = Join-Path $installRoot $finalFolder
+    $exeName       = [string]$settings.exeName
+
+    Ensure-Directory $installRoot
+    $download = Get-DownloadCachePath
+
+    $repo   = [string]$settings.githubRepo
+    $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
+    Write-Info "Querying latest v2rayN release ($repo)..."
+    try {
+        $release = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'WinServerSetup' }
+        $regex   = [string]$settings.assetNameRegex
+        $asset   = $release.assets | Where-Object { $_.name -match $regex } | Select-Object -First 1
+        if (-not $asset) { throw "No asset matched regex: $regex" }
+        $zipPath = Join-Path $download $asset.name
+        Write-Info "Downloading $($asset.name) ..."
+        if (-not (Invoke-DownloadFile -Url $asset.browser_download_url -Destination $zipPath)) { throw "v2rayN download failed." }
+
+        # Extract to a staging folder so we can rename to V2rayN cleanly.
+        $stage = Join-Path $download ("v2rayN-stage-{0}" -f ([guid]::NewGuid().ToString('N').Substring(0,8)))
+        Ensure-Directory $stage
+        Expand-Archive -Path $zipPath -DestinationPath $stage -Force
+
+        # Identify the root inside the archive (the zip ships with a v2rayN-windows-64 folder).
+        $rootInside = Get-ChildItem -Path $stage -Directory | Select-Object -First 1
+        $srcDir = if ($rootInside) { $rootInside.FullName } else { $stage }
+
+        if (Test-Path $finalDir) {
+            Write-Info "Existing $finalFolder folder found; refreshing it in place."
+            # Replace contents but keep the folder so shortcuts/Quick Access pins survive.
+            $robocopyLog = Join-Path $env:TEMP "WinServerSetup-v2rayN.log"
+            $robo = Start-Process robocopy.exe -ArgumentList @("`"$srcDir`"", "`"$finalDir`"", "/MIR", "/R:1", "/W:2", "/NJH","/NJS","/NFL","/NDL","/NC","/NS","/LOG:`"$robocopyLog`"") -Wait -PassThru -WindowStyle Hidden
+            Write-StructuredLog -Level COMMAND -Message ("v2rayN robocopy exit code: {0}; log: {1}" -f $robo.ExitCode, $robocopyLog)
+            if ($robo.ExitCode -ge 8) { throw "robocopy failed while refreshing v2rayN (exit $($robo.ExitCode)). See $robocopyLog" }
+        } else {
+            Move-Item -LiteralPath $srcDir -Destination $finalDir -Force
+        }
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Ok "v2rayN extracted to $finalDir"
+    } catch {
+        Write-Warn "v2rayN install/update failed: $($_.Exception.Message)"
+        return
+    }
+
+    $exePath = Get-ChildItem -Path $finalDir -Filter $exeName -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $exePath) {
+        Write-Warn "v2rayN executable not found after extraction."
+        return
+    }
+    $exeFull = $exePath.FullName
+    $workDir = Split-Path -Parent $exeFull
+
+    if ($settings.createDesktopShortcut) {
+        $desk = [Environment]::GetFolderPath("Desktop")
+        New-Shortcut -TargetPath $exeFull -ShortcutPath (Join-Path $desk "V2rayN.lnk") -WorkingDirectory $workDir -Description "V2rayN"
+        Write-Ok "Desktop shortcut created/updated -> $exeFull"
+    }
+    if ($settings.createStartMenuShortcut) {
+        $sm = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\WinServerSetup"
+        Ensure-Directory $sm
+        New-Shortcut -TargetPath $exeFull -ShortcutPath (Join-Path $sm "V2rayN.lnk") -WorkingDirectory $workDir -Description "V2rayN"
+        Write-Ok "Start Menu shortcut created/updated -> $exeFull"
+    }
+}
+
+# =============================================================================
+# SECTION 8: POWERSHELL 7 FROM GITHUB (carry-over, cleaner output)
+# =============================================================================
+function Get-PowerShellCoreVersion {
+    if (-not (Test-CommandExists "pwsh")) { return $null }
+    try {
+        $v = & pwsh -NoLogo -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' 2>$null
+        if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+        return [version]([string]$v).Trim()
+    } catch { return $null }
+}
+
+function Install-LatestPowerShellFromGitHub {
+    $s = $Global:Config.powershell
+    if (-not $s -or -not $s.enabled) { return }
+    if ($s.PSObject.Properties.Name -contains "installLatestFromGitHub" -and -not $s.installLatestFromGitHub) {
+        Write-Info "PowerShell GitHub install disabled via installLatestFromGitHub."
+        return
+    }
+    $repo = [string]$s.githubRepo; if ([string]::IsNullOrWhiteSpace($repo)) { $repo = "PowerShell/PowerShell" }
+    Write-Info "Querying latest PowerShell release ($repo)..."
+    try {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing -Headers @{ 'User-Agent' = 'WinServerSetup' }
+    } catch { Write-Warn "GitHub query failed: $($_.Exception.Message)"; return }
+
+    $latestVer = $null; try { $latestVer = [version](([string]$release.tag_name).TrimStart("v")) } catch { }
+    $currentVer = Get-PowerShellCoreVersion
+    if ($currentVer -and $latestVer -and -not $s.forceInstall -and $currentVer -ge $latestVer) {
+        Write-Ok "PowerShell $currentVer already current vs GitHub latest $latestVer."
+        return
+    }
+
+    $regex = [string]$s.assetNameRegex; if ([string]::IsNullOrWhiteSpace($regex)) { $regex = "^PowerShell-.*-win-x64\.msi$" }
+    $asset = $release.assets | Where-Object { $_.name -match $regex } | Select-Object -First 1
+    if (-not $asset) { Write-Warn "No PowerShell asset matched regex $regex"; return }
+
+    $download = Get-DownloadCachePath
+    $msi = Join-Path $download $asset.name
+    if (-not (Invoke-DownloadFile -Url $asset.browser_download_url -Destination $msi)) { return }
+
+    $msiArgs = @("/i", "`"$msi`"")
+    if ($s.interactiveInstaller) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$s.msiArguments)) { $msiArgs += ([string]$s.msiArguments) }
+    } else {
+        $msiArgs += @("/qn","/norestart")
+        if (-not [string]::IsNullOrWhiteSpace([string]$s.silentMsiArguments)) { $msiArgs += ([string]$s.silentMsiArguments) }
+    }
+    Write-Info "Installing PowerShell silently ..."
+    try {
+        $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList ($msiArgs -join ' ') -Wait -PassThru -WindowStyle Hidden
+        Write-StructuredLog -Level COMMAND -Message ("PowerShell MSI exit code: {0}" -f $proc.ExitCode)
+        if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+            Write-Ok "PowerShell installer completed."
+            if ($proc.ExitCode -eq 3010) { Set-PendingReboot "PowerShell 7 installer requested reboot" }
+            $null = $Global:RunStats.InstalledApps.Add("PowerShell 7")
+        } else {
+            Write-Warn "PowerShell installer exited with code $($proc.ExitCode)."
+            $null = $Global:RunStats.FailedApps.Add("PowerShell 7")
+        }
+    } catch {
+        Write-Fail "PowerShell installer failed: $($_.Exception.Message)"
+        $null = $Global:RunStats.FailedApps.Add("PowerShell 7")
+    }
+}
+
+# =============================================================================
+# SECTION 9: WINDOWS TERMINAL + PS7 DEFAULT PROFILE (items 4)
+# =============================================================================
+function Install-WindowsTerminal {
+    $s = $Global:Config.windowsTerminal
+    if (-not $s -or -not $s.enabled) { return }
+    if (-not (Ensure-Winget)) { return }
+
+    $pkg = [string]$s.packageId; if ([string]::IsNullOrWhiteSpace($pkg)) { $pkg = "Microsoft.WindowsTerminal" }
+    $listOutput = winget list --id $pkg --exact --accept-source-agreements --source winget 2>$null
+    if ($LASTEXITCODE -eq 0 -and ($listOutput -join "`n") -match [regex]::Escape($pkg)) {
+        Write-Ok "Windows Terminal already installed."
+        try { [void](Invoke-LoggedCommand -FilePath "winget" -Arguments @("upgrade", "--id", $pkg, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--silent", "--source", "winget") -DisplayName "winget upgrade Windows Terminal") } catch { }
+    } else {
+        $args = @("install", "--id", $pkg, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget")
+        if ($s.interactiveInstaller) { $args += "--interactive" } else { $args += "--silent" }
+        try {
+            $terminalResult = Invoke-LoggedCommand -FilePath "winget" -Arguments $args -DisplayName "winget install Windows Terminal"
+            if ($terminalResult.ExitCode -eq 0) { Write-Ok "Windows Terminal install completed." }
+            else { Write-Warn "Windows Terminal install exited with code $($terminalResult.ExitCode)." }
+        }
+        catch { Write-Fail "Windows Terminal install failed: $($_.Exception.Message)"; return }
+    }
+
+    if ($s.setAsDefaultTerminal)              { Set-WindowsTerminalAsDefault }
+    if ($s.setPowerShell7AsDefaultProfile)    { Set-WindowsTerminalPowerShell7Default }
+}
+
+function Set-WindowsTerminalAsDefault {
+    Write-Info "Setting Windows Terminal as default terminal (current user)."
+    $sk = "HKCU:\Console\%%Startup"
+    if (-not (Test-Path $sk)) { New-Item -Path $sk -Force | Out-Null }
+    Set-ItemProperty -Path $sk -Name "DelegationConsole"  -Type String -Value "{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}"
+    Set-ItemProperty -Path $sk -Name "DelegationTerminal" -Type String -Value "{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}"
+    Write-Ok "Windows Terminal set as default terminal application."
+}
+
+function Get-WindowsTerminalSettingsPath {
+    $stable = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json"
+    if (Test-Path $stable) { return $stable }
+    $root = Join-Path $env:LOCALAPPDATA "Packages"
+    if (Test-Path $root) {
+        $c = Get-ChildItem -Path $root -Directory -Filter "Microsoft.WindowsTerminal_*" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($c) { return (Join-Path $c.FullName "LocalState\settings.json") }
+    }
+    return $stable
+}
+
+function Set-WindowsTerminalPowerShell7Default {
+    $pwshPath = Get-PowerShell7ExePath
+    if (-not (Test-Path $pwshPath)) { Write-Warn "PowerShell 7 not found; default profile not changed."; return }
+
+    $settingsPath = Get-WindowsTerminalSettingsPath
+    $settingsDir  = Split-Path -Parent $settingsPath
+    Ensure-Directory $settingsDir
+
+    # Deterministic GUID matched by Windows Terminal for stock PowerShell-Core fragment.
+    $profileGuid = "{574e775e-4f2a-5b96-ac1e-a2962a402336}"
+
+    if (-not (Test-Path $settingsPath)) {
+        $escaped = $pwshPath -replace '\\','\\'
+        $json = @"
+{
+  "`$schema": "https://aka.ms/terminal-profiles-schema",
+  "defaultProfile": "$profileGuid",
+  "profiles": {
+    "defaults": {},
+    "list": [
+      { "guid": "$profileGuid", "name": "PowerShell 7", "commandline": "$escaped", "hidden": false }
+    ]
+  }
+}
+"@
+        Set-Content -LiteralPath $settingsPath -Value $json -Encoding utf8
+        Write-Ok "Created Windows Terminal settings.json with PowerShell 7 default."
+        return
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8
+        $sj  = $raw | ConvertFrom-Json
+    } catch {
+        Write-Warn "Could not parse Windows Terminal settings.json. Leaving it untouched."
+        return
+    }
+    try {
+        if (-not $sj.profiles)      { $sj | Add-Member -NotePropertyName profiles -NotePropertyValue ([pscustomobject]@{ defaults=([pscustomobject]@{}); list=@() }) -Force }
+        if (-not $sj.profiles.list) { $sj.profiles | Add-Member -NotePropertyName list -NotePropertyValue @() -Force }
+
+        $existing = $sj.profiles.list | Where-Object {
+            ($_.guid -eq $profileGuid) -or
+            ($_.name -match 'PowerShell' -and $_.commandline -match 'pwsh') -or
+            ($_.source -match 'Windows.Terminal.PowershellCore')
+        } | Select-Object -First 1
+        if ($existing) {
+            $profileGuid = [string]$existing.guid
+            if ([string]::IsNullOrWhiteSpace($profileGuid)) {
+                $profileGuid = "{574e775e-4f2a-5b96-ac1e-a2962a402336}"
+                $existing | Add-Member -NotePropertyName guid -NotePropertyValue $profileGuid -Force
+            }
+        } else {
+            $sj.profiles.list = @($sj.profiles.list) + ([pscustomobject]@{
+                guid = $profileGuid; name = "PowerShell 7"; commandline = $pwshPath; hidden = $false
+            })
+        }
+        $sj | Add-Member -NotePropertyName defaultProfile -NotePropertyValue $profileGuid -Force
+        $sj | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+        Write-Ok "Windows Terminal default profile is now PowerShell 7."
+    } catch {
+        Write-Warn "Could not update Windows Terminal settings safely: $($_.Exception.Message)"
+    }
+}
+
+function Get-PowerShell7ExePath {
+    $pwshPath = Join-Path $env:ProgramFiles "PowerShell\7\pwsh.exe"
+    if (Test-Path $pwshPath) { return $pwshPath }
+    $cmd = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
+function Set-PowerShell7AsPs1Default {
+    $s = $Global:Config.powershell
+    if ($s -and ($s.PSObject.Properties.Name -contains "setPs1DefaultApp") -and -not $s.setPs1DefaultApp) {
+        Write-Info "PowerShell 7 .ps1 default app step disabled in config."
+        return
+    }
+
+    $pwshPath = Get-PowerShell7ExePath
+    if (-not $pwshPath -or -not (Test-Path $pwshPath)) {
+        Write-Warn "PowerShell 7 executable not found; .ps1 default handler was not changed."
+        return
+    }
+
+    $progId = "WinServerSetup.PowerShell7Script"
+    $progPath = "HKCU:\Software\Classes\$progId"
+    $cmdPath = Join-Path $progPath "shell\open\command"
+    Set-RegistryDefaultValue -Path $progPath -Value "PowerShell 7 Script"
+    Set-RegistryDefaultValue -Path $cmdPath -Value ("`"{0}`" -NoLogo -File `"%1`" %*" -f $pwshPath)
+
+    $extPath = "HKCU:\Software\Classes\.ps1"
+    Set-RegistryDefaultValue -Path $extPath -Value $progId
+    $openWithPath = Join-Path $extPath "OpenWithProgids"
+    if (-not (Test-Path $openWithPath)) { New-Item -Path $openWithPath -Force | Out-Null }
+    New-ItemProperty -Path $openWithPath -Name $progId -Value "" -PropertyType String -Force | Out-Null
+
+    $userChoice = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.ps1\UserChoice"
+    if (Test-Path $userChoice) {
+        try {
+            Remove-Item -Path $userChoice -Recurse -Force -ErrorAction Stop
+            Write-Info "Removed protected .ps1 UserChoice key so HKCU class default can apply."
+        } catch {
+            Write-Warn "Windows blocked .ps1 UserChoice removal; choose PowerShell 7 once from Open with if the old handler remains."
+        }
+    }
+
+    Write-Ok ".ps1 default open command is configured for PowerShell 7."
+}
+
+# =============================================================================
+# SECTION 10: BRAVE EXTENSIONS (item 13)
+# =============================================================================
+function Open-BraveBrowser {
+    param([string]$Url)
+    $candidates = @(
+        (Join-Path $env:ProgramFiles "BraveSoftware\Brave-Browser\Application\brave.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "BraveSoftware\Brave-Browser\Application\brave.exe")
+    )
+    $exe = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if (-not $exe) { return $false }
+    try {
+        if ([string]::IsNullOrWhiteSpace($Url)) { Start-Process $exe } else { Start-Process $exe -ArgumentList $Url }
+        return $true
+    } catch { return $false }
+}
+
+function Install-BraveExtensions {
+    $cfg = $Global:Config.braveExtensions
+    if (-not $cfg -or -not $cfg.enabled) { return }
+
+    if ($cfg.useForceListPolicy) {
+        try {
+            $policyPath = "HKLM:\SOFTWARE\Policies\BraveSoftware\Brave\ExtensionInstallForcelist"
+            if (-not (Test-Path $policyPath)) { New-Item -Path $policyPath -Force | Out-Null }
+            $i = 1
+            foreach ($ext in $cfg.items) {
+                $value = "{0};https://clients2.google.com/service/update2/crx" -f $ext.id
+                Set-ItemProperty -Path $policyPath -Name ([string]$i) -Type String -Value $value
+                Write-Ok "Policy added for $($ext.name) ($($ext.id))."
+                $i++
+            }
+            Write-Info "Brave will install force-listed extensions on next start (Chrome policy honored)."
+        } catch {
+            Write-Warn "Could not set Brave ExtensionInstallForcelist policy: $($_.Exception.Message)"
+        }
+    }
+
+    if ($cfg.openInBrave) {
+        $opened = $false
+        foreach ($ext in $cfg.items) {
+            if (Open-BraveBrowser -Url $ext.url) {
+                Write-Ok "Opened Brave to $($ext.name): $($ext.url)"
+                $opened = $true
+            } else {
+                Write-Warn "Brave not installed yet; could not open $($ext.name) install page."
+            }
+        }
+        if (-not $opened) { Write-Warn "Install Brave first, then re-run option 'Install Brave extensions'." }
+    }
+}
+
+# =============================================================================
+# SECTION 10b: 7-ZIP AS DEFAULT FOR COMPRESSED FILE EXTENSIONS
+# =============================================================================
+# Registers 7-Zip ProgIds (7-Zip.zip, 7-Zip.rar, ...) as the per-user default
+# handler for the configured extensions, under HKCU:\Software\Classes. This is
+# the only programmatic association that Windows 10/11 honors reliably without
+# the protected UserChoice hash. The DefaultAppAssociations.xml file already
+# contains the equivalent entries for new user profiles (applied via DISM).
+
+function Test-SevenZipInstalled {
+    param([string]$InstallPath = "C:\Program Files\7-Zip")
+    $exe = Join-Path $InstallPath "7zFM.exe"
+    if (Test-Path $exe) { return $exe }
+    $alt = Join-Path ${env:ProgramFiles(x86)} "7-Zip\7zFM.exe"
+    if (Test-Path $alt) { return $alt }
+    if (Test-CommandExists "7z") { return (Get-Command 7z -ErrorAction SilentlyContinue).Source }
+    return $null
+}
+
+function Test-SevenZipProgIdRegistered {
+    param([Parameter(Mandatory)][string]$ProgId)
+    # 7-Zip writes its ProgIds into HKLM\Software\Classes during install (HKCR).
+    return (Test-Path "Registry::HKEY_CLASSES_ROOT\$ProgId") -or (Test-Path "HKLM:\SOFTWARE\Classes\$ProgId")
+}
+
+function Set-FileExtensionDefaultHandler {
+    param(
+        [Parameter(Mandatory)][string]$Extension,
+        [Parameter(Mandatory)][string]$ProgId,
+        [switch]$RemoveUserChoice
+    )
+    if (-not $Extension.StartsWith('.')) { $Extension = ".$Extension" }
+
+    # HKCU\Software\Classes\<.ext> -> (Default) = ProgId
+    $classPath = "HKCU:\Software\Classes\$Extension"
+    Set-RegistryDefaultValue -Path $classPath -Value $ProgId
+
+    # HKCU\Software\Classes\<.ext>\OpenWithProgids\<ProgId> = ""
+    $owpPath = Join-Path $classPath "OpenWithProgids"
+    if (-not (Test-Path $owpPath)) { New-Item -Path $owpPath -Force | Out-Null }
+    Set-ItemProperty -Path $owpPath -Name $ProgId -Value "" -Type String
+
+    if ($RemoveUserChoice) {
+        # If a previous UserChoice exists, Windows enforces it (with a hash) and
+        # ignores our Classes default. Try to remove it. Some Windows builds
+        # protect this key against deletion; we log and continue.
+        $ucPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$Extension\UserChoice"
+        if (Test-Path $ucPath) {
+            try {
+                Remove-Item -Path $ucPath -Force -Recurse -ErrorAction Stop
+            } catch {
+                Write-Warn ("UserChoice key locked for {0} ({1}). Default may not switch until you 'Open with' once manually." -f $Extension, $_.Exception.Message)
+            }
+        }
+    }
+}
+
+function Set-SevenZipAsDefault {
+    $s = $Global:Config.sevenZipDefaults
+    if (-not $s -or -not $s.enabled) {
+        Write-Info "7-Zip default-handler step disabled in config."
+        return
+    }
+
+    $installPath = if ([string]::IsNullOrWhiteSpace([string]$s.installPath)) { "C:\Program Files\7-Zip" } else { [string]$s.installPath }
+    $exe = Test-SevenZipInstalled -InstallPath $installPath
+    if (-not $exe) {
+        Write-Warn "7-Zip not installed yet; install it first (Install applications) and re-run this step."
+        return
+    }
+    Write-Info ("7-Zip detected at: {0}" -f $exe)
+
+    $exts        = @($s.extensions)
+    $removeUC    = [bool]$s.removeUserChoice
+    $applied     = 0
+    $skipped     = 0
+    $missingPid  = New-Object System.Collections.Generic.List[string]
+
+    foreach ($ext in $exts) {
+        if ([string]::IsNullOrWhiteSpace($ext)) { continue }
+        if (-not $ext.StartsWith('.')) { $ext = ".$ext" }
+        $progId = "7-Zip" + $ext   # 7-Zip ProgIds look like "7-Zip.zip", "7-Zip.rar", ...
+
+        if (-not (Test-SevenZipProgIdRegistered -ProgId $progId)) {
+            $missingPid.Add($ext) | Out-Null
+            $skipped++
+            continue
+        }
+        try {
+            Set-FileExtensionDefaultHandler -Extension $ext -ProgId $progId -RemoveUserChoice:$removeUC
+            Write-Ok ("Default handler set: {0,-8} -> {1}" -f $ext, $progId)
+            $applied++
+        } catch {
+            Write-Warn ("Could not set default for {0}: {1}" -f $ext, $_.Exception.Message)
+        }
+    }
+
+    if ($missingPid.Count -gt 0) {
+        Write-Warn ("7-Zip has no ProgId registered for these extensions; skipped: {0}" -f ($missingPid -join ', '))
+        Write-Warn "Open 7-Zip File Manager -> Tools -> Options -> 7-Zip tab and pick the missing types manually if needed."
+    }
+
+    # Refresh Explorer so the new icons/associations are visible without re-login.
+    try {
+        $sig = '[DllImport("shell32.dll")] public static extern int SHChangeNotify(int eventId, int flags, IntPtr item1, IntPtr item2);'
+        $shell = Add-Type -MemberDefinition $sig -Namespace WinShell -Name Notify -PassThru -ErrorAction SilentlyContinue
+        if ($shell) { [void]$shell::SHChangeNotify(0x8000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero) }
+    } catch { }
+
+    Write-Ok ("7-Zip default handler step done. Applied: {0}, Skipped: {1}." -f $applied, $skipped)
+}
+
+# =============================================================================
+# SECTION 11: DEFAULT APPS (carry over)
+# =============================================================================
+function Configure-DefaultApps {
+    $s = $Global:Config.defaultApps
+    if (-not $s -or -not $s.enabled) { return }
+    if ($s.importXmlIfExists) {
+        $xml = Resolve-RelativePath ([string]$s.xmlPath)
+        if (Test-Path $xml) {
+            Write-Info "Importing default app associations: $xml"
+            try {
+                $dismResult = Invoke-LoggedCommand -FilePath "dism.exe" -Arguments @("/Online", "/Import-DefaultAppAssociations:$xml") -DisplayName "DISM default app import"
+                if ($dismResult.ExitCode -eq 0) {
+                    Write-Ok "Default associations import completed."
+                } else {
+                    Write-Warn "Default associations import exited with code $($dismResult.ExitCode). Windows may require manual default-app selection for the current user."
+                }
+            } catch { Write-Warn "DISM import failed: $($_.Exception.Message)" }
+        } else { Write-Warn "Default app associations XML not found: $xml" }
+    }
+    if ($s.openSettingsAfterInstall) { try { Start-Process "ms-settings:defaultapps" -ErrorAction SilentlyContinue } catch { } }
+}
+
+# =============================================================================
+# SECTION 12: RDP PORT SAFETY (item 8) + bruteforce blocker (items 34, 36)
+# =============================================================================
+function Test-TcpPortListening {
+    param([Parameter(Mandatory)][int]$Port)
+    try {
+        $conns = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop
+        return [bool]$conns
+    } catch { return $false }
+}
+
+function Ensure-RdpFirewallRule {
+    param(
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)][int]$Port
+    )
+    try {
+        $rule = Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue
+        if (-not $rule) {
+            New-NetFirewallRule -DisplayName $DisplayName -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+        } else {
+            $rule | Set-NetFirewallRule -Enabled True -Action Allow -Profile Any -ErrorAction Stop
+            $rule | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter -Protocol TCP -LocalPort $Port -ErrorAction Stop
+        }
+
+        $verifyRule = Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction Stop
+        $verifyPort = $verifyRule | Get-NetFirewallPortFilter
+        if ($verifyRule.Enabled -ne 'True' -or $verifyRule.Action -ne 'Allow' -or [string]$verifyPort.Protocol -ne 'TCP' -or [string]$verifyPort.LocalPort -ne [string]$Port) {
+            throw "Firewall verification failed for $DisplayName."
+        }
+        Write-Ok "Firewall rule verified: $DisplayName allows TCP $Port."
+        return $true
+    } catch {
+        Write-Fail "Failed to create/verify firewall rule for TCP ${Port}: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Configure-RdpPortAndFirewall {
+    $s = $Global:Config.rdp
+    if (-not $s.enabled) { return }
+    $newPort = [int]$s.newPort
+    $oldPort = [int]$s.oldPort
+    if ($newPort -lt 1 -or $newPort -gt 65535) { throw "Invalid RDP port: $newPort" }
+
+    Write-Info "Step 1/5: Enable Remote Desktop in registry."
+    Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+    Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+    Write-Info "Step 2/5: Pre-create inbound firewall rule for new port $newPort BEFORE changing service port."
+    $newRule = "WinServerSetup RDP TCP $newPort"
+    if (-not (Ensure-RdpFirewallRule -DisplayName $newRule -Port $newPort)) {
+        throw "ABORTING RDP port change to prevent lockout because firewall setup failed."
+    }
+
+    Write-Info "Step 3/5: Backup current PortNumber and update registry."
+    $rdpPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+    $backup = Resolve-RelativePath "backups\RDP-Tcp-PortNumber.reg"
+    try { reg.exe export "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" "$backup" /y | Out-Null } catch { }
+    Set-ItemProperty -Path $rdpPath -Name "PortNumber" -Type DWord -Value $newPort
+    Write-Ok "PortNumber registry value set to $newPort."
+
+    Write-Info "Step 4/5: Restart TermService to bind the new port."
+    if ($s.restartRemoteDesktopService) {
+        Write-Warn "Restarting Remote Desktop service -- your current RDP session may briefly disconnect."
+        try { Restart-Service TermService -Force -ErrorAction Stop; Start-Sleep -Seconds 2 } catch { Write-Warn "Service restart had issues: $($_.Exception.Message)" }
+    } else {
+        Write-Info "Skipping service restart (config). Reboot will apply the change."
+        Set-PendingReboot "RDP port change requires service restart"
+    }
+
+    Write-Info "Step 5/5: Verify the new port is listening."
+    if ($s.verifyListening) {
+        Start-Sleep -Seconds 2
+        if (Test-TcpPortListening -Port $newPort) {
+            Write-Ok "Confirmed: TCP $newPort is listening."
+            if ($s.blockOldPort -and $oldPort -ne $newPort) {
+                $blockName = "WinServerSetup Block Old RDP TCP $oldPort"
+                if (-not (Get-NetFirewallRule -DisplayName $blockName -ErrorAction SilentlyContinue)) {
+                    try {
+                        New-NetFirewallRule -DisplayName $blockName -Direction Inbound -Protocol TCP -LocalPort $oldPort -Action Block -Profile Any | Out-Null
+                        Write-Ok "Old port $oldPort blocked (only after new port verified)."
+                    } catch { Write-Warn "Could not block old port $oldPort : $($_.Exception.Message)" }
+                }
+            }
+        } else {
+            Write-Warn "Could not confirm new port is listening yet. Old port will NOT be blocked to avoid lockout."
+        }
+    }
+}
+
+function Install-RdpBruteforceBlocker {
+    $s = $Global:Config.rdpBruteforceBlocker
+    if (-not $s.enabled) { return }
+    $scriptPath = Join-Path $Global:ProjectRoot "scripts\Block-RdpBruteforce.ps1"
+    if (-not (Test-Path $scriptPath)) { throw "Blocker script not found: $scriptPath" }
+
+    $taskName = [string]$s.taskName
+    $interval = [int]$s.taskIntervalMinutes; if ($interval -lt 1) { $interval = 5 }
+    $hidden   = $true
+
+    $psExe = Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $hiddenFlag = if ($hidden) { "-WindowStyle Hidden " } else { "" }
+    # Always use the CURRENT resolved config path (so post-relocate runs use the new path) -- item 36.
+    $arguments = "${hiddenFlag}-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`" -ConfigPath `"$Global:ConfigPath`""
+
+    $action    = New-ScheduledTaskAction    -Execute $psExe -Argument $arguments
+    $trigger   = New-ScheduledTaskTrigger   -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes $interval) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden
+
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Ok ("Scheduled task registered: {0}  (hidden, highest privileges)" -f $taskName)
+    Write-Info ("Task argument: {0}" -f $arguments)
+    try {
+        $registered = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        $registeredAction = $registered.Actions | Select-Object -First 1
+        Write-StructuredLog -Level TASK -Message ("{0} execute: {1}" -f $taskName, $registeredAction.Execute)
+        Write-StructuredLog -Level TASK -Message ("{0} arguments: {1}" -f $taskName, $registeredAction.Arguments)
+        if ([string]$registeredAction.Arguments -notlike "*$Global:ConfigPath*") {
+            Write-Warn "RDP blocker task action does not appear to reference the resolved config path."
+        } else {
+            Write-Ok "RDP blocker task action verified with config path: $Global:ConfigPath"
+        }
+    } catch {
+        Write-Warn "Could not verify RDP blocker scheduled task action: $($_.Exception.Message)"
+    }
+
+    Write-Info "Running blocker once now for verification..."
+    try { & $psExe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -ConfigPath $Global:ConfigPath } catch { Write-Warn "Blocker test run failed: $($_.Exception.Message)" }
+}
+
+# =============================================================================
+# SECTION 13: SEARCH INDEXING (carry over)
+# =============================================================================
+function Enable-SearchIndexing {
+    if (-not $Global:Config.indexing.enabled) { return }
+    Write-Info "Installing/enabling Windows Search service."
+    try {
+        $before = Get-Service -Name WSearch -ErrorAction SilentlyContinue
+        if ($before) { Write-Info "Windows Search initial state: $($before.Status) / $($before.StartType)" }
+        else { Write-Info "Windows Search service not found before enable attempt." }
+    } catch { }
+    try {
+        if (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue) {
+            Install-WindowsFeature Search-Service -ErrorAction SilentlyContinue | Out-Null
+        }
+    } catch { Write-Warn "Install-WindowsFeature Search-Service: $($_.Exception.Message)" }
+    try {
+        Set-Service -Name WSearch -StartupType Automatic
+        Start-Service -Name WSearch -ErrorAction SilentlyContinue
+        $after = Get-Service -Name WSearch -ErrorAction SilentlyContinue
+        if ($after) { Write-Ok "Windows Search service final state: $($after.Status) / $($after.StartType)" }
+        else { Write-Warn "Windows Search service is still not available after enable attempt." }
+    } catch { Write-Warn "Could not start WSearch: $($_.Exception.Message)" }
+}
+
+# =============================================================================
+# SECTION 14: .NET + VC++ RUNTIMES (items 23, 31)
+# =============================================================================
+function Install-DotNetFramework35 {
+    if (-not $Global:Config.runtimes.installDotNetFramework35) { return }
+    Write-Info "Installing .NET Framework 3.5 feature."
+    try {
+        if (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue) {
+            Install-WindowsFeature NET-Framework-Core -ErrorAction SilentlyContinue | Out-Null
+        } else {
+            Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart -ErrorAction SilentlyContinue | Out-Null
+        }
+        Write-Ok ".NET Framework 3.5 feature step completed."
+    } catch { Write-Warn ".NET 3.5 feature install warning: $($_.Exception.Message)" }
+}
+
+function Get-DotNetFrameworkReleaseValue {
+    try {
+        $k = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -Name Release -ErrorAction Stop
+        return [int]$k.Release
+    } catch { return 0 }
+}
+
+function Install-DotNetFramework4Plus {
+    if (-not $Global:Config.runtimes.installDotNetFramework4Plus) { return }
+    $rv = Get-DotNetFrameworkReleaseValue
+    if ($rv -ge 533320) { Write-Ok ".NET Framework 4.8.1+ already installed (release $rv)."; return }
+    $url = [string]$Global:Config.runtimes.dotNetFramework481OfflineUrl
+    if ([string]::IsNullOrWhiteSpace($url)) { $url = "https://go.microsoft.com/fwlink/?linkid=2203305" }
+    $download = Get-DownloadCachePath
+    $msi = Join-Path $download "NDP481-x86-x64-AllOS-ENU.exe"
+    if (-not (Invoke-DownloadFile -Url $url -Destination $msi)) { return }
+    Write-Info "Installing .NET Framework 4.8.1 (passive, no restart)..."
+    try {
+        $proc = Start-Process -FilePath $msi -ArgumentList "/passive /norestart" -Wait -PassThru -WindowStyle Hidden
+        Write-StructuredLog -Level COMMAND -Message (".NET Framework 4.8.1 installer exit code: {0}" -f $proc.ExitCode)
+        if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+            Write-Ok ".NET Framework 4.8.1 install command finished."
+            Set-PendingReboot ".NET Framework 4.8.1 may require reboot"
+        } else {
+            Write-Warn ".NET Framework 4.8.1 installer exited with code $($proc.ExitCode)."
+        }
+    } catch { Write-Warn ".NET 4.8.1 install failed: $($_.Exception.Message)" }
+}
+
+function Install-WingetRuntimePackage {
+    param([Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][string]$Id)
+    try {
+        $listOutput = winget list --id $Id --exact --accept-source-agreements --source winget 2>$null
+        if ($LASTEXITCODE -eq 0 -and ($listOutput -join "`n") -match [regex]::Escape($Id)) {
+            Write-Ok "$Name already installed."
+            return
+        }
+        $runtimeResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("install", "--id", $Id, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget", "--silent") -DisplayName "winget runtime $Name"
+        if ($runtimeResult.ExitCode -eq 0) { Write-Ok "$Name installed." } else { Write-Warn "$Name install exit code $($runtimeResult.ExitCode)." }
+    } catch { Write-Warn "${Name}: $($_.Exception.Message)" }
+}
+
+function Install-DotNetDesktopRuntimes {
+    if (-not $Global:Config.runtimes.installDotNetDesktopRuntimes) { return }
+    if (-not (Ensure-Winget)) { return }
+    $packages = @()
+    if ($Global:Config.runtimes.includeUnsupportedDotNetVersions) {
+        $packages += @(
+            @{ Name = ".NET Desktop Runtime 5 x64 (unsupported)"; Id = "Microsoft.DotNet.DesktopRuntime.5" },
+            @{ Name = ".NET Desktop Runtime 6 x64 (unsupported)"; Id = "Microsoft.DotNet.DesktopRuntime.6" },
+            @{ Name = ".NET Desktop Runtime 7 x64 (unsupported)"; Id = "Microsoft.DotNet.DesktopRuntime.7" }
+        )
+    }
+    $packages += @(
+        @{ Name = ".NET Desktop Runtime 8 x64"; Id = "Microsoft.DotNet.DesktopRuntime.8" },
+        @{ Name = ".NET Desktop Runtime 9 x64"; Id = "Microsoft.DotNet.DesktopRuntime.9" },
+        @{ Name = ".NET Desktop Runtime 10 x64"; Id = "Microsoft.DotNet.DesktopRuntime.10" }
+    )
+    foreach ($p in $packages) { Install-WingetRuntimePackage -Name $p.Name -Id $p.Id }
+}
+
+function Install-DotNetCoreRuntimes {
+    if (-not $Global:Config.runtimes.installDotNetCoreRuntimes) { return }
+    if (-not (Ensure-Winget)) { return }
+    $packages = @()
+    if ($Global:Config.runtimes.includeUnsupportedDotNetVersions) {
+        $packages += @(
+            @{ Name = ".NET Runtime 5 x64 (unsupported)"; Id = "Microsoft.DotNet.Runtime.5" },
+            @{ Name = ".NET Runtime 6 x64 (unsupported)"; Id = "Microsoft.DotNet.Runtime.6" },
+            @{ Name = ".NET Runtime 7 x64 (unsupported)"; Id = "Microsoft.DotNet.Runtime.7" }
+        )
+    }
+    $packages += @(
+        @{ Name = ".NET Runtime 8 x64"; Id = "Microsoft.DotNet.Runtime.8" },
+        @{ Name = ".NET Runtime 9 x64"; Id = "Microsoft.DotNet.Runtime.9" },
+        @{ Name = ".NET Runtime 10 x64"; Id = "Microsoft.DotNet.Runtime.10" }
+    )
+    foreach ($p in $packages) { Install-WingetRuntimePackage -Name $p.Name -Id $p.Id }
+}
+
+# NOTE: ASP.NET Core Runtimes are intentionally NOT installed (item 31).
+# The installAspNetCoreRuntimes flag in config is forced to false and this
+# function is left here as a no-op for backwards compatibility.
+function Install-DotNetAspNetCoreRuntimes {
+    if ($Global:Config.runtimes.installDotNetAspNetCoreRuntimes) {
+        Write-Warn "ASP.NET Core Runtime install requested in config but explicitly disabled per project policy."
+    } else {
+        Write-Info "ASP.NET Core Runtime install is disabled by project policy (item 31)."
+    }
+}
+
+function Install-VisualCppRuntimes {
+    if (-not $Global:Config.runtimes.installVisualCppRuntimes) { return }
+    if (-not (Ensure-Winget)) { return }
+    $packages = @(
+        @{ Name = "VC++ 2015-2022 x64"; Id = "Microsoft.VCRedist.2015+.x64" },
+        @{ Name = "VC++ 2015-2022 x86"; Id = "Microsoft.VCRedist.2015+.x86" }
+    )
+    if ($Global:Config.runtimes.installLegacyVisualCppRuntimes) {
+        $packages += @(
+            @{ Name = "VC++ 2013 x64"; Id = "Microsoft.VCRedist.2013.x64" },
+            @{ Name = "VC++ 2013 x86"; Id = "Microsoft.VCRedist.2013.x86" },
+            @{ Name = "VC++ 2012 x64"; Id = "Microsoft.VCRedist.2012.x64" },
+            @{ Name = "VC++ 2012 x86"; Id = "Microsoft.VCRedist.2012.x86" },
+            @{ Name = "VC++ 2010 x64"; Id = "Microsoft.VCRedist.2010.x64" },
+            @{ Name = "VC++ 2010 x86"; Id = "Microsoft.VCRedist.2010.x86" },
+            @{ Name = "VC++ 2008 x64"; Id = "Microsoft.VCRedist.2008.x64" },
+            @{ Name = "VC++ 2008 x86"; Id = "Microsoft.VCRedist.2008.x86" },
+            @{ Name = "VC++ 2005 x86"; Id = "Microsoft.VCRedist.2005.x86" }
+        )
+    }
+    foreach ($p in $packages) { Install-WingetRuntimePackage -Name $p.Name -Id $p.Id }
+}
+
+function Install-Runtimes {
+    Install-DotNetFramework35
+    Install-DotNetFramework4Plus
+    Install-DotNetDesktopRuntimes
+    Install-DotNetCoreRuntimes
+    Install-DotNetAspNetCoreRuntimes   # no-op (policy)
+    Install-VisualCppRuntimes
+}
+
+# =============================================================================
+# SECTION 15: EMPTY STANDBY LIST TASK (item 21)
+# =============================================================================
+function Install-EmptyStandbyList {
+    $s = $Global:Config.emptyStandbyList
+    if (-not $s.enabled) { return }
+    $installDir = [string]$s.installDir
+    $exeName    = [string]$s.exeName
+    $exePath    = Join-Path $installDir $exeName
+    $xmlName    = if ($s.PSObject.Properties.Name -contains "taskXmlName") { [string]$s.taskXmlName } else { "EmptyStandbyList.xml" }
+    $xmlPath    = Join-Path $installDir $xmlName
+    $taskName   = [string]$s.taskName
+    $taskPath   = if ($s.PSObject.Properties.Name -contains "taskPath") { [string]$s.taskPath } else { "\" }
+    $repeat     = [int]$s.repeatMinutes
+    if (-not $taskPath.StartsWith("\")) { $taskPath = "\" + $taskPath }
+    if (-not $taskPath.EndsWith("\"))   { $taskPath = $taskPath + "\" }
+
+    Ensure-Directory $installDir
+    if (-not (Test-Path $exePath)) {
+        $local = Resolve-RelativePath ("apps\installers\" + $exeName)
+        if (Test-Path $local) {
+            Copy-Item -LiteralPath $local -Destination $exePath -Force
+            Write-Ok "Copied EmptyStandbyList.exe from local installers folder."
+        } else {
+            $repo = [string]$s.sourceRepo
+            $raw  = "https://raw.githubusercontent.com/$repo/master/$exeName"
+            if (-not (Invoke-DownloadFile -Url $raw -Destination $exePath)) {
+                Write-Warn "Could not obtain EmptyStandbyList.exe. Put it in apps\installers and re-run."
+                return
+            }
+        }
+    } else { Write-Ok "EmptyStandbyList.exe already at $exePath" }
+
+    $start = (Get-Date).AddMinutes(1).ToString("yyyy-MM-ddTHH:mm:ss")
+    $interval = "PT${repeat}M"
+    $taskUri  = "$taskPath$taskName"
+    $arg      = ([string]$s.argument).Replace("&","&amp;").Replace("<","&lt;").Replace(">","&gt;")
+    $cmd      = $exePath.Replace("&","&amp;").Replace("<","&lt;").Replace(">","&gt;")
+
+    $xmlContent = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>WinServerSetup</Author>
+    <Description>Clear standby memory every $repeat minutes using EmptyStandbyList.exe $arg.</Description>
+    <URI>$taskUri</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <Repetition><Interval>$interval</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
+      <StartBoundary>$start</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>$cmd</Command><Arguments>$arg</Arguments></Exec>
+  </Actions>
+</Task>
+"@
+    $xmlContent | Set-Content -LiteralPath $xmlPath -Encoding Unicode -Force
+    Write-Ok "Task XML written to: $xmlPath"
+
+    try { Unregister-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+    Register-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Xml (Get-Content -LiteralPath $xmlPath -Raw) -Force | Out-Null
+    Write-Ok ("Empty Cache scheduled task registered: {0}{1}  every {2} min (hidden, highest privileges)" -f $taskPath, $taskName, $repeat)
+
+    # Verify
+    $verify = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction SilentlyContinue
+    if ($verify) { Write-Ok "Task verified in Task Scheduler." } else { Write-Warn "Could not verify Empty Cache task after registration." }
+}
+
+# =============================================================================
+# SECTION 16: QoS / BANDWIDTH (item 22)
+# =============================================================================
+function Configure-WindowsUpdateBandwidthPolicies {
+    $s = $Global:Config.windowsUpdateBandwidth
+    if (-not $s.enabled) { return }
+    Write-Info "Applying QoS / DeliveryOptimization / WindowsUpdate bandwidth policies..."
+
+    $qos = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
+    if (-not (Test-Path $qos)) { New-Item -Path $qos -Force | Out-Null }
+    Set-ItemProperty -Path $qos -Name "NonBestEffortLimit" -Type DWord -Value ([int]$s.qosNonBestEffortLimit)
+
+    $do = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
+    if (-not (Test-Path $do)) { New-Item -Path $do -Force | Out-Null }
+    Set-ItemProperty -Path $do -Name "DODownloadMode" -Type DWord -Value ([int]$s.deliveryOptimizationDownloadMode)
+
+    if ($s.disableUpdateBandwidthLimits) {
+        $wu = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+        if (-not (Test-Path $wu)) { New-Item -Path $wu -Force | Out-Null }
+        Set-ItemProperty -Path $wu -Name "SetDownloadThrottle" -Type DWord -Value 0
+        Set-ItemProperty -Path $wu -Name "SetBusinessHoursDownloadThrottle" -Type DWord -Value 0
+        Set-ItemProperty -Path $wu -Name "SetDownloadThrottlePercentage" -Type DWord -Value 0
+        Set-ItemProperty -Path $wu -Name "SetBusinessHoursDownloadThrottlePercentage" -Type DWord -Value 0
+    }
+
+    if ($s.runGpupdate) {
+        try {
+            $gp = Invoke-LoggedCommand -FilePath "gpupdate.exe" -Arguments @("/target:computer", "/force") -DisplayName "gpupdate"
+            if ($gp.ExitCode -eq 0) { Write-Ok "Computer policy refreshed." }
+            else { Write-Warn "gpupdate exited with code $($gp.ExitCode)." }
+        } catch { }
+    }
+
+    $applied = (Get-ItemProperty -Path $qos -Name NonBestEffortLimit -ErrorAction SilentlyContinue).NonBestEffortLimit
+    Write-Ok ("NonBestEffortLimit verified = {0}" -f $applied)
+}
+
+# =============================================================================
+# SECTION 17: STARTUP DISABLE / APPX REMOVE / CAPABILITY REMOVE
+#  (items 17, 28, 29, 30)
+# =============================================================================
+function Disable-StartupEntry {
+    param([Parameter(Mandatory)][string]$Pattern)
+    $found = $false
+    $runKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+    )
+    foreach ($k in $runKeys) {
+        if (-not (Test-Path $k)) { continue }
+        try {
+            $p = Get-ItemProperty $k -ErrorAction SilentlyContinue
+            if (-not $p) { continue }
+            foreach ($prop in $p.PSObject.Properties) {
+                if ($prop.Name -like 'PS*') { continue }
+                if ([string]$prop.Value -match [regex]::Escape($Pattern) -or $prop.Name -match [regex]::Escape($Pattern)) {
+                    Remove-ItemProperty -Path $k -Name $prop.Name -ErrorAction SilentlyContinue
+                    Write-Ok "Removed startup entry: $k :: $($prop.Name)"
+                    $found = $true
+                }
+            }
+        } catch { }
+    }
+    # Startup folders
+    $folders = @([Environment]::GetFolderPath("Startup"), [Environment]::GetFolderPath("CommonStartup"))
+    foreach ($f in $folders) {
+        if (-not $f -or -not (Test-Path $f)) { continue }
+        Get-ChildItem $f -Filter '*.lnk' -ErrorAction SilentlyContinue | ForEach-Object {
+            $target = ""
+            try {
+                $ws = New-Object -ComObject WScript.Shell
+                $target = $ws.CreateShortcut($_.FullName).TargetPath
+            } catch { }
+            if ($_.Name -match [regex]::Escape($Pattern) -or $target -match [regex]::Escape($Pattern)) {
+                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                Write-Ok "Removed startup shortcut: $($_.FullName)"
+                $found = $true
+            }
+        }
+    }
+    if (-not $found) { Write-Info "Startup entry not found (already disabled?): $Pattern" }
+    return $found
+}
+
+function Disable-ConfiguredStartupApps {
+    $s = $Global:Config.startupDisable
+    if (-not $s -or -not $s.enabled) { return }
+    foreach ($p in $s.patterns) {
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        Write-Info "Disabling startup entry: $p"
+        Disable-StartupEntry -Pattern $p | Out-Null
+    }
+}
+
+function Remove-ConfiguredAppxPackages {
+    $s = $Global:Config.removeAppxPackages
+    if (-not $s -or -not $s.enabled) { return }
+    foreach ($name in $s.packages) {
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        Write-Info "Removing Appx package (current user): $name"
+        try {
+            Get-AppxPackage -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
+                Remove-AppxPackage -Package $_.PackageFullName -ErrorAction SilentlyContinue
+                Write-Ok "Removed $($_.PackageFullName) for current user."
+            }
+        } catch { Write-Warn "Per-user Appx removal failed for $name : $($_.Exception.Message)" }
+        try {
+            Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -eq $name } |
+                ForEach-Object {
+                    Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue | Out-Null
+                    Write-Ok "Removed provisioned package $($_.PackageName)."
+                }
+        } catch { Write-Warn "Provisioned Appx removal failed for $name : $($_.Exception.Message)" }
+    }
+}
+
+function Remove-ConfiguredWindowsCapabilities {
+    $s = $Global:Config.removeWindowsCapabilities
+    if (-not $s -or -not $s.enabled) { return }
+    foreach ($cap in $s.capabilities) {
+        if ([string]::IsNullOrWhiteSpace($cap)) { continue }
+        Write-Info "Removing Windows capability: $cap"
+        try {
+            $state = Get-WindowsCapability -Online -Name $cap -ErrorAction SilentlyContinue
+            if (-not $state) { Write-Info "Capability not present: $cap"; continue }
+            if ($state.State -eq 'NotPresent') { Write-Ok "Capability already NotPresent: $cap"; continue }
+            $dism = Invoke-LoggedCommand -FilePath "dism.exe" -Arguments @("/online", "/Remove-Capability", "/CapabilityName:$cap") -DisplayName "DISM remove capability $cap"
+            if ($dism.ExitCode -eq 0 -or $dism.ExitCode -eq 3010) {
+                Write-Ok "Capability removal command completed: $cap"
+                if ($dism.ExitCode -eq 3010) { Set-PendingReboot "Capability removal requested reboot: $cap" }
+            } else {
+                Write-Warn "Capability removal exited with code $($dism.ExitCode): $cap"
+            }
+        } catch { Write-Warn "Capability removal failed for $cap : $($_.Exception.Message)" }
+    }
+}
+
+# =============================================================================
+# SECTION 18: QUICK ACCESS PIN (item 33)
+# =============================================================================
+function Add-FolderToQuickAccess {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path)) { Ensure-Directory $Path }
+    try {
+        $shell = New-Object -ComObject Shell.Application
+        $ns    = $shell.NameSpace($Path)
+        if (-not $ns) { Write-Warn "Shell cannot access folder: $Path"; return $false }
+        $ns.Self.InvokeVerb("pintohome")
+        Start-Sleep -Milliseconds 250
+        Write-Ok "Pinned to Quick Access (or already pinned): $Path"
+        return $true
+    } catch {
+        Write-Warn "Quick Access pin failed for $Path : $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Add-RecycleBinToQuickAccess {
+    try {
+        $shell = New-Object -ComObject Shell.Application
+        $bin = $shell.NameSpace(10) # ssfBITBUCKET
+        if (-not $bin -or -not $bin.Self) {
+            Write-Warn "Shell cannot access Recycle Bin for Quick Access pinning."
+            return $false
+        }
+        $bin.Self.InvokeVerb("pintohome")
+        Start-Sleep -Milliseconds 250
+        Write-Ok "Pinned Recycle Bin to Quick Access (or already pinned)."
+        return $true
+    } catch {
+        Write-Warn "Quick Access pin failed for Recycle Bin: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Add-ConfiguredQuickAccessPins {
+    $s = $Global:Config.quickAccess
+    if (-not $s -or -not $s.enabled) { return }
+    foreach ($p in $s.folders) {
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        Add-FolderToQuickAccess -Path $p | Out-Null
+    }
+    $includeRecycleBin = $true
+    if ($s.PSObject.Properties.Name -contains "includeRecycleBin") { $includeRecycleBin = [bool]$s.includeRecycleBin }
+    if ($includeRecycleBin) { Add-RecycleBinToQuickAccess | Out-Null }
+}
+
+# =============================================================================
+# SECTION 19: EDGE UNPIN / BRAVE PIN  (item 18, best-effort)
+# =============================================================================
+function Invoke-ShellPinUnpin {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$VerbName)
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        $shell = New-Object -ComObject Shell.Application
+        $folder = $shell.Namespace((Split-Path -Parent $Path))
+        if (-not $folder) { return $false }
+        $item = $folder.ParseName((Split-Path -Leaf $Path))
+        if (-not $item) { return $false }
+        $verb = $item.Verbs() | Where-Object { $_.Name -replace '&','' -ieq $VerbName -or $_.Name -ilike "*$VerbName*" } | Select-Object -First 1
+        if (-not $verb) { return $false }
+        $verb.DoIt()
+        Start-Sleep -Milliseconds 400
+        return $true
+    } catch { return $false }
+}
+
+function Replace-EdgeTaskbarPinWithBrave {
+    $s = $Global:Config.taskbar
+    if (-not $s) { return }
+    if ($s.unpinEdge) {
+        $edge = "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe"
+        if (-not (Test-Path $edge)) { $edge = "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe" }
+        if (Test-Path $edge) {
+            if (Invoke-ShellPinUnpin -Path $edge -VerbName "Unpin from taskbar") {
+                Write-Ok "Unpinned Edge from taskbar."
+            } else {
+                Write-Warn "Could not unpin Edge automatically. Windows 11 often blocks programmatic taskbar pin changes; unpin Edge manually if it remains."
+            }
+        } else { Write-Info "Edge executable not found; skipping unpin." }
+    }
+    if ($s.pinBrave) {
+        $brave = "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe"
+        if (-not (Test-Path $brave)) { $brave = "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe" }
+        if (Test-Path $brave) {
+            if (Invoke-ShellPinUnpin -Path $brave -VerbName "Pin to taskbar") {
+                Write-Ok "Pinned Brave to taskbar."
+            } else {
+                Write-Warn "Could not pin Brave automatically. Drag brave.exe to taskbar manually as a fallback."
+            }
+        } else { Write-Warn "Brave not installed yet; cannot pin to taskbar." }
+    }
+}
+
+# =============================================================================
+# SECTION 20: WINDOWS UPDATE (items 5, 19)
+# =============================================================================
+function Initialize-WindowsUpdateEnvironment {
+    if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+        try { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Confirm:$false | Out-Null } catch { }
+    }
+    try { Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted -ErrorAction SilentlyContinue } catch { }
+    if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+        try { Install-Module -Name PSWindowsUpdate -Force -AllowClobber -Confirm:$false | Out-Null } catch { Write-Warn "Install PSWindowsUpdate failed: $($_.Exception.Message)" }
+    }
+    Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
+    try { Add-WUServiceManager -MicrosoftUpdate -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+}
+
+function Invoke-WindowsUpdatePass {
+    param([int]$PassNumber)
+    Write-Info "Windows Update pass ${PassNumber}: scanning..."
+    $updates = @()
+    try {
+        $updates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Verbose:$false -ErrorAction Stop
+    } catch { Write-Warn "Get-WindowsUpdate failed: $($_.Exception.Message)" }
+
+    if (-not $updates -or $updates.Count -eq 0) {
+        Write-Ok "Pass ${PassNumber}: no applicable updates."
+        return 0
+    }
+    Write-Info ("Pass ${PassNumber}: detected {0} update(s)." -f $updates.Count)
+
+    $i = 0
+    foreach ($u in $updates) {
+        $i++
+        $title = if ($u.Title) { $u.Title } else { [string]$u }
+        Write-StructuredLog -Level UPDATE -Message ("Pass {0}: detected [{1}/{2}] {3}" -f $PassNumber, $i, $updates.Count, $title)
+        Write-StructuredLog -Level UPDATE -Message ("Pass {0}: accepted [{1}/{2}] {3}" -f $PassNumber, $i, $updates.Count, $title)
+    }
+
+    Write-Info "Pass ${PassNumber}: downloading/installing accepted updates with reboot suppressed."
+    try {
+        $wuJob = Start-Job -Name "WinServerSetup-WindowsUpdate-$PassNumber" -ScriptBlock {
+            Import-Module PSWindowsUpdate -Force
+            Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose:$false -Confirm:$false
+        }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($wuJob.State -eq 'Running') {
+            Write-StatusInPlace ("Pass {0}: downloading/installing updates... elapsed {1:hh\:mm\:ss}" -f $PassNumber, $sw.Elapsed)
+            Start-Sleep -Seconds 2
+            $wuJob = Get-Job -Id $wuJob.Id
+        }
+        Clear-StatusInPlace
+        $wuOutput = @()
+        try { $wuOutput = @(Receive-Job -Job $wuJob -ErrorAction SilentlyContinue) } catch { $wuOutput = @($_.Exception.Message) }
+        foreach ($line in $wuOutput) {
+            $text = [string]$line
+            if (-not [string]::IsNullOrWhiteSpace($text)) { Write-StructuredLog -Level UPDATE -Message ("Pass {0}: {1}" -f $PassNumber, $text.TrimEnd()) }
+        }
+        if ($wuJob.State -eq 'Completed') {
+            foreach ($u in $updates) {
+                $title = if ($u.Title) { $u.Title } else { [string]$u }
+                Write-StructuredLog -Level UPDATE -Message ("Pass {0}: downloaded {1}" -f $PassNumber, $title)
+                Write-StructuredLog -Level UPDATE -Message ("Pass {0}: installed {1}" -f $PassNumber, $title)
+            }
+            Write-Ok "Pass ${PassNumber}: Windows Update install command completed."
+        } else {
+            foreach ($u in $updates) {
+                $title = if ($u.Title) { $u.Title } else { [string]$u }
+                Write-StructuredLog -Level UPDATE -Message ("Pass {0}: failed {1}" -f $PassNumber, $title)
+            }
+            Write-Warn "Pass ${PassNumber}: Windows Update job ended with state $($wuJob.State). Details are in the structured log."
+        }
+        Remove-Job -Job $wuJob -Force -ErrorAction SilentlyContinue | Out-Null
+    } catch {
+        Clear-StatusInPlace
+        Write-Warn "Install-WindowsUpdate raised: $($_.Exception.Message)"
+    }
+
+    if (Test-WindowsRebootRequired) {
+        Set-PendingReboot "Windows Update pass $PassNumber requested reboot"
+        foreach ($u in $updates) {
+            $title = if ($u.Title) { $u.Title } else { [string]$u }
+            Write-StructuredLog -Level UPDATE -Message ("Pass {0}: reboot required after {1}" -f $PassNumber, $title)
+        }
+    }
+    return $updates.Count
+}
+
+function Invoke-SystemUpdate {
+    if (-not $Global:Config.windowsUpdate.enabled) { Write-Info "Windows Update section disabled in config."; return }
+    if (-not $Global:Config.windowsUpdate.usePSWindowsUpdateModule) {
+        Write-Info "Opening Settings -> Windows Update (PSWindowsUpdate disabled)."
+        try { Start-Process "ms-settings:windowsupdate" } catch { }
+        return
+    }
+    Initialize-WindowsUpdateEnvironment
+    $maxPasses = [int]$Global:Config.windowsUpdate.maxPasses
+    if ($maxPasses -lt 1) { $maxPasses = 4 }
+    for ($pass = 1; $pass -le $maxPasses; $pass++) {
+        $n = Invoke-WindowsUpdatePass -PassNumber $pass
+        if ($n -eq 0) { break }
+    }
+    # Final summary
+    try {
+        $remaining = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Verbose:$false -ErrorAction SilentlyContinue
+        if ($remaining -and $remaining.Count -gt 0) {
+            Write-Warn ("{0} update(s) still pending after {1} passes." -f $remaining.Count, $maxPasses)
+            foreach ($r in $remaining) { Write-Warn ("  pending: {0}" -f $r.Title) }
+        } else {
+            Write-Ok "All applicable Windows Updates installed."
+        }
+    } catch { }
+}
+
+# =============================================================================
+# SECTION 21: ACTIVATION (carry over)
+# =============================================================================
+function Invoke-Slmgr {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    $slmgr = Join-Path $env:windir "System32\slmgr.vbs"
+    if (-not (Test-Path $slmgr)) { throw "slmgr.vbs not found at $slmgr" }
+    & cscript.exe //nologo $slmgr @Arguments | Out-Host
+    return $LASTEXITCODE
+}
+
+function Invoke-ActivationIfConfigured {
+    $a = $Global:Config.activation
+    if (-not $a -or -not $a.enabled) { Write-Info "Activation disabled in config."; return }
+    $kms  = [string]$a.kmsServer
+    $key  = [string]$a.productKey
+    if ([string]::IsNullOrWhiteSpace($kms) -and [string]::IsNullOrWhiteSpace($key)) {
+        Write-Warn "Activation enabled but no kmsServer or productKey set."
+        return
+    }
+    Write-Warn "Use Activation only with a key/server you are entitled to use."
+    if (-not [string]::IsNullOrWhiteSpace($key)) { Invoke-Slmgr -Arguments @("/ipk", $key)  | Out-Null }
+    if (-not [string]::IsNullOrWhiteSpace($kms)) { Invoke-Slmgr -Arguments @("/skms", $kms) | Out-Null }
+    Invoke-Slmgr -Arguments @("/ato") | Out-Null
+    Invoke-Slmgr -Arguments @("/xpr") | Out-Null
+}
+
+# =============================================================================
+# SECTION 22: POST-REBOOT SFC (item 32)
+# =============================================================================
+function Register-PostRebootSfcTask {
+    if (-not $Global:Config.autoReboot.scheduleSfcAfterReboot) { return }
+    $sfcScript = Join-Path $Global:ProjectRoot "scripts\Run-PostRebootSfc.ps1"
+    if (-not (Test-Path $sfcScript)) {
+        Write-Warn "Post-reboot SFC helper not found: $sfcScript"
+        return
+    }
+    $psExe = Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $taskName = "WinServerSetup Post-Reboot SFC"
+    $arguments = "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$sfcScript`" -ProjectRoot `"$Global:ProjectRoot`""
+
+    $action    = New-ScheduledTaskAction    -Execute $psExe -Argument $arguments
+    $trigger   = New-ScheduledTaskTrigger   -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -Hidden
+
+    try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Ok "Scheduled post-reboot task registered: $taskName"
+}
+
+# =============================================================================
+# CLEANUP + HEALTH CHECK (carry over)
+# =============================================================================
+function Remove-DirectoryContentsSafe {
+    param([Parameter(Mandatory)][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) { return }
+    Write-Info "Cleaning: $Path"
+    try {
+        Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop } catch { }
+        }
+        Write-Ok "Cleaned: $Path"
+    } catch { Write-Warn "Could not clean $Path : $($_.Exception.Message)" }
+}
+
+function Clear-WinServerSetupTempAndCache {
+    $s = $Global:Config.cleanup
+    if (-not $s -or -not $s.enabled) { return }
+    Write-Section "Cleaning temp and cache files"
+    if ($s.cleanProjectDownloadCache) { Remove-DirectoryContentsSafe -Path (Get-DownloadCachePath) }
+    if ($s.cleanUserTemp)             { Remove-DirectoryContentsSafe -Path $env:TEMP; Remove-DirectoryContentsSafe -Path $env:TMP }
+    if ($s.cleanWindowsTemp)          { Remove-DirectoryContentsSafe -Path (Join-Path $env:WINDIR "Temp") }
+    if ($s.cleanWindowsUpdateDownloadCache) {
+        try {
+            Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+            Stop-Service -Name bits     -Force -ErrorAction SilentlyContinue
+            Remove-DirectoryContentsSafe -Path (Join-Path $env:WINDIR "SoftwareDistribution\Download")
+            Start-Service -Name bits -ErrorAction SilentlyContinue
+            Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+        } catch { Write-Warn "WU cache cleanup: $($_.Exception.Message)" }
+    }
+    if ($s.cleanRecycleBin) {
+        try { Clear-RecycleBin -Force -ErrorAction SilentlyContinue; Write-Ok "Recycle Bin cleared." }
+        catch { Write-Warn "Could not clear Recycle Bin: $($_.Exception.Message)" }
+    }
+}
+
+function Invoke-HealthCheck {
+    Write-Section "WinServerSetup Health Check"
+    $items = @(
+        @{ Name = "WinGet";                                  Test = { Test-CommandExists "winget" } },
+        @{ Name = "C:\portable";                             Test = { Test-Path ([string]$Global:Config.customFolders.portablePath) } },
+        @{ Name = "C:\portable\Scripts";                     Test = { Test-Path ([string]$Global:Config.customFolders.scriptsPath) } },
+        @{ Name = "Downloads\compressed";                    Test = { Test-Path (Join-Path (Get-CurrentUserDownloadsFolder) ([string]$Global:Config.customFolders.compressedFolderName)) } },
+        @{ Name = "Defender exclusion for compressed";       Test = { Test-DefenderExclusionPath -Path (Join-Path (Get-CurrentUserDownloadsFolder) ([string]$Global:Config.customFolders.compressedFolderName)) } },
+        @{ Name = "PowerShell 7";                            Test = { Test-CommandExists "pwsh" } },
+        @{ Name = "Windows Terminal";                        Test = { (Get-Command wt -ErrorAction SilentlyContinue) -ne $null } },
+        @{ Name = "Brave";                                   Test = { Test-Path "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe" } },
+        @{ Name = "Python";                                  Test = { Test-CommandExists "python" } },
+        @{ Name = "FFmpeg";                                  Test = { Test-CommandExists "ffmpeg" } },
+        @{ Name = "7-Zip";                                   Test = { (Test-Path "$env:ProgramFiles\7-Zip\7z.exe") -or (Test-CommandExists "7z") } },
+        @{ Name = "V2rayN portable folder";                  Test = { Test-Path (Join-Path (Join-Path ([string]$Global:Config.v2rayN.installDir) ([string]$Global:Config.v2rayN.finalFolderName)) ([string]$Global:Config.v2rayN.exeName)) } },
+        @{ Name = "Everything Service";                      Test = { [bool](Get-Service -Name "Everything" -ErrorAction SilentlyContinue) } },
+        @{ Name = "Windows Search";                          Test = { (Get-Service -Name WSearch -ErrorAction SilentlyContinue).Status -eq "Running" } },
+        @{ Name = "RDP Port matches config";                 Test = { (Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name PortNumber).PortNumber -eq [int]$Global:Config.rdp.newPort } },
+        @{ Name = "EmptyStandbyList Task";                   Test = { [bool](Get-ScheduledTask -TaskName ([string]$Global:Config.emptyStandbyList.taskName) -TaskPath ([string]$Global:Config.emptyStandbyList.taskPath) -ErrorAction SilentlyContinue) } },
+        @{ Name = "RDP Blocker Task";                        Test = { [bool](Get-ScheduledTask -TaskName ([string]$Global:Config.rdpBruteforceBlocker.taskName) -ErrorAction SilentlyContinue) } },
+        @{ Name = "Show File Extensions";                    Test = { (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name HideFileExt -ErrorAction SilentlyContinue).HideFileExt -eq 0 } },
+        @{ Name = "Dark Mode";                               Test = { (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name AppsUseLightTheme -ErrorAction SilentlyContinue).AppsUseLightTheme -eq 0 } },
+        @{ Name = "PowerShell 7 default for .ps1";            Test = { (Get-RegistryDefaultValue -Path "HKCU:\Software\Classes\.ps1") -eq "WinServerSetup.PowerShell7Script" } },
+        @{ Name = "7-Zip default for .zip";                  Test = { (Get-RegistryDefaultValue -Path "HKCU:\Software\Classes\.zip") -eq "7-Zip.zip" } },
+        @{ Name = "7-Zip default for .7z";                   Test = { (Get-RegistryDefaultValue -Path "HKCU:\Software\Classes\.7z") -eq "7-Zip.7z"  } },
+        @{ Name = "7-Zip default for .rar";                  Test = { (Get-RegistryDefaultValue -Path "HKCU:\Software\Classes\.rar") -eq "7-Zip.rar" } }
+    )
+    foreach ($i in $items) {
+        try { if (& $i.Test) { Write-Ok $i.Name } else { Write-Warn $i.Name } }
+        catch { Write-Warn $i.Name }
+    }
+}
+
+# =============================================================================
+# FINAL SUMMARY + AUTO REBOOT (items 11, 26)
+# =============================================================================
+function Show-FinalSummary {
+    Write-Host ""
+    Write-Section "Setup Summary"
+    $s = $Global:RunStats
+    $elapsed = Format-ActiveTimerElapsed
+    Write-Themed ("Started   : {0}" -f $s.StartedTasks.Count)   -Kind Info
+    Write-Themed ("Completed : {0}" -f $s.CompletedTasks.Count) -Kind Success
+    Write-Themed ("Failed    : {0}" -f $s.FailedTasks.Count)    -Kind $(if ($s.FailedTasks.Count -gt 0) { 'Error' } else { 'Success' })
+    Write-Themed ("Skipped   : {0}" -f $s.SkippedTasks.Count)   -Kind Status
+    Write-Themed ("Warnings  : {0}" -f $s.Warnings.Count)       -Kind $(if ($s.Warnings.Count -gt 0) { 'Warning' } else { 'Success' })
+    Write-Themed ("Installed apps : {0}" -f ($s.InstalledApps -join ', ')) -Kind Info
+    if ($s.FailedApps.Count -gt 0) {
+        Write-Themed ("Failed apps    : {0}" -f ($s.FailedApps -join ', ')) -Kind Error
+    }
+    if ($s.RebootRequired) {
+        Write-Themed "Reboot required: YES" -Kind Warning
+    } else {
+        Write-Themed "Reboot required: no"  -Kind Success
+    }
+    Write-Themed ("Total active elapsed: {0}" -f $elapsed) -Kind Summary
+    if ($Global:LogFile)       { Write-Themed ("Console log    : {0}" -f $Global:LogFile)       -Kind SummaryDim }
+    if ($Global:StructuredLog) { Write-Themed ("Structured log : {0}" -f $Global:StructuredLog) -Kind SummaryDim }
+    Write-StructuredLog -Level SUMMARY -Message ("Started={0}; Completed={1}; Failed={2}; Skipped={3}; Warnings={4}; RebootRequired={5}; ActiveElapsed={6}" -f $s.StartedTasks.Count, $s.CompletedTasks.Count, $s.FailedTasks.Count, $s.SkippedTasks.Count, $s.Warnings.Count, $s.RebootRequired, $elapsed)
+}
+
+function Restart-AfterSetup {
+    if ($Global:NoReboot) { Write-Info "Auto-reboot skipped: -NoReboot is set."; return }
+    if (-not $Global:Config.autoReboot.enabled) { Write-Info "Auto-reboot disabled in config."; return }
+    if (-not $Global:RunStats.RebootRequired -and -not (Test-WindowsRebootRequired)) {
+        Write-Info "No pending reboot signal detected. Skipping auto-reboot."
+        return
+    }
+    $countdown = [int]$Global:Config.autoReboot.countdownSeconds
+    if ($countdown -lt 1) { $countdown = 30 }
+    if ($Global:Config.autoReboot.scheduleSfcAfterReboot) { Register-PostRebootSfcTask }
+
+    if ($Global:NoPause) {
+        Write-Warn "Rebooting now (silent mode)..."
+        Restart-Computer -Force
+        return
+    }
+    Write-Warn ("Rebooting in {0} seconds. Press Ctrl+C to abort." -f $countdown)
+    for ($i = $countdown; $i -gt 0; $i--) {
+        Write-StatusInPlace ("Reboot in {0} s ... (Ctrl+C to abort)" -f $i)
+        Start-Sleep -Seconds 1
+    }
+    Clear-StatusInPlace
+    Write-Warn "Issuing Restart-Computer now."
+    Restart-Computer -Force
+}
+
+# =============================================================================
+# FULL SETUP ORCHESTRATION  (item 2 reboot deferral, item 3 parallel)
+# =============================================================================
+function Install-Applications {
+    Install-WingetPackages
+    Install-DirectInstallers
+    Install-V2RayN
+    Install-LatestPowerShellFromGitHub
+    Install-WindowsTerminal
+    Set-PowerShell7AsPs1Default
+    Install-BraveExtensions
+}
+
+function Invoke-FullSetup {
+    Write-Section "Running Full WinServerSetup"
+
+    # Quick wins / settings that don't need network. Apply early.
+    Set-WindowsDarkMode
+    Enable-FileExtensions
+    Add-PersianKeyboardLayout
+    Configure-CustomFoldersAndDefenderExclusions
+
+    # Now run Windows Update in the foreground (heavy, ordered) while safe,
+    # self-contained registry updates run in background jobs.
+    $parallelEnabled = $Global:Config.parallel -and $Global:Config.parallel.enabled
+    $maxPar          = if ($parallelEnabled) { [int]$Global:Config.parallel.maxParallel } else { 1 }
+    if ($maxPar -lt 1) { $maxPar = 1 }
+
+    $sideTasks = @(
+        @{ Name = "QoS reservable bandwidth = 0";    Action = { reg add 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Psched' /v NonBestEffortLimit /t REG_DWORD /d 0 /f | Out-Null } },
+        @{ Name = "Show file extensions registry";   Action = { reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v HideFileExt /t REG_DWORD /d 0 /f | Out-Null } }
+    )
+
+    $sideJobs = @()
+    if ($parallelEnabled) { $sideJobs = Start-ParallelTasks -Tasks $sideTasks -MaxParallel $maxPar }
+    $appPrefetch = $null
+    if ($parallelEnabled) { $appPrefetch = Start-ApplicationDownloadPrefetch -MaxParallel $maxPar }
+    Invoke-SystemUpdate
+    if ($parallelEnabled) { Wait-ParallelTasks -StartedTasks $sideJobs }
+    if ($parallelEnabled) { Wait-ApplicationDownloadPrefetch -Prefetch $appPrefetch }
+
+    # The rest is sequential because of resource contention and ordering.
+    Invoke-ActivationIfConfigured
+    Configure-WindowsUpdateBandwidthPolicies
+    Install-Applications
+    Configure-DefaultApps
+    Set-SevenZipAsDefault
+    Configure-RdpPortAndFirewall
+    Enable-SearchIndexing
+    Install-Runtimes
+    Install-EmptyStandbyList
+    Install-RdpBruteforceBlocker
+    Disable-ConfiguredStartupApps
+    Remove-ConfiguredAppxPackages
+    Remove-ConfiguredWindowsCapabilities
+    Replace-EdgeTaskbarPinWithBrave
+    Add-ConfiguredQuickAccessPins
+    Invoke-HealthCheck
+    Clear-WinServerSetupTempAndCache
+
+    Show-FinalSummary
+
+    Write-Ok "Full setup completed."
+
+    Restart-AfterSetup
+}
+
+# =============================================================================
+# MAIN MENU
+# =============================================================================
+function Show-MainMenu {
+    while ($true) {
+        Write-Host ""
+        Write-Rule  -Width 36
+        Write-Title " WinServerSetup Main Menu"
+        Write-Rule  -Width 36
+        Write-Option -Number "1"  -Label "Run full setup"
+        Write-Option -Number "2"  -Label "Windows Update (multi-pass)"
+        Write-Option -Number "3"  -Label "Activation from config only"
+        Write-Option -Number "4"  -Label "Apply dark mode + taskbar"
+        Write-Option -Number "5"  -Label "Show file extensions"
+        Write-Option -Number "6"  -Label "Add Persian keyboard layout"
+        Write-Option -Number "7"  -Label "Install applications (winget + direct + v2rayN + PS7 + WT)"
+        Write-Option -Number "8"  -Label "Install Brave extensions"
+        Write-Option -Number "9"  -Label "Configure default browser/player"
+        Write-Option -Number "9b" -Label "Set 7-Zip as default for compressed file extensions"
+        Write-Option -Number "10" -Label "Configure RDP port and firewall (safe)"
+        Write-Option -Number "11" -Label "Enable Search Indexing"
+        Write-Option -Number "12" -Label "Install .NET + Visual C++ runtimes (no ASP.NET)"
+        Write-Option -Number "13" -Label "Setup Empty Cache task"
+        Write-Option -Number "14" -Label "Configure Windows Update bandwidth / QoS"
+        Write-Option -Number "15" -Label "Install RDP brute-force blocker (hidden)"
+        Write-Option -Number "16" -Label "Disable startup apps (AzureArcSysTray, S9Proxy, etc)"
+        Write-Option -Number "17" -Label "Remove Feedback Hub / Appx packages"
+        Write-Option -Number "18" -Label "Remove Windows capabilities (AzureArcSetup, etc)"
+        Write-Option -Number "19" -Label "Replace Edge taskbar pin with Brave"
+        Write-Option -Number "20" -Label "Pin folders to Quick Access"
+        Write-Option -Number "21" -Label "Custom folders and Defender exclusions"
+        Write-Option -Number "22" -Label "Clean temp and cache"
+        Write-Option -Number "23" -Label "Health check"
+        Write-Option -Number "24" -Label "Final summary"
+        Write-Option -Number "25" -Label "Schedule post-reboot SFC"
+        Write-Option -Number "26" -Label "Reboot now (if pending)"
+        Write-Option -Number "0"  -Label "Back / Exit"
+        Write-Host ""
+
+        $choice = Read-HostUntimed "Select"
+        try {
+            switch ($choice) {
+                "1"  { Invoke-Timed -Name "Full setup"                              -Action { Invoke-FullSetup };                              Pause-IfNeeded }
+                "2"  { Invoke-Timed -Name "Windows Update (multi-pass)"             -Action { Invoke-SystemUpdate };                           Pause-IfNeeded }
+                "3"  { Invoke-Timed -Name "Activation from config"                  -Action { Invoke-ActivationIfConfigured };                 Pause-IfNeeded }
+                "4"  { Invoke-Timed -Name "Apply dark mode"                         -Action { Set-WindowsDarkMode };                           Pause-IfNeeded }
+                "5"  { Invoke-Timed -Name "Show file extensions"                    -Action { Enable-FileExtensions };                         Pause-IfNeeded }
+                "6"  { Invoke-Timed -Name "Add Persian keyboard layout"             -Action { Add-PersianKeyboardLayout };                     Pause-IfNeeded }
+                "7"  { Invoke-Timed -Name "Install applications"                    -Action { Install-Applications };                          Pause-IfNeeded }
+                "8"  { Invoke-Timed -Name "Install Brave extensions"                -Action { Install-BraveExtensions };                       Pause-IfNeeded }
+                "9"  { Invoke-Timed -Name "Configure default browser/player"        -Action { Configure-DefaultApps };                         Pause-IfNeeded }
+                "9b" { Invoke-Timed -Name "7-Zip as default for compressed files"   -Action { Set-SevenZipAsDefault };                         Pause-IfNeeded }
+                "10" { Invoke-Timed -Name "Configure RDP port and firewall"         -Action { Configure-RdpPortAndFirewall };                  Pause-IfNeeded }
+                "11" { Invoke-Timed -Name "Enable Search Indexing"                  -Action { Enable-SearchIndexing };                         Pause-IfNeeded }
+                "12" { Invoke-Timed -Name ".NET + Visual C++ runtimes"              -Action { Install-Runtimes };                              Pause-IfNeeded }
+                "13" { Invoke-Timed -Name "Empty Cache task"                        -Action { Install-EmptyStandbyList };                      Pause-IfNeeded }
+                "14" { Invoke-Timed -Name "Windows Update bandwidth / QoS"          -Action { Configure-WindowsUpdateBandwidthPolicies };      Pause-IfNeeded }
+                "15" { Invoke-Timed -Name "RDP brute-force blocker"                 -Action { Install-RdpBruteforceBlocker };                  Pause-IfNeeded }
+                "16" { Invoke-Timed -Name "Disable startup apps"                    -Action { Disable-ConfiguredStartupApps };                 Pause-IfNeeded }
+                "17" { Invoke-Timed -Name "Remove Appx packages"                    -Action { Remove-ConfiguredAppxPackages };                 Pause-IfNeeded }
+                "18" { Invoke-Timed -Name "Remove Windows capabilities"             -Action { Remove-ConfiguredWindowsCapabilities };          Pause-IfNeeded }
+                "19" { Invoke-Timed -Name "Replace Edge with Brave on taskbar"      -Action { Replace-EdgeTaskbarPinWithBrave };               Pause-IfNeeded }
+                "20" { Invoke-Timed -Name "Pin folders to Quick Access"             -Action { Add-ConfiguredQuickAccessPins };                 Pause-IfNeeded }
+                "21" { Invoke-Timed -Name "Custom folders / Defender exclusions"    -Action { Configure-CustomFoldersAndDefenderExclusions }; Pause-IfNeeded }
+                "22" { Invoke-Timed -Name "Clean temp and cache"                    -Action { Clear-WinServerSetupTempAndCache };              Pause-IfNeeded }
+                "23" { Invoke-Timed -Name "Health check"                            -Action { Invoke-HealthCheck };                            Pause-IfNeeded }
+                "24" { Show-FinalSummary; Pause-IfNeeded }
+                "25" { Invoke-Timed -Name "Schedule post-reboot SFC"                -Action { Register-PostRebootSfcTask };                    Pause-IfNeeded }
+                "26" { Restart-AfterSetup; Pause-IfNeeded }
+                "0"  { return }
+                default { Write-Warn "Invalid option." }
+            }
+        } catch {
+            Stop-ActiveTimer
+            Write-Fail $_.Exception.Message
+            Pause-IfNeeded
+        }
+    }
+}
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+try {
+    Assert-Admin
+    Load-Config
+
+    if (Invoke-SelfRelocateIfNeeded) {
+        # Relaunched at new path; exit current process cleanly.
+        exit 0
+    }
+
+    Initialize-Environment
+
+    if ($Global:Full) {
+        Invoke-Timed -Name "Full setup" -Action { Invoke-FullSetup }
+    } else {
+        Show-MainMenu
+    }
+}
+finally {
+    if ($Global:TranscriptStarted) {
+        try { Stop-Transcript | Out-Null } catch { }
+    }
+}

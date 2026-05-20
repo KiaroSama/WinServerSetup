@@ -1,0 +1,127 @@
+# Local command/request notes
+.Commands/
+.Commands/**
+.Comments/
+.Comments/**
+Commands/
+Commands/**
+
+# Logs
+logs/
+log/
+Logs/
+Log/
+*.log
+*.trace
+*.debug
+*.etl
+*.evtx
+
+# Cache
+.cache/
+cache/
+Cache/
+.caches/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Temporary files
+tmp/
+temp/
+Temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.swp
+*.swo
+*.partial
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+credentials.*
+credential.*
+secrets.*
+secret.*
+token.*
+tokens.*
+cookie.*
+cookies.*
+session.*
+sessions.*
+WinServerSetup.config.local.json
+
+# Local output / generated data
+output/
+outputs/
+Output/
+Outputs/
+downloads/
+download/
+Downloads/
+Download/
+dist/
+build/
+processed/
+remuxed/
+publish/
+release/
+Release/
+
+# Downloaded installers and portable binaries
+apps/installers/*
+!apps/installers/PUT_INSTALLERS_HERE.txt
+apps/portable/
+*.exe
+*.msi
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+*.zip
+*.7z
+*.rar
+
+# Runtime backups
+backups/
+
+# Editor and IDE folders
+.vscode/
+.idea/
+*.code-workspace
+*.user
+*.suo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+Desktop.ini
+*.lnk
+
+# Local tool state
+.claude/
+.codex/
+
+# Language/tool-specific folders
+node_modules/
+venv/
+.venv/
+target/
+bin/
+obj/

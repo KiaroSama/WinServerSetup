@@ -1,0 +1,259 @@
+{
+  "projectName": "WinServerSetup",
+  "portableRoot": "C:\\portable",
+  "scriptsRoot": "C:\\portable\\Scripts",
+  "targetProjectRoot": "C:\\portable\\Scripts\\WinServerSetup",
+  "downloadRoot": "",
+  "logRoot": "logs",
+  "selfRelocate": {
+    "enabled": true
+  },
+  "parallel": {
+    "enabled": true,
+    "maxParallel": 4
+  },
+  "interactiveAnyKey": true,
+  "autoReboot": {
+    "enabled": true,
+    "countdownSeconds": 30,
+    "scheduleSfcAfterReboot": true
+  },
+  "activation": {
+    "enabled": true,
+    "productKey": "",
+    "kmsServer": "kms.digiboy.ir"
+  },
+  "windowsUpdate": {
+    "enabled": true,
+    "usePSWindowsUpdateModule": true,
+    "autoReboot": false,
+    "maxPasses": 4
+  },
+  "appearance": {
+    "darkMode": true,
+    "restartExplorer": true,
+    "showFileExtensions": true
+  },
+  "keyboard": {
+    "addPersianLayout": true
+  },
+  "rdp": {
+    "enabled": true,
+    "newPort": 5801,
+    "oldPort": 3389,
+    "blockOldPort": true,
+    "restartRemoteDesktopService": true,
+    "verifyListening": true
+  },
+  "indexing": {
+    "enabled": true
+  },
+  "runtimes": {
+    "installDotNetFramework35": true,
+    "installDotNetDesktopRuntimes": true,
+    "installVisualCppRuntimes": true,
+    "installLegacyVisualCppRuntimes": true,
+    "installDotNetFramework4Plus": true,
+    "dotNetFramework481OfflineUrl": "https://go.microsoft.com/fwlink/?linkid=2203305",
+    "installDotNetCoreRuntimes": true,
+    "includeUnsupportedDotNetVersions": true
+  },
+  "winget": {
+    "installIfMissing": true,
+    "interactiveInstallers": false,
+    "upgradeExistingPackages": true,
+    "removeMsstoreSource": true,
+    "packages": [
+      { "name": "FFmpeg",                "id": "Gyan.FFmpeg",                       "enabled": true },
+      { "name": "7-Zip",                 "id": "7zip.7zip",                         "enabled": true },
+      { "name": "Brave Browser",         "id": "Brave.Brave",                       "enabled": true },
+      { "name": "qBittorrent",           "id": "qBittorrent.qBittorrent",           "enabled": true },
+      { "name": "Python 3.11",           "id": "Python.Python.3.11",                "enabled": true },
+      { "name": "K-Lite Codec Pack Mega","id": "CodecGuide.K-LiteCodecPack.Mega",   "enabled": true },
+      { "name": "Notepad++",             "id": "Notepad++.Notepad++",               "enabled": true },
+      { "name": "Telegram Desktop",      "id": "Telegram.TelegramDesktop",          "enabled": true }
+    ]
+  },
+  "directInstallers": [
+    {
+      "name": "9Proxy",
+      "enabled": true,
+      "url": "https://static.9proxy-cdn.net/download/latest/windows/9proxy-windows-installer.exe",
+      "fileName": "9proxy-windows-installer.exe",
+      "silentArgs": "/S",
+      "fallbackInteractive": true,
+      "verifyRegistryName": "9Proxy"
+    },
+    {
+      "name": "Dolphin Anty",
+      "enabled": true,
+      "url": "https://app.dolphin-anty-mirror3.net/anty-app/dolphin-anty-win-latest.exe",
+      "fileName": "dolphin-anty-win-latest.exe",
+      "silentArgs": "/S",
+      "fallbackInteractive": true,
+      "verifyRegistryName": "Dolphin Anty"
+    },
+    {
+      "name": "GoLogin",
+      "enabled": true,
+      "url": "https://dl.gologin.com/gologin.exe",
+      "fileName": "gologin.exe",
+      "silentArgs": "/S",
+      "fallbackInteractive": true,
+      "verifyRegistryName": "GoLogin"
+    },
+    {
+      "name": "Everything",
+      "enabled": true,
+      "url": "https://www.voidtools.com/downloads/",
+      "fileName": "Everything-x64-Setup.exe",
+      "silentArgs": "/S",
+      "fallbackInteractive": true,
+      "verifyRegistryName": "Everything",
+      "enableService": true
+    }
+  ],
+  "v2rayN": {
+    "enabled": true,
+    "githubRepo": "2dust/v2rayN",
+    "assetNameRegex": "^v2rayN-windows-64\\.zip$",
+    "installDir": "C:\\portable",
+    "finalFolderName": "V2rayN",
+    "exeName": "v2rayN.exe",
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true
+  },
+  "defaultApps": {
+    "enabled": true,
+    "importXmlIfExists": true,
+    "xmlPath": "default-apps\\DefaultAppAssociations.xml",
+    "openSettingsAfterInstall": false
+  },
+  "sevenZipDefaults": {
+    "enabled": true,
+    "installPath": "C:\\Program Files\\7-Zip",
+    "removeUserChoice": true,
+    "extensions": [
+      ".7z", ".zip", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".tbz2",
+      ".xz", ".txz", ".lzma", ".lzh", ".lha", ".cab", ".arj",
+      ".iso", ".img", ".wim", ".swm", ".esd",
+      ".cpio", ".cramfs", ".dmg", ".rpm", ".deb", ".chm",
+      ".vhd", ".vhdx", ".vmdk", ".squashfs", ".udf", ".xar", ".z",
+      ".001"
+    ]
+  },
+  "braveExtensions": {
+    "enabled": true,
+    "useForceListPolicy": true,
+    "openInBrave": true,
+    "items": [
+      {
+        "name": "Dark Reader",
+        "id": "eimadpbcbfnmbkopoojfekhnkhdbieeh",
+        "url": "https://chromewebstore.google.com/detail/dark-reader/eimadpbcbfnmbkopoojfekhnkhdbieeh?hl=en-GB&pli=1"
+      },
+      {
+        "name": "Buster Captcha Solver",
+        "id": "mpbjkejclgfgadiemmefgebjfooflfhl",
+        "url": "https://chromewebstore.google.com/detail/buster-captcha-solver-for/mpbjkejclgfgadiemmefgebjfooflfhl?hl=en"
+      }
+    ]
+  },
+  "taskbar": {
+    "unpinEdge": true,
+    "pinBrave": true
+  },
+  "quickAccess": {
+    "enabled": true,
+    "includeRecycleBin": true,
+    "folders": [
+      "C:\\portable",
+      "C:\\portable\\Scripts",
+      "C:\\portable\\V2rayN"
+    ]
+  },
+  "startupDisable": {
+    "enabled": true,
+    "patterns": [
+      "AzureArcSysTray.exe",
+      "S9Proxy.App.exe"
+    ]
+  },
+  "removeAppxPackages": {
+    "enabled": true,
+    "packages": [
+      "Microsoft.WindowsFeedbackHub"
+    ]
+  },
+  "removeWindowsCapabilities": {
+    "enabled": true,
+    "capabilities": [
+      "AzureArcSetup~~~~"
+    ]
+  },
+  "emptyStandbyList": {
+    "enabled": true,
+    "sourceRepo": "stefanpejcic/EmptyStandbyList",
+    "installDir": "C:\\Empty Cache",
+    "exeName": "EmptyStandbyList.exe",
+    "argument": "standbylist",
+    "taskName": "Dump Res.Memory",
+    "repeatMinutes": 30,
+    "taskXmlName": "EmptyStandbyList.xml",
+    "taskPath": "\\Dump\\"
+  },
+  "windowsUpdateBandwidth": {
+    "enabled": true,
+    "qosNonBestEffortLimit": 0,
+    "deliveryOptimizationDownloadMode": 0,
+    "disableUpdateBandwidthLimits": true,
+    "runGpupdate": true
+  },
+  "rdpBruteforceBlocker": {
+    "enabled": true,
+    "threshold": 6,
+    "lookbackMinutes": 30,
+    "taskName": "WinServerSetup RDP Bruteforce Blocker",
+    "taskIntervalMinutes": 5,
+    "rulePrefix": "WinServerSetup RDP Block",
+    "hidden": true,
+    "whitelistCIDRs": [
+      "127.0.0.1/32"
+    ]
+  },
+  "powershell": {
+    "enabled": true,
+    "githubRepo": "PowerShell/PowerShell",
+    "assetNameRegex": "^PowerShell-.*-win-x64\\.msi$",
+    "installLatestFromGitHub": true,
+    "forceInstall": false,
+    "interactiveInstaller": false,
+    "setPs1DefaultApp": true,
+    "msiArguments": "",
+    "silentMsiArguments": "ADD_EXPLORER_CONTEXT_MENU_OPENPOWERSHELL=1 REGISTER_MANIFEST=1 ENABLE_PSREMOTING=0 USE_MU=1 ENABLE_MU=1 DISABLE_TELEMETRY=1"
+  },
+  "windowsTerminal": {
+    "enabled": true,
+    "packageId": "Microsoft.WindowsTerminal",
+    "interactiveInstaller": false,
+    "setAsDefaultTerminal": true,
+    "setPowerShell7AsDefaultProfile": true,
+    "openSettingsAfterInstall": false
+  },
+  "customFolders": {
+    "enabled": true,
+    "portablePath": "C:\\portable",
+    "scriptsPath": "C:\\portable\\Scripts",
+    "createCompressedInDownloads": true,
+    "compressedFolderName": "compressed",
+    "excludeCompressedFromDefender": true
+  },
+  "cleanup": {
+    "enabled": true,
+    "cleanProjectDownloadCache": true,
+    "cleanUserTemp": true,
+    "cleanWindowsTemp": true,
+    "cleanWindowsUpdateDownloadCache": false,
+    "cleanRecycleBin": false
+  }
+}

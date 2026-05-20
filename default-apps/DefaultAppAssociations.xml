@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DefaultAssociations>
+  <!--
+    Template only.
+    Windows protects default app associations. This XML usually works best for new users/images.
+    After installing Brave and K-Lite/MPC-HC, export your confirmed defaults with:
+      Dism /Online /Export-DefaultAppAssociations:"C:\portable\DefaultAppAssociations.xml"
+    Then replace this file and re-run the default apps section.
+  -->
+  <Association Identifier=".htm" ProgId="BraveHTML" ApplicationName="Brave" />
+  <Association Identifier=".html" ProgId="BraveHTML" ApplicationName="Brave" />
+  <Association Identifier=".shtml" ProgId="BraveHTML" ApplicationName="Brave" />
+  <Association Identifier=".xht" ProgId="BraveHTML" ApplicationName="Brave" />
+  <Association Identifier=".xhtml" ProgId="BraveHTML" ApplicationName="Brave" />
+  <Association Identifier="http" ProgId="BraveHTML" ApplicationName="Brave" />
+  <Association Identifier="https" ProgId="BraveHTML" ApplicationName="Brave" />
+
+  <Association Identifier=".mp4" ProgId="MPC-HC.mp4" ApplicationName="MPC-HC" />
+  <Association Identifier=".m4v" ProgId="MPC-HC.m4v" ApplicationName="MPC-HC" />
+  <Association Identifier=".mkv" ProgId="MPC-HC.mkv" ApplicationName="MPC-HC" />
+  <Association Identifier=".avi" ProgId="MPC-HC.avi" ApplicationName="MPC-HC" />
+  <Association Identifier=".mov" ProgId="MPC-HC.mov" ApplicationName="MPC-HC" />
+  <Association Identifier=".wmv" ProgId="MPC-HC.wmv" ApplicationName="MPC-HC" />
+  <Association Identifier=".flv" ProgId="MPC-HC.flv" ApplicationName="MPC-HC" />
+  <Association Identifier=".webm" ProgId="MPC-HC.webm" ApplicationName="MPC-HC" />
+  <Association Identifier=".mpg" ProgId="MPC-HC.mpg" ApplicationName="MPC-HC" />
+  <Association Identifier=".mpeg" ProgId="MPC-HC.mpeg" ApplicationName="MPC-HC" />
+  <Association Identifier=".ts" ProgId="MPC-HC.ts" ApplicationName="MPC-HC" />
+  <Association Identifier=".m2ts" ProgId="MPC-HC.m2ts" ApplicationName="MPC-HC" />
+
+  <!-- 7-Zip as default for compressed/archive file extensions.
+       7-Zip registers ProgIds named "7-Zip.<ext>" during install.
+       These entries make 7-Zip the default for new user profiles, applied
+       via:  Dism /Online /Import-DefaultAppAssociations:<this file>.
+       For existing users, the script's Set-SevenZipAsDefault function writes
+       equivalent entries to HKCU\Software\Classes at runtime. -->
+  <Association Identifier=".7z"      ProgId="7-Zip.7z"      ApplicationName="7-Zip" />
+  <Association Identifier=".zip"     ProgId="7-Zip.zip"     ApplicationName="7-Zip" />
+  <Association Identifier=".rar"     ProgId="7-Zip.rar"     ApplicationName="7-Zip" />
+  <Association Identifier=".tar"     ProgId="7-Zip.tar"     ApplicationName="7-Zip" />
+  <Association Identifier=".gz"      ProgId="7-Zip.gz"      ApplicationName="7-Zip" />
+  <Association Identifier=".tgz"     ProgId="7-Zip.tgz"     ApplicationName="7-Zip" />
+  <Association Identifier=".bz2"     ProgId="7-Zip.bz2"     ApplicationName="7-Zip" />
+  <Association Identifier=".tbz2"    ProgId="7-Zip.tbz2"    ApplicationName="7-Zip" />
+  <Association Identifier=".xz"      ProgId="7-Zip.xz"      ApplicationName="7-Zip" />
+  <Association Identifier=".txz"     ProgId="7-Zip.txz"     ApplicationName="7-Zip" />
+  <Association Identifier=".lzma"    ProgId="7-Zip.lzma"    ApplicationName="7-Zip" />
+  <Association Identifier=".lzh"     ProgId="7-Zip.lzh"     ApplicationName="7-Zip" />
+  <Association Identifier=".lha"     ProgId="7-Zip.lha"     ApplicationName="7-Zip" />
+  <Association Identifier=".cab"     ProgId="7-Zip.cab"     ApplicationName="7-Zip" />
+  <Association Identifier=".arj"     ProgId="7-Zip.arj"     ApplicationName="7-Zip" />
+  <Association Identifier=".iso"     ProgId="7-Zip.iso"     ApplicationName="7-Zip" />
+  <Association Identifier=".img"     ProgId="7-Zip.img"     ApplicationName="7-Zip" />
+  <Association Identifier=".wim"     ProgId="7-Zip.wim"     ApplicationName="7-Zip" />
+  <Association Identifier=".swm"     ProgId="7-Zip.swm"     ApplicationName="7-Zip" />
+  <Association Identifier=".esd"     ProgId="7-Zip.esd"     ApplicationName="7-Zip" />
+  <Association Identifier=".cpio"    ProgId="7-Zip.cpio"    ApplicationName="7-Zip" />
+  <Association Identifier=".cramfs"  ProgId="7-Zip.cramfs"  ApplicationName="7-Zip" />
+  <Association Identifier=".dmg"     ProgId="7-Zip.dmg"     ApplicationName="7-Zip" />
+  <Association Identifier=".rpm"     ProgId="7-Zip.rpm"     ApplicationName="7-Zip" />
+  <Association Identifier=".deb"     ProgId="7-Zip.deb"     ApplicationName="7-Zip" />
+  <Association Identifier=".chm"     ProgId="7-Zip.chm"     ApplicationName="7-Zip" />
+  <Association Identifier=".vhd"     ProgId="7-Zip.vhd"     ApplicationName="7-Zip" />
+  <Association Identifier=".vhdx"    ProgId="7-Zip.vhdx"    ApplicationName="7-Zip" />
+  <Association Identifier=".vmdk"    ProgId="7-Zip.vmdk"    ApplicationName="7-Zip" />
+  <Association Identifier=".squashfs" ProgId="7-Zip.squashfs" ApplicationName="7-Zip" />
+  <Association Identifier=".udf"     ProgId="7-Zip.udf"     ApplicationName="7-Zip" />
+  <Association Identifier=".xar"     ProgId="7-Zip.xar"     ApplicationName="7-Zip" />
+  <Association Identifier=".z"       ProgId="7-Zip.z"       ApplicationName="7-Zip" />
+  <Association Identifier=".001"     ProgId="7-Zip.001"     ApplicationName="7-Zip" />
+</DefaultAssociations>

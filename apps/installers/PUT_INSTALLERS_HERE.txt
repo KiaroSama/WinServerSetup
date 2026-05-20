@@ -1,0 +1,7 @@
+Put optional local installers here. WinServerSetup prefers the configured online sources, but local files can still be used by steps that explicitly check this folder.
+
+Expected optional files:
+- EmptyStandbyList.exe
+
+9Proxy, Dolphin Anty, GoLogin, Everything, PowerShell 7, and v2rayN are downloaded from their configured URLs by default.
+WinGet-installed apps use the official winget source after the msstore source is removed.

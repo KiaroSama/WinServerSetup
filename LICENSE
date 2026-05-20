@@ -1,0 +1,45 @@
+MIT License
+
+Copyright (c) 2026 Kiaro Sama
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software, including copied, modified,
+published, distributed, republished, redistributed, or substantially included
+parts of this project.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Attribution Notice
+------------------
+
+WinServerSetup - Copyright (c) 2026 Kiaro Sama
+Original author: Kiaro Sama
+GitHub: https://github.com/KiaroSama
+Original repository: https://github.com/KiaroSama/WinServerSetup
+Licensed under the MIT License.
+
+Windows Activation Disclaimer
+-----------------------------
+
+This software includes an optional helper for activating Windows against KMS
+(Key Management Service) hosts that the operator supplies in its configuration
+file. The default configuration points at a publicly known KMS host
+(kms.digiboy.ir). Kiaro Sama does not operate that server, does not endorse
+using it for non-licensed Windows installations, and provides no guarantee
+about its availability, security, or legality in any jurisdiction. By using
+the activation feature you confirm that you have the right to activate the
+Windows installation in question. You alone are responsible for licensing
+compliance.
