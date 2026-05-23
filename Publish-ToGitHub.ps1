@@ -38,6 +38,14 @@ function Get-ProjectRoot {
     return (Get-Location).Path
 }
 
+function Test-GitHubRemoteUrl {
+    param([Parameter(Mandatory)][string]$Url)
+    return (
+        $Url -match '^https://github\.com/[^/]+/[^/]+(\.git)?$' -or
+        $Url -match '^git@github\.com:[^/]+/[^/]+(\.git)?$'
+    )
+}
+
 $projectRoot = Get-ProjectRoot
 Push-Location $projectRoot
 try {
@@ -115,8 +123,16 @@ try {
         return
     }
 
+    if (-not (Test-GitHubRemoteUrl -Url $RepoUrl) -and -not $Force) {
+        throw "RepoUrl is not a GitHub remote. Pass -Force only if you intentionally want to push elsewhere: $RepoUrl"
+    }
+
     $remotes = (git remote) 2>$null
     if ($remotes -contains "origin") {
+        $currentOrigin = (git remote get-url origin) 2>$null
+        if ($currentOrigin -and -not (Test-GitHubRemoteUrl -Url $currentOrigin) -and -not $Force) {
+            throw "Existing origin is not a GitHub remote. Pass -Force to overwrite it intentionally: $currentOrigin"
+        }
         if ($Force) {
             Write-Step "Updating existing 'origin' remote to $RepoUrl."
             git remote set-url origin $RepoUrl

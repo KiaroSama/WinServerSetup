@@ -51,10 +51,11 @@ function Test-IPv4InCidr {
     )
 
     if ($IpAddress -notmatch '^(\d{1,3}\.){3}\d{1,3}$') { return $false }
-    if ($Cidr -notmatch '^(.+)/(\d{1,2})$') { return $IpAddress -eq $Cidr }
+    $cidrMatch = [regex]::Match($Cidr, '^(.+)/(\d{1,2})$')
+    if (-not $cidrMatch.Success) { return $IpAddress -eq $Cidr }
 
-    $network = $Matches[1]
-    $prefix = [int]$Matches[2]
+    $network = $cidrMatch.Groups[1].Value
+    $prefix = [int]$cidrMatch.Groups[2].Value
     if ($prefix -lt 0 -or $prefix -gt 32) { return $false }
 
     $ipInt = Convert-IPv4ToUInt32 $IpAddress
@@ -73,7 +74,9 @@ function Test-IsWhitelisted {
         if ([string]::IsNullOrWhiteSpace($cidr)) { continue }
         try {
             if (Test-IPv4InCidr -IpAddress $IpAddress -Cidr $cidr) { return $true }
-        } catch { }
+        } catch {
+            Write-LogLine ("Whitelist CIDR check failed for {0} / {1}: {2}" -f $IpAddress, $cidr, $_.Exception.Message) "WARN"
+        }
     }
     return $false
 }
@@ -88,9 +91,9 @@ function Get-FailedLogonSourceIPs {
     $events = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4625; StartTime = $startTime } -ErrorAction SilentlyContinue
     $ips = New-Object System.Collections.Generic.List[string]
 
-    foreach ($event in $events) {
+    foreach ($evt in $events) {
         try {
-            [xml]$xml = $event.ToXml()
+            [xml]$xml = $evt.ToXml()
             $data = @{}
             foreach ($node in $xml.Event.EventData.Data) {
                 if ($node.Name) { $data[$node.Name] = $node.'#text' }
@@ -103,16 +106,16 @@ function Get-FailedLogonSourceIPs {
             if ($ip -eq '-' -or $ip -eq '::1' -or $ip -eq '127.0.0.1') { continue }
             if ($ip -notmatch '^(\d{1,3}\.){3}\d{1,3}$') { continue }
 
-            # LogonType 10 is RemoteInteractive (RDP). Type 3 may occur with network auth paths.
-            if ($logonType -and ($logonType -notin @('10','3'))) { continue }
+            # LogonType 10 is RemoteInteractive (RDP). Network logons are intentionally ignored.
+            if ($logonType -ne '10') { continue }
 
             $ips.Add($ip)
         } catch {
-            continue
+            Write-LogLine "Could not parse failed-logon event: $($_.Exception.Message)" "WARN"
         }
     }
 
-    return $ips | Group-Object | Where-Object { $_.Count -gt $Threshold } | Sort-Object Count -Descending
+    return $ips | Group-Object | Where-Object { $_.Count -ge $Threshold } | Sort-Object Count -Descending
 }
 
 function Get-CurrentRdpClientIPs {
@@ -126,7 +129,9 @@ function Get-CurrentRdpClientIPs {
                     $clients.Add($remote)
                 }
             }
-        } catch { }
+        } catch {
+            Write-LogLine ("Could not enumerate RDP clients on port {0}: {1}" -f $port, $_.Exception.Message) "WARN"
+        }
     }
     return @($clients | Select-Object -Unique)
 }
@@ -178,7 +183,9 @@ try {
     try {
         if ($config.rdp.newPort) { $rdpPorts += [int]$config.rdp.newPort }
         if ($config.rdp.oldPort) { $rdpPorts += [int]$config.rdp.oldPort }
-    } catch { }
+    } catch {
+        Write-LogLine "Could not read configured RDP ports: $($_.Exception.Message)" "WARN"
+    }
     $currentRdpClients = @(Get-CurrentRdpClientIPs -Ports $rdpPorts)
     foreach ($client in $currentRdpClients) {
         Write-LogLine "Current established RDP client detected and protected from blocking: $client"

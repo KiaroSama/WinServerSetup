@@ -241,6 +241,26 @@ function Invoke-Timed {
     }
 }
 
+function Invoke-RecordedSetupStep {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [switch]$PassThru
+    )
+    $null = $Global:RunStats.StartedTasks.Add($Name)
+    Write-StructuredLog -Level TASK -Message ("Started: {0}" -f $Name)
+    try {
+        $result = & $Action
+        $null = $Global:RunStats.CompletedTasks.Add($Name)
+        Write-StructuredLog -Level TASK -Message ("Completed: {0}" -f $Name)
+        if ($PassThru) { return $result }
+    } catch {
+        $null = $Global:RunStats.FailedTasks.Add($Name)
+        Write-StructuredLog -Level ERROR -Message ("Failed: {0}; {1}" -f $Name, $_.Exception.Message)
+        throw
+    }
+}
+
 # =============================================================================
 # PRESS-ANY-KEY PROMPTS
 # =============================================================================
@@ -349,6 +369,67 @@ function Get-DownloadCachePath {
     return $cfgValue
 }
 
+function Get-SafeDownloadCacheFilePath {
+    param([Parameter(Mandatory)][string]$FileName)
+    $leaf = Split-Path -Leaf $FileName
+    if ([string]::IsNullOrWhiteSpace($leaf)) {
+        throw "Download file name is empty."
+    }
+    if (-not [string]::Equals($leaf, $FileName, [System.StringComparison]::Ordinal)) {
+        Write-Warn ("Download file name contained path segments; using safe leaf name: {0}" -f $leaf)
+    }
+    $root = [System.IO.Path]::GetFullPath((Get-DownloadCachePath)).TrimEnd('\')
+    $candidate = [System.IO.Path]::GetFullPath((Join-Path $root $leaf))
+    if (-not $candidate.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Resolved download path is outside the configured cache: $candidate"
+    }
+    return $candidate
+}
+
+function Test-DownloadedFileSignature {
+    param([Parameter(Mandatory)][string]$Path)
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($ext -notin @('.exe', '.msi', '.msix', '.msixbundle', '.appx', '.appxbundle')) {
+        Write-StructuredLog -Level SIGNATURE -Message ("Authenticode signature not applicable for file type: {0}" -f $Path)
+        return $null
+    }
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        if ($sig.Status -eq 'Valid') {
+            Write-StructuredLog -Level SIGNATURE -Message ("Valid signature: {0}; signer={1}" -f $Path, $sig.SignerCertificate.Subject)
+            return $true
+        } else {
+            Write-Warn ("Downloaded file signature is not valid for {0}: {1}. Installer will remain available, but verify the source if this is unexpected." -f (Split-Path -Leaf $Path), $sig.Status)
+            Write-StructuredLog -Level SIGNATURE -Message ("Non-valid signature: {0}; status={1}; message={2}" -f $Path, $sig.Status, $sig.StatusMessage)
+            return $false
+        }
+    } catch {
+        Write-Warn ("Could not verify downloaded file signature for {0}: {1}" -f (Split-Path -Leaf $Path), $_.Exception.Message)
+        return $false
+    }
+}
+
+function Test-FileSha256 {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ExpectedSha256 = ""
+    )
+    if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) { return $true }
+    try {
+        $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ([string]::Equals($actual, $ExpectedSha256.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-StructuredLog -Level HASH -Message ("SHA256 verified: {0}" -f $Path)
+            return $true
+        }
+        Write-Warn ("SHA256 mismatch for {0}. Expected {1}, got {2}." -f (Split-Path -Leaf $Path), $ExpectedSha256, $actual)
+        Write-StructuredLog -Level HASH -Message ("SHA256 mismatch: {0}; expected={1}; actual={2}" -f $Path, $ExpectedSha256, $actual)
+        return $false
+    } catch {
+        Write-Warn ("Could not verify SHA256 for {0}: {1}" -f (Split-Path -Leaf $Path), $_.Exception.Message)
+        return $false
+    }
+}
+
 function Initialize-Environment {
     Load-Config
 
@@ -400,8 +481,11 @@ function Test-WindowsRebootRequired {
     foreach ($p in $signals) { if (Test-Path $p) { return $true } }
     try {
         $pending = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue)
-        if ($pending) { return $true }
-    } catch { }
+        $ops = @($pending.PendingFileRenameOperations | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($ops.Count -gt 0) { return $true }
+    } catch {
+        Write-StructuredLog -Level DEBUG -Message ("PendingFileRenameOperations check failed: {0}" -f $_.Exception.Message)
+    }
     return $false
 }
 
@@ -469,7 +553,8 @@ function Invoke-SelfRelocateIfNeeded {
     if ($Global:NoReboot){ $childArgs += "-NoReboot" }
 
     Write-Info ("Relaunching from new location: {0}" -f $newScript)
-    Start-Process powershell.exe -ArgumentList $childArgs
+    $relocatedProcess = Start-Process powershell.exe -ArgumentList $childArgs -PassThru
+    Write-Info ("Relocated setup process started. PID={0}; relocation log={1}" -f $relocatedProcess.Id, $relocateLog)
     try {
         $cleanupScript = Join-Path $env:TEMP ("WinServerSetup-clean-source-{0}.ps1" -f ([guid]::NewGuid().ToString("N")))
         $parentPid = $PID
@@ -492,6 +577,7 @@ try {
 } catch {
     Add-Content -LiteralPath `$RelocateLog -Encoding utf8 -Value ("[{0}] [WARN] Could not remove original source folder: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `$_.Exception.Message)
 }
+try { Remove-Item -LiteralPath `$MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue } catch { }
 "@
         Set-Content -LiteralPath $cleanupScript -Value $cleanup -Encoding utf8 -Force
         Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
@@ -646,7 +732,7 @@ function Start-ApplicationDownloadPrefetch {
     Ensure-Directory $logRoot
     $prefetchLog = Join-Path $logRoot ("WinServerSetup-prefetch-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
     $psExe = Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe"
-    $args = @(
+    $prefetchArgs = @(
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
         "-File", "`"$prefetchScript`"",
@@ -657,7 +743,7 @@ function Start-ApplicationDownloadPrefetch {
     )
 
     try {
-        $proc = Start-Process -FilePath $psExe -ArgumentList $args -PassThru -WindowStyle Hidden
+        $proc = Start-Process -FilePath $psExe -ArgumentList $prefetchArgs -PassThru -WindowStyle Hidden
         Write-Ok "Application download prefetch started in the background (max $MaxParallel downloads)."
         Write-Info "Prefetch log: $prefetchLog"
         Write-StructuredLog -Level PREFETCH -Message ("Started process {0}; log={1}" -f $proc.Id, $prefetchLog)
@@ -696,26 +782,60 @@ function Invoke-DownloadFile {
     param(
         [Parameter(Mandatory)][string]$Url,
         [Parameter(Mandatory)][string]$Destination,
-        [int]$RetryCount = 2
+        [int]$RetryCount = 2,
+        [int64]$MinimumBytes = 1024,
+        [string]$ExpectedSha256 = "",
+        [bool]$RequireValidSignature = $false
     )
     $dir = Split-Path -Parent $Destination
     Ensure-Directory $dir
-    if ((Test-Path $Destination) -and ((Get-Item -LiteralPath $Destination).Length -gt 0)) {
-        Write-Ok ("Using cached download: {0}" -f (Split-Path -Leaf $Destination))
-        Write-StructuredLog -Level DOWNLOAD -Message ("Cache hit: {0}" -f $Destination)
-        return $true
+    if (Test-Path $Destination) {
+        $existing = Get-Item -LiteralPath $Destination -ErrorAction SilentlyContinue
+        if ($existing -and $existing.Length -ge $MinimumBytes) {
+            if (-not (Test-FileSha256 -Path $Destination -ExpectedSha256 $ExpectedSha256)) {
+                Write-Warn ("Cached file failed hash verification; re-downloading: {0}" -f (Split-Path -Leaf $Destination))
+                Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            } elseif ($RequireValidSignature -and $true -ne (Test-DownloadedFileSignature -Path $Destination)) {
+                Write-Warn ("Cached file failed required signature validation; re-downloading: {0}" -f (Split-Path -Leaf $Destination))
+                Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Ok ("Using cached download: {0}" -f (Split-Path -Leaf $Destination))
+                Write-StructuredLog -Level DOWNLOAD -Message ("Cache hit: {0}; bytes={1}" -f $Destination, $existing.Length)
+                return $true
+            }
+        } else {
+            Write-Warn ("Cached file is missing or too small; re-downloading: {0}" -f (Split-Path -Leaf $Destination))
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        }
     }
 
     for ($i = 0; $i -le $RetryCount; $i++) {
+        $partial = "$Destination.partial"
         try {
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
             Write-StructuredLog -Level DOWNLOAD -Message ("URL={0}; Destination={1}" -f $Url, $Destination)
             Write-StatusInPlace ("Downloading: {0}" -f (Split-Path -Leaf $Destination))
-            Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -ErrorAction Stop
+            Invoke-WebRequest -Uri $Url -OutFile $partial -UseBasicParsing -ErrorAction Stop
+            $downloaded = Get-Item -LiteralPath $partial -ErrorAction Stop
+            if ($downloaded.Length -lt $MinimumBytes) {
+                throw "Downloaded file is unexpectedly small ($($downloaded.Length) bytes)."
+            }
+            Move-Item -LiteralPath $partial -Destination $Destination -Force
             Clear-StatusInPlace
+            if (-not (Test-FileSha256 -Path $Destination -ExpectedSha256 $ExpectedSha256)) {
+                Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+                throw "Downloaded file failed SHA256 verification."
+            }
+            $signatureOk = Test-DownloadedFileSignature -Path $Destination
+            if ($RequireValidSignature -and $true -ne $signatureOk) {
+                Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+                throw "Downloaded file failed required Authenticode signature validation."
+            }
             Write-Ok ("Downloaded: {0}" -f (Split-Path -Leaf $Destination))
             return $true
         } catch {
             Clear-StatusInPlace
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
             if ($i -ge $RetryCount) {
                 Write-Fail ("Download failed: {0}  ({1})" -f $Url, $_.Exception.Message)
                 return $false
@@ -795,6 +915,53 @@ function Invoke-LoggedCommand {
     }
 }
 
+function Invoke-LoggedProcessWithProgress {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [string]$DisplayName = "",
+        [string]$StatusMessage = ""
+    )
+    $label = if ([string]::IsNullOrWhiteSpace($DisplayName)) { (Split-Path -Leaf $FilePath) } else { $DisplayName }
+    $status = if ([string]::IsNullOrWhiteSpace($StatusMessage)) { "Running $label" } else { $StatusMessage }
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
+    try {
+        Write-StructuredLog -Level COMMAND -Message ("{0} {1}" -f $FilePath, ($Arguments -join ' '))
+        $proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -RedirectStandardOutput $outFile -RedirectStandardError $errFile -WindowStyle Hidden -PassThru
+        $start = Get-Date
+        while (-not $proc.HasExited) {
+            $elapsed = (Get-Date) - $start
+            Write-StatusInPlace ("{0} [{1:hh\:mm\:ss}]" -f $status, $elapsed)
+            Start-Sleep -Seconds 2
+            try { $proc.Refresh() } catch { }
+        }
+        Clear-StatusInPlace
+
+        $output = @()
+        foreach ($path in @($outFile, $errFile)) {
+            if (Test-Path $path) {
+                $output += Get-Content -LiteralPath $path -ErrorAction SilentlyContinue
+            }
+        }
+        foreach ($line in $output) {
+            $text = [string]$line
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                Write-StructuredLog -Level OUTPUT -Message ("{0}> {1}" -f $label, $text.TrimEnd())
+            }
+        }
+        Write-StructuredLog -Level COMMAND -Message ("{0} exit code: {1}" -f $label, $proc.ExitCode)
+        return [pscustomobject]@{ ExitCode = $proc.ExitCode; Output = $output }
+    } catch {
+        Clear-StatusInPlace
+        Write-StructuredLog -Level ERROR -Message ("{0} failed to start or run: {1}" -f $label, $_.Exception.Message)
+        throw
+    } finally {
+        Clear-StatusInPlace
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # =============================================================================
 # WINGET ENSURE + MSSTORE FIX (item 9)
 # =============================================================================
@@ -809,8 +976,7 @@ function Ensure-Winget {
         return $false
     }
     Write-Info "WinGet was not found. Downloading Microsoft App Installer package..."
-    $download = Get-DownloadCachePath
-    $bundle = Join-Path $download "Microsoft.DesktopAppInstaller.msixbundle"
+    $bundle = Get-SafeDownloadCacheFilePath -FileName "Microsoft.DesktopAppInstaller.msixbundle"
     if (Invoke-DownloadFile -Url "https://aka.ms/getwinget" -Destination $bundle) {
         try {
             Add-AppxPackage -Path $bundle
@@ -830,27 +996,103 @@ function Ensure-Winget {
 
 function Repair-WingetSources {
     if (-not $Global:Config.winget.removeMsstoreSource) { return }
+    $needsReset = $false
     try {
         $sourcesResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "list") -DisplayName "winget source list"
-        $sources = ($sourcesResult.Output -join "`n")
-        if ($sources -match '(?im)^\s*msstore\b') {
-            Write-Info "Removing msstore winget source (avoids 0x8a15005e certificate errors)."
-            $removeResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "remove", "msstore") -DisplayName "winget source remove msstore"
-            if ($removeResult.ExitCode -eq 0) { Write-Ok "Removed winget source: msstore" }
-            else { Write-Warn "winget could not remove msstore source; details are in the structured log." }
+        if ($sourcesResult.ExitCode -ne 0) {
+            Write-Warn "winget source listing failed; attempting source reset fallback."
+            $needsReset = $true
         } else {
-            Write-Info "winget msstore source is already absent."
+            $sources = ($sourcesResult.Output -join "`n")
+            if ($sources -match '(?im)^\s*msstore\b') {
+                Write-Info "Removing msstore winget source (avoids 0x8a15005e certificate errors)."
+                $removeResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "remove", "msstore") -DisplayName "winget source remove msstore"
+                if ($removeResult.ExitCode -eq 0) { Write-Ok "Removed winget source: msstore" }
+                else {
+                    Write-Warn "winget could not remove msstore source; attempting source reset fallback."
+                    $needsReset = $true
+                }
+            } else {
+                Write-Info "winget msstore source is already absent."
+            }
         }
-    } catch { Write-Warn "winget source listing failed: $($_.Exception.Message)" }
+    } catch {
+        Write-Warn "winget source listing failed: $($_.Exception.Message)"
+        $needsReset = $true
+    }
 
     try {
         Write-Info "Refreshing winget sources..."
         $updateResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "update") -DisplayName "winget source update"
         if ($updateResult.ExitCode -eq 0) { Write-Ok "winget sources refreshed." }
-        else { Write-Warn "winget source update exited with code $($updateResult.ExitCode). Details are in the structured log." }
+        else {
+            Write-Warn "winget source update exited with code $($updateResult.ExitCode). Attempting source reset fallback."
+            $needsReset = $true
+        }
     } catch {
         Write-Warn "winget source update failed: $($_.Exception.Message)"
+        $needsReset = $true
     }
+
+    if ($needsReset) {
+        try {
+            Write-Info "Resetting winget sources with --force..."
+            $resetResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "reset", "--force") -DisplayName "winget source reset"
+            if ($resetResult.ExitCode -eq 0) { Write-Ok "winget sources reset." }
+            else { Write-Warn "winget source reset exited with code $($resetResult.ExitCode)." }
+            $removeAfterReset = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "remove", "msstore") -DisplayName "winget source remove msstore after reset"
+            if ($removeAfterReset.ExitCode -eq 0) { Write-Ok "Removed winget source after reset: msstore" }
+            else {
+                Write-Info "msstore source was not present after reset or could not be removed; details are in the structured log."
+                Write-StructuredLog -Level WINGET -Message ("winget source remove msstore after reset exit code: {0}" -f $removeAfterReset.ExitCode)
+            }
+            $refreshResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "update") -DisplayName "winget source update after reset"
+            if ($refreshResult.ExitCode -eq 0) { Write-Ok "winget sources refreshed after reset." }
+            else { Write-Warn "winget source update after reset exited with code $($refreshResult.ExitCode)." }
+        } catch {
+            Write-Warn "winget source reset fallback failed: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Test-WingetPackageInstalled {
+    param([Parameter(Mandatory)][string]$Id)
+    if ([string]::IsNullOrWhiteSpace($Id)) { return $false }
+
+    try {
+        $jsonResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("list", "--id", $Id, "--exact", "--accept-source-agreements", "--source", "winget", "--output", "json") -DisplayName "winget list $Id json"
+        $jsonText = ($jsonResult.Output -join "`n")
+        if ($jsonResult.ExitCode -eq 0) {
+            $starts = @($jsonText.IndexOf('{'), $jsonText.IndexOf('[')) | Where-Object { $_ -ge 0 } | Sort-Object
+            foreach ($startIndex in $starts) {
+                try {
+                    $jsonPayload = $jsonText.Substring($startIndex)
+                    $null = $jsonPayload | ConvertFrom-Json -ErrorAction Stop
+                    if ($jsonPayload -match [regex]::Escape($Id)) { return $true }
+                    break
+                } catch {
+                    Write-StructuredLog -Level WINGET -Message ("Could not parse winget JSON payload for {0} starting at index {1}: {2}" -f $Id, $startIndex, $_.Exception.Message)
+                }
+            }
+        }
+    } catch {
+        Write-StructuredLog -Level WINGET -Message ("JSON package detection failed for {0}: {1}" -f $Id, $_.Exception.Message)
+    }
+
+    try {
+        $listResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("list", "--id", $Id, "--exact", "--accept-source-agreements", "--source", "winget") -DisplayName "winget list $Id"
+        return ($listResult.ExitCode -eq 0 -and (($listResult.Output -join "`n") -match [regex]::Escape($Id)))
+    } catch {
+        Write-StructuredLog -Level WINGET -Message ("Package detection failed for {0}: {1}" -f $Id, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Test-WindowsTerminalInstalled {
+    if (Test-CommandExists "wt") { return $true }
+    $stable = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\wt.exe"
+    if (Test-Path $stable) { return $true }
+    return $false
 }
 
 # =============================================================================
@@ -873,7 +1115,9 @@ function Enable-FileExtensions {
             $sig = '[DllImport("shell32.dll")] public static extern int SHChangeNotify(int eventId, int flags, IntPtr item1, IntPtr item2);'
             $shell = Add-Type -MemberDefinition $sig -Namespace WinShell -Name ExplorerSettingsNotify -PassThru -ErrorAction SilentlyContinue
             if ($shell) { [void]$shell::SHChangeNotify(0x8000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero) }
-        } catch { }
+        } catch {
+            Write-StructuredLog -Level WARN -Message ("Explorer file-extension refresh failed: {0}" -f $_.Exception.Message)
+        }
     }
 }
 
@@ -894,7 +1138,7 @@ function Set-WindowsDarkMode {
     # before Start/taskbar pick up the system dark state.
     $colorPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes"
     if (Test-Path $colorPath) {
-        try { Set-ItemProperty -Path $colorPath -Name "ThemeChangesDesktopIcons" -Value 0 -ErrorAction SilentlyContinue } catch { }
+        try { Set-ItemProperty -Path $colorPath -Name "ThemeChangesDesktopIcons" -Value 0 -ErrorAction SilentlyContinue } catch { Write-StructuredLog -Level WARN -Message ("Could not set ThemeChangesDesktopIcons: {0}" -f $_.Exception.Message) }
     }
     $dwmPath = "HKCU:\Software\Microsoft\Windows\DWM"
     if (-not (Test-Path $dwmPath)) { New-Item -Path $dwmPath -Force | Out-Null }
@@ -1034,8 +1278,7 @@ function Install-WingetPackages {
         if ([string]::IsNullOrWhiteSpace($id)) { Write-Warn "Skipping $name (empty id)."; continue }
 
         Write-Info "Checking package: $name ($id)"
-        $listOutput = winget list --id $id --exact --accept-source-agreements --source winget 2>$null
-        if ($LASTEXITCODE -eq 0 -and ($listOutput -join "`n") -match [regex]::Escape($id)) {
+        if (Test-WingetPackageInstalled -Id $id) {
             Write-Ok "$name is already installed."
             if ($Global:Config.winget.upgradeExistingPackages) {
                 try {
@@ -1077,6 +1320,8 @@ function Install-DirectInstaller {
     $fileName    = [string]$Spec.fileName
     $silentArgs  = if ($Spec.silentArgs) { [string]$Spec.silentArgs } else { "/S" }
     $verifyName  = [string]$Spec.verifyRegistryName
+    $expectedSha256 = if ($Spec.PSObject.Properties.Name -contains "expectedSha256") { [string]$Spec.expectedSha256 } else { "" }
+    $requireValidSignature = if ($Spec.PSObject.Properties.Name -contains "requireValidSignature") { [bool]$Spec.requireValidSignature } else { $false }
 
     if (-not [string]::IsNullOrWhiteSpace($verifyName)) {
         $existing = Get-InstalledRegistryDisplayName -NameLike $verifyName
@@ -1087,7 +1332,6 @@ function Install-DirectInstaller {
         }
     }
 
-    $download = Get-DownloadCachePath
     if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = "${name}-installer.exe" -replace '\s','' }
 
     if ($name -ieq "Everything" -and $url -match 'voidtools\.com/.*/?downloads/?$|voidtools\.com/downloads/?$') {
@@ -1095,8 +1339,8 @@ function Install-DirectInstaller {
         try {
             Write-Info "Resolving latest Everything x64 installer from Voidtools downloads page..."
             $page = Invoke-WebRequest -Uri $url -UseBasicParsing -ErrorAction Stop
-            $matches = [regex]::Matches([string]$page.Content, 'Everything-(\d+\.\d+\.\d+\.\d+)\.x64-Setup\.exe')
-            $latest = $matches | ForEach-Object {
+            $regexMatches = [regex]::Matches([string]$page.Content, 'Everything-(\d+\.\d+\.\d+\.\d+)\.x64-Setup\.exe')
+            $latest = $regexMatches | ForEach-Object {
                 [pscustomobject]@{ Version = [version]$_.Groups[1].Value; File = $_.Value }
             } | Sort-Object Version -Descending | Select-Object -First 1
             if ($latest) {
@@ -1117,9 +1361,9 @@ function Install-DirectInstaller {
         }
     }
 
-    $exePath  = Join-Path $download $fileName
+    $exePath  = Get-SafeDownloadCacheFilePath -FileName $fileName
 
-    if (-not (Invoke-DownloadFile -Url $url -Destination $exePath)) {
+    if (-not (Invoke-DownloadFile -Url $url -Destination $exePath -ExpectedSha256 $expectedSha256 -RequireValidSignature $requireValidSignature)) {
         Write-Warn "$name download failed; skipping install."
         $null = $Global:RunStats.FailedApps.Add($name)
         return
@@ -1145,7 +1389,11 @@ function Install-DirectInstaller {
     } catch {
         Write-Warn "$name silent install failed: $($_.Exception.Message)"
         if ($Spec.fallbackInteractive) {
-            try { Start-Process -FilePath $exePath -Wait -ErrorAction SilentlyContinue } catch { }
+            try {
+                Start-Process -FilePath $exePath -Wait -ErrorAction SilentlyContinue
+            } catch {
+                Write-Warn "$name interactive fallback could not be started: $($_.Exception.Message)"
+            }
             Write-Info "$name interactive install attempted. Verify manually."
             $null = $Global:RunStats.InstalledApps.Add("$name (interactive)")
         } else {
@@ -1183,12 +1431,19 @@ function Install-DirectInstallers {
 # =============================================================================
 function New-Shortcut {
     param([Parameter(Mandatory)][string]$TargetPath,[Parameter(Mandatory)][string]$ShortcutPath,[string]$WorkingDirectory = "",[string]$Description = "")
-    $shell = New-Object -ComObject WScript.Shell
-    $s = $shell.CreateShortcut($ShortcutPath)
-    $s.TargetPath = $TargetPath
-    if ($WorkingDirectory) { $s.WorkingDirectory = $WorkingDirectory }
-    if ($Description)      { $s.Description      = $Description }
-    $s.Save()
+    $shell = $null
+    $s = $null
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $s = $shell.CreateShortcut($ShortcutPath)
+        $s.TargetPath = $TargetPath
+        if ($WorkingDirectory) { $s.WorkingDirectory = $WorkingDirectory }
+        if ($Description)      { $s.Description      = $Description }
+        $s.Save()
+    } finally {
+        if ($s) { try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($s) } catch { } }
+        if ($shell) { try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell) } catch { } }
+    }
 }
 
 function Install-V2RayN {
@@ -1212,7 +1467,7 @@ function Install-V2RayN {
         $regex   = [string]$settings.assetNameRegex
         $asset   = $release.assets | Where-Object { $_.name -match $regex } | Select-Object -First 1
         if (-not $asset) { throw "No asset matched regex: $regex" }
-        $zipPath = Join-Path $download $asset.name
+        $zipPath = Get-SafeDownloadCacheFilePath -FileName ([string]$asset.name)
         Write-Info "Downloading $($asset.name) ..."
         if (-not (Invoke-DownloadFile -Url $asset.browser_download_url -Destination $zipPath)) { throw "v2rayN download failed." }
 
@@ -1227,9 +1482,9 @@ function Install-V2RayN {
 
         if (Test-Path $finalDir) {
             Write-Info "Existing $finalFolder folder found; refreshing it in place."
-            # Replace contents but keep the folder so shortcuts/Quick Access pins survive.
+            # Copy new files without purging user-generated v2rayN configuration.
             $robocopyLog = Join-Path $env:TEMP "WinServerSetup-v2rayN.log"
-            $robo = Start-Process robocopy.exe -ArgumentList @("`"$srcDir`"", "`"$finalDir`"", "/MIR", "/R:1", "/W:2", "/NJH","/NJS","/NFL","/NDL","/NC","/NS","/LOG:`"$robocopyLog`"") -Wait -PassThru -WindowStyle Hidden
+            $robo = Start-Process robocopy.exe -ArgumentList @("`"$srcDir`"", "`"$finalDir`"", "/E", "/R:1", "/W:2", "/NJH","/NJS","/NFL","/NDL","/NC","/NS","/LOG:`"$robocopyLog`"") -Wait -PassThru -WindowStyle Hidden
             Write-StructuredLog -Level COMMAND -Message ("v2rayN robocopy exit code: {0}; log: {1}" -f $robo.ExitCode, $robocopyLog)
             if ($robo.ExitCode -ge 8) { throw "robocopy failed while refreshing v2rayN (exit $($robo.ExitCode)). See $robocopyLog" }
         } else {
@@ -1288,7 +1543,8 @@ function Install-LatestPowerShellFromGitHub {
         $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing -Headers @{ 'User-Agent' = 'WinServerSetup' }
     } catch { Write-Warn "GitHub query failed: $($_.Exception.Message)"; return }
 
-    $latestVer = $null; try { $latestVer = [version](([string]$release.tag_name).TrimStart("v")) } catch { }
+    $latestVer = $null
+    try { $latestVer = [version](([string]$release.tag_name).TrimStart("v")) } catch { Write-StructuredLog -Level WARN -Message ("Could not parse PowerShell release tag '{0}': {1}" -f $release.tag_name, $_.Exception.Message) }
     $currentVer = Get-PowerShellCoreVersion
     if ($currentVer -and $latestVer -and -not $s.forceInstall -and $currentVer -ge $latestVer) {
         Write-Ok "PowerShell $currentVer already current vs GitHub latest $latestVer."
@@ -1299,8 +1555,7 @@ function Install-LatestPowerShellFromGitHub {
     $asset = $release.assets | Where-Object { $_.name -match $regex } | Select-Object -First 1
     if (-not $asset) { Write-Warn "No PowerShell asset matched regex $regex"; return }
 
-    $download = Get-DownloadCachePath
-    $msi = Join-Path $download $asset.name
+    $msi = Get-SafeDownloadCacheFilePath -FileName ([string]$asset.name)
     if (-not (Invoke-DownloadFile -Url $asset.browser_download_url -Destination $msi)) { return }
 
     $msiArgs = @("/i", "`"$msi`"")
@@ -1337,21 +1592,24 @@ function Install-WindowsTerminal {
     if (-not (Ensure-Winget)) { return }
 
     $pkg = [string]$s.packageId; if ([string]::IsNullOrWhiteSpace($pkg)) { $pkg = "Microsoft.WindowsTerminal" }
-    $listOutput = winget list --id $pkg --exact --accept-source-agreements --source winget 2>$null
-    if ($LASTEXITCODE -eq 0 -and ($listOutput -join "`n") -match [regex]::Escape($pkg)) {
+    if (Test-WingetPackageInstalled -Id $pkg) {
         Write-Ok "Windows Terminal already installed."
-        try { [void](Invoke-LoggedCommand -FilePath "winget" -Arguments @("upgrade", "--id", $pkg, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--silent", "--source", "winget") -DisplayName "winget upgrade Windows Terminal") } catch { }
+        try { [void](Invoke-LoggedCommand -FilePath "winget" -Arguments @("upgrade", "--id", $pkg, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--silent", "--source", "winget") -DisplayName "winget upgrade Windows Terminal") } catch { Write-Warn "Windows Terminal upgrade check failed: $($_.Exception.Message)" }
     } else {
-        $args = @("install", "--id", $pkg, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget")
-        if ($s.interactiveInstaller) { $args += "--interactive" } else { $args += "--silent" }
+        $wingetInstallArgs = @("install", "--id", $pkg, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget")
+        if ($s.interactiveInstaller) { $wingetInstallArgs += "--interactive" } else { $wingetInstallArgs += "--silent" }
         try {
-            $terminalResult = Invoke-LoggedCommand -FilePath "winget" -Arguments $args -DisplayName "winget install Windows Terminal"
+            $terminalResult = Invoke-LoggedCommand -FilePath "winget" -Arguments $wingetInstallArgs -DisplayName "winget install Windows Terminal"
             if ($terminalResult.ExitCode -eq 0) { Write-Ok "Windows Terminal install completed." }
             else { Write-Warn "Windows Terminal install exited with code $($terminalResult.ExitCode)." }
         }
         catch { Write-Fail "Windows Terminal install failed: $($_.Exception.Message)"; return }
     }
 
+    if (-not (Test-WindowsTerminalInstalled)) {
+        Write-Warn "Windows Terminal executable was not found; default terminal/profile settings were skipped."
+        return
+    }
     if ($s.setAsDefaultTerminal)              { Set-WindowsTerminalAsDefault }
     if ($s.setPowerShell7AsDefaultProfile)    { Set-WindowsTerminalPowerShell7Default }
 }
@@ -1378,7 +1636,7 @@ function Get-WindowsTerminalSettingsPath {
 
 function Set-WindowsTerminalPowerShell7Default {
     $pwshPath = Get-PowerShell7ExePath
-    if (-not (Test-Path $pwshPath)) { Write-Warn "PowerShell 7 not found; default profile not changed."; return }
+    if ([string]::IsNullOrWhiteSpace($pwshPath) -or -not (Test-Path $pwshPath)) { Write-Warn "PowerShell 7 not found; default profile not changed."; return }
 
     $settingsPath = Get-WindowsTerminalSettingsPath
     $settingsDir  = Split-Path -Parent $settingsPath
@@ -1414,8 +1672,19 @@ function Set-WindowsTerminalPowerShell7Default {
         return
     }
     try {
-        if (-not $sj.profiles)      { $sj | Add-Member -NotePropertyName profiles -NotePropertyValue ([pscustomobject]@{ defaults=([pscustomobject]@{}); list=@() }) -Force }
-        if (-not $sj.profiles.list) { $sj.profiles | Add-Member -NotePropertyName list -NotePropertyValue @() -Force }
+        if (-not $sj.profiles) {
+            $sj | Add-Member -NotePropertyName profiles -NotePropertyValue ([pscustomobject]@{ defaults=([pscustomobject]@{}); list=@() }) -Force
+        } elseif ($sj.profiles -is [array]) {
+            $legacyProfiles = @($sj.profiles)
+            $sj.profiles = [pscustomobject]@{
+                defaults = [pscustomobject]@{}
+                list     = $legacyProfiles
+            }
+            Write-Info "Normalized legacy Windows Terminal profiles array into the current profiles.list format."
+        } elseif (-not ($sj.profiles.PSObject.Properties.Name -contains 'list')) {
+            $sj.profiles | Add-Member -NotePropertyName list -NotePropertyValue @() -Force
+        }
+        if ($null -eq $sj.profiles.list) { $sj.profiles.list = @() }
 
         $existing = $sj.profiles.list | Where-Object {
             ($_.guid -eq $profileGuid) -or
@@ -1465,7 +1734,11 @@ function Set-PowerShell7AsPs1Default {
     $progId = "WinServerSetup.PowerShell7Script"
     $progPath = "HKCU:\Software\Classes\$progId"
     $cmdPath = Join-Path $progPath "shell\open\command"
+    $iconPath = Join-Path $progPath "DefaultIcon"
     Set-RegistryDefaultValue -Path $progPath -Value "PowerShell 7 Script"
+    Set-ItemProperty -Path $progPath -Name "FriendlyTypeName" -Type String -Value "PowerShell 7 Script"
+    Set-ItemProperty -Path $progPath -Name "EditFlags" -Type DWord -Value 0
+    Set-RegistryDefaultValue -Path $iconPath -Value ("`"{0}`",0" -f $pwshPath)
     Set-RegistryDefaultValue -Path $cmdPath -Value ("`"{0}`" -NoLogo -File `"%1`" %*" -f $pwshPath)
 
     $extPath = "HKCU:\Software\Classes\.ps1"
@@ -1646,7 +1919,9 @@ function Set-SevenZipAsDefault {
         $sig = '[DllImport("shell32.dll")] public static extern int SHChangeNotify(int eventId, int flags, IntPtr item1, IntPtr item2);'
         $shell = Add-Type -MemberDefinition $sig -Namespace WinShell -Name Notify -PassThru -ErrorAction SilentlyContinue
         if ($shell) { [void]$shell::SHChangeNotify(0x8000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero) }
-    } catch { }
+    } catch {
+        Write-StructuredLog -Level WARN -Message ("7-Zip association shell refresh failed: {0}" -f $_.Exception.Message)
+    }
 
     Write-Ok ("7-Zip default handler step done. Applied: {0}, Skipped: {1}." -f $applied, $skipped)
 }
@@ -1661,6 +1936,7 @@ function Configure-DefaultApps {
         $xml = Resolve-RelativePath ([string]$s.xmlPath)
         if (Test-Path $xml) {
             Write-Info "Importing default app associations: $xml"
+            Write-Info "DISM default app import applies to new user profiles; current-user protected defaults may still require Settings."
             try {
                 $dismResult = Invoke-LoggedCommand -FilePath "dism.exe" -Arguments @("/Online", "/Import-DefaultAppAssociations:$xml") -DisplayName "DISM default app import"
                 if ($dismResult.ExitCode -eq 0) {
@@ -1671,7 +1947,7 @@ function Configure-DefaultApps {
             } catch { Write-Warn "DISM import failed: $($_.Exception.Message)" }
         } else { Write-Warn "Default app associations XML not found: $xml" }
     }
-    if ($s.openSettingsAfterInstall) { try { Start-Process "ms-settings:defaultapps" -ErrorAction SilentlyContinue } catch { } }
+    if ($s.openSettingsAfterInstall) { try { Start-Process "ms-settings:defaultapps" -ErrorAction SilentlyContinue } catch { Write-Warn "Could not open Default Apps settings: $($_.Exception.Message)" } }
 }
 
 # =============================================================================
@@ -1683,6 +1959,25 @@ function Test-TcpPortListening {
         $conns = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop
         return [bool]$conns
     } catch { return $false }
+}
+
+function Wait-TcpPortListening {
+    param(
+        [Parameter(Mandatory)][int]$Port,
+        [int]$TimeoutSeconds = 30
+    )
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+    while ((Get-Date) -lt $deadline) {
+        if (Test-TcpPortListening -Port $Port) {
+            Clear-StatusInPlace
+            return $true
+        }
+        $remaining = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalSeconds)
+        Write-StatusInPlace ("Waiting for TCP {0} to listen... {1}s" -f $Port, $remaining)
+        Start-Sleep -Seconds 1
+    }
+    Clear-StatusInPlace
+    return (Test-TcpPortListening -Port $Port)
 }
 
 function Ensure-RdpFirewallRule {
@@ -1732,14 +2027,33 @@ function Configure-RdpPortAndFirewall {
     Write-Info "Step 3/5: Backup current PortNumber and update registry."
     $rdpPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
     $backup = Resolve-RelativePath "backups\RDP-Tcp-PortNumber.reg"
-    try { reg.exe export "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" "$backup" /y | Out-Null } catch { }
+    $previousPort = $oldPort
+    try {
+        $currentPortValue = (Get-ItemProperty -Path $rdpPath -Name "PortNumber" -ErrorAction Stop).PortNumber
+        if ($currentPortValue) { $previousPort = [int]$currentPortValue }
+    } catch {
+        Write-StructuredLog -Level WARN -Message ("Could not read existing RDP PortNumber before change: {0}" -f $_.Exception.Message)
+    }
+    try { reg.exe export "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" "$backup" /y | Out-Null } catch { Write-StructuredLog -Level WARN -Message ("RDP registry backup export failed: {0}" -f $_.Exception.Message) }
     Set-ItemProperty -Path $rdpPath -Name "PortNumber" -Type DWord -Value $newPort
     Write-Ok "PortNumber registry value set to $newPort."
 
     Write-Info "Step 4/5: Restart TermService to bind the new port."
     if ($s.restartRemoteDesktopService) {
         Write-Warn "Restarting Remote Desktop service -- your current RDP session may briefly disconnect."
-        try { Restart-Service TermService -Force -ErrorAction Stop; Start-Sleep -Seconds 2 } catch { Write-Warn "Service restart had issues: $($_.Exception.Message)" }
+        try {
+            Restart-Service TermService -Force -ErrorAction Stop
+        } catch {
+            Write-Warn "Service restart failed: $($_.Exception.Message)"
+            try {
+                Set-ItemProperty -Path $rdpPath -Name "PortNumber" -Type DWord -Value $previousPort
+                Write-Warn "Rolled RDP PortNumber back to $previousPort because TermService restart failed."
+            } catch {
+                Write-Warn "Could not roll RDP PortNumber back to $previousPort. Old port firewall rules were left unchanged."
+                Set-PendingReboot "RDP service restart failed after port registry update"
+            }
+            return
+        }
     } else {
         Write-Info "Skipping service restart (config). Reboot will apply the change."
         Set-PendingReboot "RDP port change requires service restart"
@@ -1747,8 +2061,7 @@ function Configure-RdpPortAndFirewall {
 
     Write-Info "Step 5/5: Verify the new port is listening."
     if ($s.verifyListening) {
-        Start-Sleep -Seconds 2
-        if (Test-TcpPortListening -Port $newPort) {
+        if (Wait-TcpPortListening -Port $newPort -TimeoutSeconds 30) {
             Write-Ok "Confirmed: TCP $newPort is listening."
             if ($s.blockOldPort -and $oldPort -ne $newPort) {
                 $blockName = "WinServerSetup Block Old RDP TCP $oldPort"
@@ -1761,6 +2074,7 @@ function Configure-RdpPortAndFirewall {
             }
         } else {
             Write-Warn "Could not confirm new port is listening yet. Old port will NOT be blocked to avoid lockout."
+            Set-PendingReboot "RDP port change not confirmed listening yet"
         }
     }
 }
@@ -1860,18 +2174,39 @@ function Install-DotNetFramework4Plus {
     if ($rv -ge 533320) { Write-Ok ".NET Framework 4.8.1+ already installed (release $rv)."; return }
     $url = [string]$Global:Config.runtimes.dotNetFramework481OfflineUrl
     if ([string]::IsNullOrWhiteSpace($url)) { $url = "https://go.microsoft.com/fwlink/?linkid=2203305" }
-    $download = Get-DownloadCachePath
-    $msi = Join-Path $download "NDP481-x86-x64-AllOS-ENU.exe"
+    $msi = Get-SafeDownloadCacheFilePath -FileName "NDP481-x86-x64-AllOS-ENU.exe"
     if (-not (Invoke-DownloadFile -Url $url -Destination $msi)) { return }
     Write-Info "Installing .NET Framework 4.8.1 (passive, no restart)..."
     try {
         $proc = Start-Process -FilePath $msi -ArgumentList "/passive /norestart" -Wait -PassThru -WindowStyle Hidden
         Write-StructuredLog -Level COMMAND -Message (".NET Framework 4.8.1 installer exit code: {0}" -f $proc.ExitCode)
-        if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
-            Write-Ok ".NET Framework 4.8.1 install command finished."
-            Set-PendingReboot ".NET Framework 4.8.1 may require reboot"
-        } else {
-            Write-Warn ".NET Framework 4.8.1 installer exited with code $($proc.ExitCode)."
+        switch ([int]$proc.ExitCode) {
+            0 {
+                Write-Ok ".NET Framework 4.8.1 install command finished."
+            }
+            3010 {
+                Write-Ok ".NET Framework 4.8.1 install command finished; reboot required."
+                Set-PendingReboot ".NET Framework 4.8.1 installer requested reboot"
+            }
+            1641 {
+                Write-Ok ".NET Framework 4.8.1 installer reported success with reboot required."
+                Set-PendingReboot ".NET Framework 4.8.1 installer requested reboot"
+            }
+            1638 {
+                Write-Ok ".NET Framework 4.8.1 or a newer equivalent is already installed."
+            }
+            1602 {
+                Write-Warn ".NET Framework 4.8.1 install was cancelled by the user or installer UI."
+                $null = $Global:RunStats.FailedApps.Add(".NET Framework 4.8.1")
+            }
+            1603 {
+                Write-Warn ".NET Framework 4.8.1 install failed with fatal MSI error 1603."
+                $null = $Global:RunStats.FailedApps.Add(".NET Framework 4.8.1")
+            }
+            default {
+                Write-Warn ".NET Framework 4.8.1 installer exited with code $($proc.ExitCode)."
+                $null = $Global:RunStats.FailedApps.Add(".NET Framework 4.8.1")
+            }
         }
     } catch { Write-Warn ".NET 4.8.1 install failed: $($_.Exception.Message)" }
 }
@@ -1879,8 +2214,7 @@ function Install-DotNetFramework4Plus {
 function Install-WingetRuntimePackage {
     param([Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][string]$Id)
     try {
-        $listOutput = winget list --id $Id --exact --accept-source-agreements --source winget 2>$null
-        if ($LASTEXITCODE -eq 0 -and ($listOutput -join "`n") -match [regex]::Escape($Id)) {
+        if (Test-WingetPackageInstalled -Id $Id) {
             Write-Ok "$Name already installed."
             return
         }
@@ -2076,20 +2410,47 @@ function Configure-WindowsUpdateBandwidthPolicies {
     Set-ItemProperty -Path $do -Name "DODownloadMode" -Type DWord -Value ([int]$s.deliveryOptimizationDownloadMode)
 
     if ($s.disableUpdateBandwidthLimits) {
+        $doLimitValues = @(
+            "DOPercentageMaxBackgroundBandwidth",
+            "DOPercentageMaxForegroundBandwidth"
+        )
+        $osBuild = [Environment]::OSVersion.Version.Build
+        if ($osBuild -ge 17134) {
+            $doLimitValues += @(
+                "DOAbsoluteMaxDownloadBandwidth",
+                "DOAbsoluteMaxDownloadBandwidthForeground"
+            )
+        } else {
+            Write-Info "Skipping absolute Delivery Optimization bandwidth keys on Windows builds older than 1803."
+        }
+        foreach ($valueName in $doLimitValues) {
+            Set-ItemProperty -Path $do -Name $valueName -Type DWord -Value 0
+        }
+
+        # Remove old no-op values written by earlier project builds under the
+        # WindowsUpdate policy key. Delivery Optimization owns these limits.
         $wu = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
-        if (-not (Test-Path $wu)) { New-Item -Path $wu -Force | Out-Null }
-        Set-ItemProperty -Path $wu -Name "SetDownloadThrottle" -Type DWord -Value 0
-        Set-ItemProperty -Path $wu -Name "SetBusinessHoursDownloadThrottle" -Type DWord -Value 0
-        Set-ItemProperty -Path $wu -Name "SetDownloadThrottlePercentage" -Type DWord -Value 0
-        Set-ItemProperty -Path $wu -Name "SetBusinessHoursDownloadThrottlePercentage" -Type DWord -Value 0
+        if (Test-Path $wu) {
+            foreach ($legacyName in @(
+                "SetDownloadThrottle",
+                "SetBusinessHoursDownloadThrottle",
+                "SetDownloadThrottlePercentage",
+                "SetBusinessHoursDownloadThrottlePercentage"
+            )) {
+                Remove-ItemProperty -Path $wu -Name $legacyName -ErrorAction SilentlyContinue
+            }
+        }
     }
 
     if ($s.runGpupdate) {
         try {
-            $gp = Invoke-LoggedCommand -FilePath "gpupdate.exe" -Arguments @("/target:computer", "/force") -DisplayName "gpupdate"
+            Write-Info "Refreshing computer policy with gpupdate..."
+            $gp = Invoke-LoggedProcessWithProgress -FilePath "gpupdate.exe" -Arguments @("/target:computer", "/force") -DisplayName "gpupdate" -StatusMessage "Refreshing computer policy"
             if ($gp.ExitCode -eq 0) { Write-Ok "Computer policy refreshed." }
             else { Write-Warn "gpupdate exited with code $($gp.ExitCode)." }
-        } catch { }
+        } catch {
+            Write-Warn "gpupdate failed: $($_.Exception.Message)"
+        }
     }
 
     $applied = (Get-ItemProperty -Path $qos -Name NonBestEffortLimit -ErrorAction SilentlyContinue).NonBestEffortLimit
@@ -2102,7 +2463,7 @@ function Configure-WindowsUpdateBandwidthPolicies {
 # =============================================================================
 function Disable-StartupEntry {
     param([Parameter(Mandatory)][string]$Pattern)
-    $found = $false
+    $removedEntries = New-Object System.Collections.Generic.List[string]
     $runKeys = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
@@ -2120,7 +2481,7 @@ function Disable-StartupEntry {
                 if ([string]$prop.Value -match [regex]::Escape($Pattern) -or $prop.Name -match [regex]::Escape($Pattern)) {
                     Remove-ItemProperty -Path $k -Name $prop.Name -ErrorAction SilentlyContinue
                     Write-Ok "Removed startup entry: $k :: $($prop.Name)"
-                    $found = $true
+                    $removedEntries.Add("$k :: $($prop.Name)") | Out-Null
                 }
             }
         } catch { }
@@ -2138,12 +2499,12 @@ function Disable-StartupEntry {
             if ($_.Name -match [regex]::Escape($Pattern) -or $target -match [regex]::Escape($Pattern)) {
                 Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
                 Write-Ok "Removed startup shortcut: $($_.FullName)"
-                $found = $true
+                $removedEntries.Add($_.FullName) | Out-Null
             }
         }
     }
-    if (-not $found) { Write-Info "Startup entry not found (already disabled?): $Pattern" }
-    return $found
+    if ($removedEntries.Count -eq 0) { Write-Info "Startup entry not found (already disabled?): $Pattern" }
+    return ($removedEntries.Count -gt 0)
 }
 
 function Disable-ConfiguredStartupApps {
@@ -2212,7 +2573,7 @@ function Add-FolderToQuickAccess {
         if (-not $ns) { Write-Warn "Shell cannot access folder: $Path"; return $false }
         $ns.Self.InvokeVerb("pintohome")
         Start-Sleep -Milliseconds 250
-        Write-Ok "Pinned to Quick Access (or already pinned): $Path"
+        Write-Ok "Requested Quick Access pin (or already pinned): $Path"
         return $true
     } catch {
         Write-Warn "Quick Access pin failed for $Path : $($_.Exception.Message)"
@@ -2230,7 +2591,7 @@ function Add-RecycleBinToQuickAccess {
         }
         $bin.Self.InvokeVerb("pintohome")
         Start-Sleep -Milliseconds 250
-        Write-Ok "Pinned Recycle Bin to Quick Access (or already pinned)."
+        Write-Ok "Requested Recycle Bin Quick Access pin (or already pinned)."
         return $true
     } catch {
         Write-Warn "Quick Access pin failed for Recycle Bin: $($_.Exception.Message)"
@@ -2253,8 +2614,47 @@ function Add-ConfiguredQuickAccessPins {
 # =============================================================================
 # SECTION 19: EDGE UNPIN / BRAVE PIN  (item 18, best-effort)
 # =============================================================================
+function Test-TaskbarPinnedPath {
+    param([Parameter(Mandatory)][string]$Path)
+    $pinDir = Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+    if (-not (Test-Path $pinDir)) { return $null }
+
+    $targetFull = [System.IO.Path]::GetFullPath($Path)
+    $wsh = $null
+    try {
+        $wsh = New-Object -ComObject WScript.Shell
+        foreach ($link in Get-ChildItem -LiteralPath $pinDir -Filter '*.lnk' -ErrorAction SilentlyContinue) {
+            $shortcut = $null
+            try {
+                $shortcut = $wsh.CreateShortcut($link.FullName)
+                if (-not [string]::IsNullOrWhiteSpace($shortcut.TargetPath)) {
+                    $shortcutTarget = [System.IO.Path]::GetFullPath($shortcut.TargetPath)
+                    if ([string]::Equals($shortcutTarget, $targetFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        return $true
+                    }
+                }
+            } catch {
+                Write-StructuredLog -Level TASKBAR -Message ("Could not inspect taskbar shortcut {0}: {1}" -f $link.FullName, $_.Exception.Message)
+            } finally {
+                if ($shortcut) { try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shortcut) } catch { } }
+            }
+        }
+        return $false
+    } catch {
+        Write-StructuredLog -Level TASKBAR -Message ("Could not inspect taskbar pinned folder: {0}" -f $_.Exception.Message)
+        return $null
+    } finally {
+        if ($wsh) { try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wsh) } catch { } }
+    }
+}
+
 function Invoke-ShellPinUnpin {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$VerbName)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string[]]$VerbNames,
+        [string]$CanonicalVerb = "",
+        [object]$ShouldBePinned = $null
+    )
     if (-not (Test-Path $Path)) { return $false }
     try {
         $shell = New-Object -ComObject Shell.Application
@@ -2262,10 +2662,44 @@ function Invoke-ShellPinUnpin {
         if (-not $folder) { return $false }
         $item = $folder.ParseName((Split-Path -Leaf $Path))
         if (-not $item) { return $false }
-        $verb = $item.Verbs() | Where-Object { $_.Name -replace '&','' -ieq $VerbName -or $_.Name -ilike "*$VerbName*" } | Select-Object -First 1
+
+        if (-not [string]::IsNullOrWhiteSpace($CanonicalVerb)) {
+            try {
+                $item.InvokeVerb($CanonicalVerb)
+                Start-Sleep -Milliseconds 600
+                $state = Test-TaskbarPinnedPath -Path $Path
+                if ($null -ne $state -and $state -eq [bool]$ShouldBePinned) { return $true }
+                if ($null -eq $state) {
+                    Write-StructuredLog -Level TASKBAR -Message ("Canonical taskbar verb {0} finished but pin state is indeterminate for {1}; trying fallback verb matching." -f $CanonicalVerb, $Path)
+                } else {
+                    Write-StructuredLog -Level TASKBAR -Message ("Canonical taskbar verb {0} did not reach expected state for {1}." -f $CanonicalVerb, $Path)
+                }
+            } catch {
+                Write-StructuredLog -Level TASKBAR -Message ("Canonical taskbar verb {0} failed for {1}: {2}" -f $CanonicalVerb, $Path, $_.Exception.Message)
+            }
+        }
+
+        $candidates = @($VerbNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_ -replace '&','' })
+        $verb = $item.Verbs() | Where-Object {
+            $name = $_.Name -replace '&',''
+            $matched = $false
+            foreach ($candidate in $candidates) {
+                if ($name -ieq $candidate -or $name -ilike "*$candidate*") {
+                    $matched = $true
+                    break
+                }
+            }
+            $matched
+        } | Select-Object -First 1
         if (-not $verb) { return $false }
         $verb.DoIt()
         Start-Sleep -Milliseconds 400
+        if ($null -ne $ShouldBePinned) {
+            $state = Test-TaskbarPinnedPath -Path $Path
+            if ($null -ne $state) { return ($state -eq [bool]$ShouldBePinned) }
+            Write-StructuredLog -Level TASKBAR -Message ("Taskbar pin state is indeterminate after fallback verb for {0}." -f $Path)
+            return $false
+        }
         return $true
     } catch { return $false }
 }
@@ -2277,7 +2711,7 @@ function Replace-EdgeTaskbarPinWithBrave {
         $edge = "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe"
         if (-not (Test-Path $edge)) { $edge = "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe" }
         if (Test-Path $edge) {
-            if (Invoke-ShellPinUnpin -Path $edge -VerbName "Unpin from taskbar") {
+            if (Invoke-ShellPinUnpin -Path $edge -VerbNames @("Unpin from taskbar") -CanonicalVerb "taskbarunpin" -ShouldBePinned $false) {
                 Write-Ok "Unpinned Edge from taskbar."
             } else {
                 Write-Warn "Could not unpin Edge automatically. Windows 11 often blocks programmatic taskbar pin changes; unpin Edge manually if it remains."
@@ -2288,7 +2722,7 @@ function Replace-EdgeTaskbarPinWithBrave {
         $brave = "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe"
         if (-not (Test-Path $brave)) { $brave = "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe" }
         if (Test-Path $brave) {
-            if (Invoke-ShellPinUnpin -Path $brave -VerbName "Pin to taskbar") {
+            if (Invoke-ShellPinUnpin -Path $brave -VerbNames @("Pin to taskbar") -CanonicalVerb "taskbarpin" -ShouldBePinned $true) {
                 Write-Ok "Pinned Brave to taskbar."
             } else {
                 Write-Warn "Could not pin Brave automatically. Drag brave.exe to taskbar manually as a fallback."
@@ -2302,14 +2736,14 @@ function Replace-EdgeTaskbarPinWithBrave {
 # =============================================================================
 function Initialize-WindowsUpdateEnvironment {
     if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-        try { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Confirm:$false | Out-Null } catch { }
+        try { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Confirm:$false | Out-Null } catch { Write-Warn "Install-PackageProvider NuGet failed: $($_.Exception.Message)" }
     }
-    try { Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted -ErrorAction SilentlyContinue } catch { }
+    try { Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted -ErrorAction SilentlyContinue } catch { Write-StructuredLog -Level WARN -Message ("Could not set PSGallery trusted: {0}" -f $_.Exception.Message) }
     if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
         try { Install-Module -Name PSWindowsUpdate -Force -AllowClobber -Confirm:$false | Out-Null } catch { Write-Warn "Install PSWindowsUpdate failed: $($_.Exception.Message)" }
     }
     Import-Module PSWindowsUpdate -Force -ErrorAction SilentlyContinue
-    try { Add-WUServiceManager -MicrosoftUpdate -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+    try { Add-WUServiceManager -MicrosoftUpdate -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { Write-StructuredLog -Level WARN -Message ("Could not add Microsoft Update service manager: {0}" -f $_.Exception.Message) }
 }
 
 function Invoke-WindowsUpdatePass {
@@ -2387,7 +2821,7 @@ function Invoke-SystemUpdate {
     if (-not $Global:Config.windowsUpdate.enabled) { Write-Info "Windows Update section disabled in config."; return }
     if (-not $Global:Config.windowsUpdate.usePSWindowsUpdateModule) {
         Write-Info "Opening Settings -> Windows Update (PSWindowsUpdate disabled)."
-        try { Start-Process "ms-settings:windowsupdate" } catch { }
+        try { Start-Process "ms-settings:windowsupdate" } catch { Write-Warn "Could not open Windows Update settings: $($_.Exception.Message)" }
         return
     }
     Initialize-WindowsUpdateEnvironment
@@ -2469,10 +2903,35 @@ function Remove-DirectoryContentsSafe {
     Write-Info "Cleaning: $Path"
     try {
         Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | ForEach-Object {
-            try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop } catch { }
+            try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop } catch { Write-StructuredLog -Level CLEANUP -Message ("Could not remove {0}: {1}" -f $_.FullName, $_.Exception.Message) }
         }
         Write-Ok "Cleaned: $Path"
     } catch { Write-Warn "Could not clean $Path : $($_.Exception.Message)" }
+}
+
+function Remove-WinServerSetupTempArtifacts {
+    $roots = @($env:TEMP, $env:TMP) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+    $patterns = @(
+        "WinServerSetup-downloads",
+        "WinServerSetup-*.log",
+        "WinServerSetup-clean-source-*.ps1",
+        "WinServerSetup-v2rayN.log",
+        "WinServerSetup-*.partial"
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        foreach ($pattern in $patterns) {
+            Get-ChildItem -LiteralPath $root -Force -Filter $pattern -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+                    Write-StructuredLog -Level CLEANUP -Message ("Removed project temp artifact: {0}" -f $_.FullName)
+                } catch {
+                    Write-StructuredLog -Level CLEANUP -Message ("Could not remove project temp artifact {0}: {1}" -f $_.FullName, $_.Exception.Message)
+                }
+            }
+        }
+    }
+    Write-Ok "Scoped user temp cleanup completed for WinServerSetup artifacts only."
 }
 
 function Clear-WinServerSetupTempAndCache {
@@ -2480,7 +2939,7 @@ function Clear-WinServerSetupTempAndCache {
     if (-not $s -or -not $s.enabled) { return }
     Write-Section "Cleaning temp and cache files"
     if ($s.cleanProjectDownloadCache) { Remove-DirectoryContentsSafe -Path (Get-DownloadCachePath) }
-    if ($s.cleanUserTemp)             { Remove-DirectoryContentsSafe -Path $env:TEMP; Remove-DirectoryContentsSafe -Path $env:TMP }
+    if ($s.cleanUserTemp)             { Remove-WinServerSetupTempArtifacts }
     if ($s.cleanWindowsTemp)          { Remove-DirectoryContentsSafe -Path (Join-Path $env:WINDIR "Temp") }
     if ($s.cleanWindowsUpdateDownloadCache) {
         try {
@@ -2506,7 +2965,7 @@ function Invoke-HealthCheck {
         @{ Name = "Downloads\compressed";                    Test = { Test-Path (Join-Path (Get-CurrentUserDownloadsFolder) ([string]$Global:Config.customFolders.compressedFolderName)) } },
         @{ Name = "Defender exclusion for compressed";       Test = { Test-DefenderExclusionPath -Path (Join-Path (Get-CurrentUserDownloadsFolder) ([string]$Global:Config.customFolders.compressedFolderName)) } },
         @{ Name = "PowerShell 7";                            Test = { Test-CommandExists "pwsh" } },
-        @{ Name = "Windows Terminal";                        Test = { (Get-Command wt -ErrorAction SilentlyContinue) -ne $null } },
+        @{ Name = "Windows Terminal";                        Test = { $null -ne (Get-Command wt -ErrorAction SilentlyContinue) } },
         @{ Name = "Brave";                                   Test = { Test-Path "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe" } },
         @{ Name = "Python";                                  Test = { Test-CommandExists "python" } },
         @{ Name = "FFmpeg";                                  Test = { Test-CommandExists "ffmpeg" } },
@@ -2601,54 +3060,60 @@ function Invoke-FullSetup {
     Write-Section "Running Full WinServerSetup"
 
     # Quick wins / settings that don't need network. Apply early.
-    Set-WindowsDarkMode
-    Enable-FileExtensions
-    Add-PersianKeyboardLayout
-    Configure-CustomFoldersAndDefenderExclusions
+    Invoke-RecordedSetupStep -Name "Apply dark mode" -Action { Set-WindowsDarkMode }
+    Invoke-RecordedSetupStep -Name "Show file extensions" -Action { Enable-FileExtensions }
+    Invoke-RecordedSetupStep -Name "Add Persian keyboard layout" -Action { Add-PersianKeyboardLayout }
+    Invoke-RecordedSetupStep -Name "Create custom folders and Defender exclusions" -Action { Configure-CustomFoldersAndDefenderExclusions }
 
-    # Now run Windows Update in the foreground (heavy, ordered) while safe,
-    # self-contained registry updates run in background jobs.
+    # Now run Windows Update in the foreground (heavy, ordered) while safe app
+    # downloads run in a separate helper. Registry/configuration steps stay in
+    # their normal config-aware functions to avoid duplicated writes.
     $parallelEnabled = $Global:Config.parallel -and $Global:Config.parallel.enabled
     $maxPar          = if ($parallelEnabled) { [int]$Global:Config.parallel.maxParallel } else { 1 }
     if ($maxPar -lt 1) { $maxPar = 1 }
 
-    $sideTasks = @(
-        @{ Name = "QoS reservable bandwidth = 0";    Action = { reg add 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Psched' /v NonBestEffortLimit /t REG_DWORD /d 0 /f | Out-Null } },
-        @{ Name = "Show file extensions registry";   Action = { reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v HideFileExt /t REG_DWORD /d 0 /f | Out-Null } }
-    )
-
-    $sideJobs = @()
-    if ($parallelEnabled) { $sideJobs = Start-ParallelTasks -Tasks $sideTasks -MaxParallel $maxPar }
     $appPrefetch = $null
-    if ($parallelEnabled) { $appPrefetch = Start-ApplicationDownloadPrefetch -MaxParallel $maxPar }
-    Invoke-SystemUpdate
-    if ($parallelEnabled) { Wait-ParallelTasks -StartedTasks $sideJobs }
-    if ($parallelEnabled) { Wait-ApplicationDownloadPrefetch -Prefetch $appPrefetch }
+    if ($parallelEnabled) {
+        $appPrefetch = Invoke-RecordedSetupStep -Name "Start app download prefetch" -Action { Start-ApplicationDownloadPrefetch -MaxParallel $maxPar } -PassThru
+    }
+    Invoke-RecordedSetupStep -Name "Run Windows Update" -Action { Invoke-SystemUpdate }
+    if ($parallelEnabled) {
+        Invoke-RecordedSetupStep -Name "Wait for app download prefetch" -Action { Wait-ApplicationDownloadPrefetch -Prefetch $appPrefetch }
+    }
 
     # The rest is sequential because of resource contention and ordering.
-    Invoke-ActivationIfConfigured
-    Configure-WindowsUpdateBandwidthPolicies
-    Install-Applications
-    Configure-DefaultApps
-    Set-SevenZipAsDefault
-    Configure-RdpPortAndFirewall
-    Enable-SearchIndexing
-    Install-Runtimes
-    Install-EmptyStandbyList
-    Install-RdpBruteforceBlocker
-    Disable-ConfiguredStartupApps
-    Remove-ConfiguredAppxPackages
-    Remove-ConfiguredWindowsCapabilities
-    Replace-EdgeTaskbarPinWithBrave
-    Add-ConfiguredQuickAccessPins
-    Invoke-HealthCheck
-    Clear-WinServerSetupTempAndCache
+    Invoke-RecordedSetupStep -Name "Activation from config" -Action { Invoke-ActivationIfConfigured }
+    Invoke-RecordedSetupStep -Name "Configure Windows Update bandwidth and QoS" -Action { Configure-WindowsUpdateBandwidthPolicies }
+    Invoke-RecordedSetupStep -Name "Install applications" -Action { Install-Applications }
+    Invoke-RecordedSetupStep -Name "Configure default apps" -Action { Configure-DefaultApps }
+    Invoke-RecordedSetupStep -Name "Set 7-Zip archive associations" -Action { Set-SevenZipAsDefault }
+    Invoke-RecordedSetupStep -Name "Configure RDP port and firewall" -Action { Configure-RdpPortAndFirewall }
+    Invoke-RecordedSetupStep -Name "Enable Search Indexing" -Action { Enable-SearchIndexing }
+    Invoke-RecordedSetupStep -Name "Install runtimes" -Action { Install-Runtimes }
+    Invoke-RecordedSetupStep -Name "Install EmptyStandbyList task" -Action { Install-EmptyStandbyList }
+    Invoke-RecordedSetupStep -Name "Install RDP brute-force blocker" -Action { Install-RdpBruteforceBlocker }
+    Invoke-RecordedSetupStep -Name "Disable configured startup apps" -Action { Disable-ConfiguredStartupApps }
+    Invoke-RecordedSetupStep -Name "Remove configured Appx packages" -Action { Remove-ConfiguredAppxPackages }
+    Invoke-RecordedSetupStep -Name "Remove configured Windows capabilities" -Action { Remove-ConfiguredWindowsCapabilities }
+    Invoke-RecordedSetupStep -Name "Replace Edge taskbar pin with Brave" -Action { Replace-EdgeTaskbarPinWithBrave }
+    Invoke-RecordedSetupStep -Name "Add Quick Access pins" -Action { Add-ConfiguredQuickAccessPins }
+    Invoke-RecordedSetupStep -Name "Run health check" -Action { Invoke-HealthCheck }
+    Invoke-RecordedSetupStep -Name "Clean temp and cache" -Action { Clear-WinServerSetupTempAndCache }
 
     Show-FinalSummary
 
     Write-Ok "Full setup completed."
 
     Restart-AfterSetup
+}
+
+function Invoke-FullSetupWithActiveTimer {
+    Start-ActiveTimer
+    try {
+        Invoke-FullSetup
+    } finally {
+        Stop-ActiveTimer
+    }
 }
 
 # =============================================================================
@@ -2693,7 +3158,7 @@ function Show-MainMenu {
         $choice = Read-HostUntimed "Select"
         try {
             switch ($choice) {
-                "1"  { Invoke-Timed -Name "Full setup"                              -Action { Invoke-FullSetup };                              Pause-IfNeeded }
+                "1"  { Invoke-FullSetupWithActiveTimer;                                                                          Pause-IfNeeded }
                 "2"  { Invoke-Timed -Name "Windows Update (multi-pass)"             -Action { Invoke-SystemUpdate };                           Pause-IfNeeded }
                 "3"  { Invoke-Timed -Name "Activation from config"                  -Action { Invoke-ActivationIfConfigured };                 Pause-IfNeeded }
                 "4"  { Invoke-Timed -Name "Apply dark mode"                         -Action { Set-WindowsDarkMode };                           Pause-IfNeeded }
@@ -2746,7 +3211,7 @@ try {
     Initialize-Environment
 
     if ($Global:Full) {
-        Invoke-Timed -Name "Full setup" -Action { Invoke-FullSetup }
+        Invoke-FullSetupWithActiveTimer
     } else {
         Show-MainMenu
     }

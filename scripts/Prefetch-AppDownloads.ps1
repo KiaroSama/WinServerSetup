@@ -15,8 +15,10 @@ $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor `
     [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11
 
+$script:ProjectRootOverride = $ProjectRoot
+
 function Resolve-ProjectRoot {
-    if (-not [string]::IsNullOrWhiteSpace($ProjectRoot) -and (Test-Path $ProjectRoot)) { return (Resolve-Path -LiteralPath $ProjectRoot).Path }
+    if (-not [string]::IsNullOrWhiteSpace($script:ProjectRootOverride) -and (Test-Path $script:ProjectRootOverride)) { return (Resolve-Path -LiteralPath $script:ProjectRootOverride).Path }
     if ($PSScriptRoot) { return (Split-Path -Parent $PSScriptRoot) }
     return (Get-Location).Path
 }
@@ -45,6 +47,21 @@ function Resolve-DownloadCachePath {
     return $cfgValue
 }
 
+function Join-SafeDownloadPath {
+    param(
+        [Parameter(Mandatory)][string]$DownloadRoot,
+        [Parameter(Mandatory)][string]$FileName
+    )
+    $leaf = Split-Path -Leaf $FileName
+    if ([string]::IsNullOrWhiteSpace($leaf)) { throw "Download file name is empty." }
+    $root = [System.IO.Path]::GetFullPath($DownloadRoot).TrimEnd('\')
+    $candidate = [System.IO.Path]::GetFullPath((Join-Path $root $leaf))
+    if (-not $candidate.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Resolved download path is outside the download root: $candidate"
+    }
+    return $candidate
+}
+
 function Add-Task {
     param(
         [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Tasks,
@@ -57,8 +74,8 @@ function Resolve-EverythingDownload {
     param([string]$Url)
     try {
         $page = Invoke-WebRequest -Uri $Url -UseBasicParsing -ErrorAction Stop
-        $matches = [regex]::Matches([string]$page.Content, 'Everything-(\d+\.\d+\.\d+\.\d+)\.x64-Setup\.exe')
-        $latest = $matches | ForEach-Object {
+        $regexMatches = [regex]::Matches([string]$page.Content, 'Everything-(\d+\.\d+\.\d+\.\d+)\.x64-Setup\.exe')
+        $latest = $regexMatches | ForEach-Object {
             [pscustomobject]@{ Version = [version]$_.Groups[1].Value; File = $_.Value }
         } | Sort-Object Version -Descending | Select-Object -First 1
         if ($latest) {
@@ -67,7 +84,9 @@ function Resolve-EverythingDownload {
                 FileName = $latest.File
             }
         }
-    } catch { }
+    } catch {
+        Write-PrefetchLog "Could not resolve Everything latest installer: $($_.Exception.Message)" "WARN"
+    }
     return [pscustomobject]@{
         Url = "https://www.voidtools.com/Everything-1.4.1.1032.x64-Setup.exe"
         FileName = "Everything-1.4.1.1032.x64-Setup.exe"
@@ -96,7 +115,7 @@ function New-PrefetchTasks {
             Kind = "Url"
             Name = $name
             Url = $url
-            Destination = (Join-Path $DownloadRoot $fileName)
+            Destination = (Join-SafeDownloadPath -DownloadRoot $DownloadRoot -FileName $fileName)
         }
     }
 
@@ -152,13 +171,14 @@ function Invoke-TaskJob {
         param($Task, $LogPath)
         $ErrorActionPreference = "Stop"
         $ProgressPreference = "SilentlyContinue"
+        $script:WorkerLogPath = $LogPath
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor `
             [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11
 
         function Log {
             param([string]$Message, [string]$Level = "INFO")
             $line = "[{0}] [{1}] [{2}] {3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, [string]$Task.Name, $Message
-            Add-Content -LiteralPath $LogPath -Value $line -Encoding utf8
+            Add-Content -LiteralPath $script:WorkerLogPath -Value $line -Encoding utf8
         }
 
         function EnsureDir {
@@ -170,14 +190,20 @@ function Invoke-TaskJob {
             param([string]$Url, [string]$Destination)
             $dir = Split-Path -Parent $Destination
             EnsureDir $dir
-            if ((Test-Path $Destination) -and ((Get-Item -LiteralPath $Destination).Length -gt 0)) {
+            if ((Test-Path $Destination) -and ((Get-Item -LiteralPath $Destination).Length -ge 1024)) {
                 Log "Already cached: $Destination" "OK"
                 return
+            }
+            if (Test-Path $Destination) {
+                Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
             }
             $tmp = "$Destination.partial"
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
             Log "Downloading $Url -> $Destination"
             Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -ErrorAction Stop
+            if ((Get-Item -LiteralPath $tmp).Length -lt 1024) {
+                throw "Downloaded file is unexpectedly small."
+            }
             Move-Item -LiteralPath $tmp -Destination $Destination -Force
             Log "Downloaded: $Destination" "OK"
         }
@@ -196,7 +222,7 @@ function Invoke-TaskJob {
                     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing -Headers @{ 'User-Agent' = 'WinServerSetup' }
                     $asset = $release.assets | Where-Object { $_.name -match $regex } | Select-Object -First 1
                     if (-not $asset) { throw "No release asset matched regex: $regex" }
-                    $destination = Join-Path $downloadRoot $asset.name
+                    $destination = Join-Path $downloadRoot (Split-Path -Leaf ([string]$asset.name))
                     DownloadUrl -Url ([string]$asset.browser_download_url) -Destination $destination
                 }
                 "WingetDownload" {
@@ -208,9 +234,9 @@ function Invoke-TaskJob {
                     }
                     $downloadRoot = [string]$Task.DownloadRoot
                     EnsureDir $downloadRoot
-                    $args = @("download", "--id", $id, "--exact", "--source", "winget", "--download-directory", $downloadRoot, "--accept-package-agreements", "--accept-source-agreements")
-                    Log ("Running: winget {0}" -f ($args -join ' '))
-                    $output = @(& winget @args 2>&1)
+                    $wingetDownloadArgs = @("download", "--id", $id, "--exact", "--source", "winget", "--download-directory", $downloadRoot, "--accept-package-agreements", "--accept-source-agreements")
+                    Log ("Running: winget {0}" -f ($wingetDownloadArgs -join ' '))
+                    $output = @(& winget @wingetDownloadArgs 2>&1)
                     foreach ($line in $output) {
                         $text = [string]$line
                         if (-not [string]::IsNullOrWhiteSpace($text)) { Log ("winget> {0}" -f $text.TrimEnd()) }
@@ -274,7 +300,7 @@ while ($pending.Count -gt 0 -or $jobs.Count -gt 0) {
     foreach ($job in @($finished)) {
         $meta = $jobs[$job.Id]
         $elapsed = (Get-Date) - $meta.Started
-        try { Receive-Job -Job $job -ErrorAction SilentlyContinue | Out-Null } catch { }
+        try { Receive-Job -Job $job -ErrorAction SilentlyContinue | Out-Null } catch { Write-PrefetchLog "Receive-Job failed for $($meta.Name): $($_.Exception.Message)" "WARN" }
         if ($job.State -eq "Completed") {
             Write-PrefetchLog ("Completed: {0} [{1:N1}s]" -f $meta.Name, $elapsed.TotalSeconds) "OK"
         } else {

@@ -1,27 +1,51 @@
-# WinServerSetup v1.0.0
+# WinServerSetup v1.1.0
 
-Initial public release of WinServerSetup, an administrator-only PowerShell provisioning project for Windows Server, Windows 10, and Windows 11.
+**Suggested tag:** `v1.1.0`
 
 ## Summary
 
-This release provides a configurable setup workflow for fresh Windows machines. It updates Windows, applies system settings, installs configured applications and runtimes, configures RDP safely, creates scheduled tasks, writes UTF-8 logs, defers reboot until setup is complete, and schedules a post-reboot `sfc /scannow`.
+WinServerSetup v1.1.0 is a reliability, safety, and release-documentation update for the Windows Server setup automation project. It focuses on preventing data loss, reducing RDP lockout risk, improving download validation, making cleanup safer, and improving release readiness.
 
-## Features
+## Added
 
-- First-run self-relocation to `C:\portable\Scripts\WinServerSetup`.
-- Interactive menu and full setup mode.
-- Multi-pass Windows Update with reboot suppression.
-- Background application download prefetch while Windows Update runs.
-- Sequential application installation so only one installer runs at a time.
-- Dark mode, Explorer file extensions, Persian keyboard layout, and Search Indexing configuration.
-- Safe RDP port change to TCP `5801` with firewall verification.
-- Hidden, highest-privilege scheduled tasks for EmptyStandbyList, RDP brute-force blocking, and post-reboot SFC.
-- Winget source repair for the known `msstore` certificate issue.
-- Direct installer support for 9Proxy, Dolphin Anty, GoLogin, Everything, v2rayN, and PowerShell 7.
-- PowerShell 7 Windows Terminal default profile and `.ps1` handler setup.
-- 7-Zip archive associations for the current user.
-- Quick Access and taskbar best-effort customization.
-- Structured UTF-8 logs and concise colored console output.
+- App download prefetch support while Windows Update is running.
+- Optional `expectedSha256` validation for direct installer entries.
+- Optional `requireValidSignature` validation for direct installer entries.
+- Per-step full setup task recording so the final summary reflects real workflow progress.
+- Winget source reset fallback when source listing, removal, or update fails.
+- Changelog file for versioned release tracking.
+
+## Changed
+
+- Default parallel download limit is now `4`.
+- v2rayN refresh now copies new files without purging user configuration files.
+- User temp cleanup is now scoped to WinServerSetup-owned artifacts instead of wiping the whole `%TEMP%` folder.
+- RDP brute-force blocking now counts only RemoteInteractive logon failures.
+- RDP brute-force threshold is now `7`, preserving the intended "more than 6 failed attempts" behavior.
+- Windows Terminal settings updates now handle legacy `profiles` array files.
+- Default app import messaging now clarifies that DISM imports apply to new user profiles.
+- GitHub release notes now target the next versioned release instead of the initial release.
+
+## Fixed
+
+- Fixed RDP port-change rollback when Remote Desktop Services cannot restart after the registry update.
+- Fixed RDP listener verification by waiting for the new port before blocking the old port.
+- Fixed post-reboot SFC output capture and logging.
+- Fixed winget package detection to prefer JSON output and avoid table truncation where possible.
+- Fixed `.ps1` PowerShell 7 file association metadata by adding a friendly name, icon, and edit flags.
+- Fixed relocation cleanup script leakage from `%TEMP%`.
+- Fixed scheduled task hidden/highest-privilege behavior for project-created scheduled tasks.
+- Fixed `Publish-ToGitHub.ps1` remote validation so accidental non-GitHub pushes are blocked unless forced.
+- Fixed `Run-WinServerSetup.ps1` elevated process exit-code propagation.
+- Fixed EmptyStandbyList task template start boundary for manual imports.
+
+## Removed
+
+- No user-facing features were removed.
+
+## Breaking Changes
+
+- No breaking changes are expected.
 
 ## Requirements
 
@@ -39,51 +63,20 @@ WinServerSetup performs real system changes. Review `WinServerSetup.config.json`
 - It can change the RDP port and Windows Firewall rules.
 - It can create hidden scheduled tasks running as `SYSTEM`.
 - It can remove configured Appx packages and Windows capabilities.
-- It can clean temporary folders.
+- It can clean configured cache/temp locations.
 - It can restart Windows after setup completes.
 - It includes an optional Windows activation helper. Use it only when you have the legal right to activate the target Windows installation.
 
-## Quick Start
+## Upgrade Notes
 
-```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force
-.\Run-WinServerSetup.ps1
-```
+- Review `WinServerSetup.config.json` before running this version.
+- Direct installer entries may optionally use `expectedSha256` and `requireValidSignature`; existing entries continue to work without those fields.
+- The RDP brute-force threshold is now `7`, which preserves the intended default behavior of blocking after more than 6 failed RemoteInteractive logons.
+- The default download cache remains `%TEMP%\WinServerSetup-downloads`.
 
-Run full setup:
-
-```powershell
-.\Run-WinServerSetup.ps1 -Full
-```
-
-Run full setup without pause prompts:
-
-```powershell
-.\Run-WinServerSetup.ps1 -Full -NoPause
-```
-
-## Included Files
-
-| File or folder | Purpose |
-| --- | --- |
-| `WinServerSetup.ps1` | Main setup script and menu. |
-| `Run-WinServerSetup.ps1` | Auto-elevating launcher. |
-| `WinServerSetup.config.json` | Main configuration file. |
-| `scripts\Prefetch-AppDownloads.ps1` | Background app download helper. |
-| `scripts\Block-RdpBruteforce.ps1` | RDP brute-force blocker. |
-| `scripts\Run-PostRebootSfc.ps1` | Post-reboot SFC helper. |
-| `default-apps\DefaultAppAssociations.xml` | Default app association template. |
-| `task-scheduler\EmptyStandbyList.xml` | EmptyStandbyList task template. |
-| `.github\workflows\powershell-lint.yml` | GitHub Actions parse and lint workflow. |
-| `README.md` | Project documentation. |
-| `LICENSE` | MIT License. |
-| `ATTRIBUTION.md` | Attribution notice. |
-
-## License
+## License and Attribution
 
 Released under the MIT License.
-
-## Attribution
 
 WinServerSetup - Copyright (c) 2026 Kiaro Sama  
 Original author: Kiaro Sama  

@@ -14,6 +14,7 @@ GitHub: https://github.com/KiaroSama
 - Multi-pass Windows Update with Microsoft Update support and reboot suppression.
 - Application download prefetch while Windows Update is running.
 - Sequential application installation so only one installer runs at a time.
+- Optional SHA256 and required Authenticode validation for direct installer downloads.
 - Dark mode, Explorer file extensions, Persian keyboard layout, and Windows Search Indexing.
 - Safe RDP port change to TCP `5801` with firewall verification before registry changes.
 - Hidden, highest-privilege scheduled tasks for EmptyStandbyList, RDP brute-force blocking, and post-reboot SFC.
@@ -104,7 +105,7 @@ The full setup workflow performs these actions:
 1. Applies dark mode and Explorer settings.
 2. Adds the Persian keyboard layout without removing existing layouts.
 3. Creates configured portable folders.
-4. Starts safe parallel registry tasks and app download prefetch.
+4. Starts app download prefetch with the configured safe parallel limit.
 5. Runs multi-pass Windows Update while downloads continue in the background.
 6. Applies QoS and Windows Update bandwidth policies.
 7. Installs configured applications and runtimes sequentially.
@@ -130,7 +131,10 @@ Winget packages:
 - K-Lite Codec Pack Mega
 - Notepad++
 - Telegram Desktop
-- Windows Terminal
+
+Separate Windows Terminal section:
+
+- Windows Terminal is handled by the top-level `windowsTerminal` config section and installed/configured through winget when enabled.
 
 Direct or GitHub downloads:
 
@@ -144,7 +148,7 @@ Direct or GitHub downloads:
 | PowerShell 7 | Latest GitHub release from `PowerShell/PowerShell` matching the configured MSI regex |
 | EmptyStandbyList | Configured GitHub source or `apps\installers\EmptyStandbyList.exe` |
 
-Before winget installation, the script removes the `msstore` winget source when configured and refreshes winget sources to avoid known `0x8a15005e` certificate errors.
+Before winget installation, the script removes the `msstore` winget source when configured, refreshes winget sources, and attempts `winget source reset --force` as a fallback for source/certificate corruption.
 
 ## Important Repository Files
 
@@ -161,9 +165,10 @@ Before winget installation, the script removes the `msstore` winget source when 
 | `apps\installers\PUT_INSTALLERS_HERE.txt` | Notes for optional local installers. |
 | `.github\workflows\powershell-lint.yml` | GitHub Actions parse and lint workflow. |
 | `Publish-ToGitHub.ps1` | Optional local helper for initializing and pushing a Git repo. |
+| `CHANGELOG.md` | Versioned release changelog. |
 | `LICENSE` | MIT License and attribution notice. |
 | `ATTRIBUTION.md` | Attribution summary. |
-| `GITHUB_RELEASE_NOTES.md` | Draft release notes for the first GitHub release. |
+| `GITHUB_RELEASE_NOTES.md` | Draft release notes for the next GitHub release. |
 
 ## Configuration
 
@@ -183,7 +188,7 @@ Important sections:
 | `runtimes` | Controls .NET and Visual C++ runtime installation. |
 | `rdpBruteforceBlocker` | Controls failed-login blocking threshold and schedule. |
 | `autoReboot` | Controls final automatic reboot and post-reboot SFC scheduling. |
-| `cleanup` | Controls temporary file cleanup. |
+| `cleanup` | Controls project download cache cleanup, scoped WinServerSetup user-temp cleanup, Windows temp cleanup, and optional recycle bin cleanup. |
 
 ## Logs and Output
 
@@ -200,6 +205,10 @@ Logs are written under the resolved project `logs` directory:
 | `sfc-result.log` | Post-reboot SFC result log. |
 
 The default download cache is `%TEMP%\WinServerSetup-downloads`. The project no longer creates `C:\portable\_downloads` unless you explicitly configure a permanent download root.
+
+When `cleanup.cleanUserTemp` is enabled, the script removes only WinServerSetup-owned artifacts from the user temp folder, such as `WinServerSetup-downloads`, relocation logs, partial downloads, and relocation cleanup scripts. It does not wipe the whole `%TEMP%` directory.
+
+Direct installer entries may optionally define `expectedSha256` and `requireValidSignature`. SHA256 mismatches reject the download. Authenticode signatures are logged for executable package types (`.exe`, `.msi`, `.msix`, `.appx`, and bundle variants), and invalid or non-applicable signatures are rejected when `requireValidSignature` is true for that installer.
 
 ## Safety Notes
 
@@ -218,6 +227,14 @@ This project performs real system changes. Review `WinServerSetup.config.json` b
 - It includes an optional Windows activation helper. Use it only when you have the legal right to activate the target Windows installation.
 
 The RDP port change is implemented defensively: the firewall rule for the new port is created and verified before the registry port is changed, and the old port is blocked only after the new port is confirmed listening where possible.
+
+If Remote Desktop Services cannot be restarted after the registry update, the script rolls the RDP port value back to the previous port. If the service restarts but the new port is slow to bind, the script waits and leaves the old port open unless the new port is confirmed.
+
+The Persian keyboard layout is appended to the current user's language list. Existing layouts are not removed, but Windows may refresh the input method order when the language list is written.
+
+Default app association XML imports through DISM apply to new user profiles. Current-user defaults are also attempted where the project has safe per-user logic, but Windows may still require manual selection in Settings for protected defaults.
+
+The RDP brute-force blocker scans failed RemoteInteractive logons and blocks sources that meet the configured threshold. The default threshold is `7`, which means more than 6 failed attempts in the lookback window.
 
 ## Troubleshooting
 
@@ -257,7 +274,7 @@ Check Task Scheduler for `WinServerSetup Post-Reboot SFC` and review `logs\sfc-r
 
 Do not publish local runtime artifacts. The `.gitignore` excludes logs, comments, command notes, local tool state, downloaded installers, backups, caches, temporary files, secret patterns, and generated output.
 
-Expected public files include the PowerShell scripts, configuration template, README, license, attribution file, release notes, GitHub workflow, default app XML, scheduled task XML, and installer instructions.
+Expected public files include the PowerShell scripts, configuration template, README, changelog, license, attribution file, release notes, GitHub workflow, default app XML, scheduled task XML, and installer instructions.
 
 ## License and Attribution
 

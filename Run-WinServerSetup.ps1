@@ -24,7 +24,9 @@ function Read-AnyKeyExit {
             [void][Console]::ReadKey($true)
             return
         }
-    } catch { }
+    } catch {
+        Write-Verbose ("ReadKey fallback: {0}" -f $_.Exception.Message)
+    }
     Read-Host | Out-Null
 }
 
@@ -55,7 +57,8 @@ if (Test-IsElevated) {
 
 # Not elevated: relaunch elevated. -Verb RunAs triggers UAC.
 try {
-    Start-Process powershell.exe -ArgumentList $childArgs -Verb RunAs
+    $elevated = Start-Process powershell.exe -ArgumentList $childArgs -Verb RunAs -Wait -PassThru
+    if ($null -ne $elevated.ExitCode) { exit $elevated.ExitCode }
 } catch {
     Write-Host "Failed to elevate. Please right-click PowerShell and choose 'Run as Administrator'." -ForegroundColor Red
     Write-Host $_.Exception.Message -ForegroundColor Red

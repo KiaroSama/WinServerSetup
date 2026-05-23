@@ -10,9 +10,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$script:ProjectRootOverride = $ProjectRoot
 
 function Resolve-ProjectRoot {
-    if (-not [string]::IsNullOrWhiteSpace($ProjectRoot) -and (Test-Path $ProjectRoot)) { return $ProjectRoot }
+    $candidateRoot = $script:ProjectRootOverride
+    if (-not [string]::IsNullOrWhiteSpace($candidateRoot) -and (Test-Path $candidateRoot)) {
+        return (Resolve-Path -LiteralPath $candidateRoot).Path
+    }
     if ($PSScriptRoot) { return (Split-Path -Parent $PSScriptRoot) }
     return (Get-Location).Path
 }
@@ -32,22 +36,43 @@ function Write-LogLine {
     Add-Content -LiteralPath $LogFile -Value $line -Encoding utf8
 }
 
+function Read-ProcessOutputFile {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path)) { return @() }
+
+    foreach ($encoding in @("Unicode", "UTF8", "Default")) {
+        try {
+            $content = @(Get-Content -LiteralPath $Path -Encoding $encoding -ErrorAction Stop)
+            $joined = ($content -join "")
+            if ($content.Count -eq 0 -or $joined -notmatch "`0") {
+                return $content
+            }
+        } catch {
+            $null = $_
+        }
+    }
+    return @(Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)
+}
+
 $root = Resolve-ProjectRoot
 $log  = Initialize-LogFile -Root $root
 Write-LogLine -LogFile $log -Message "Starting sfc /scannow ..."
 
+$tempOut = $null
+$tempErr = $null
 try {
-    # Capture all output (stdout+stderr) from sfc and append to the log line by line.
+    # cmd.exe /u gives the redirected stream a stable Unicode encoding.
     $tempOut = [System.IO.Path]::GetTempFileName()
-    $proc = Start-Process -FilePath (Join-Path $env:windir "System32\sfc.exe") `
-        -ArgumentList "/scannow" -PassThru -Wait -NoNewWindow `
-        -RedirectStandardOutput $tempOut
+    $tempErr = [System.IO.Path]::GetTempFileName()
+    $proc = Start-Process -FilePath (Join-Path $env:windir "System32\cmd.exe") `
+        -ArgumentList @("/u", "/d", "/c", "sfc /scannow") -PassThru -Wait -WindowStyle Hidden `
+        -RedirectStandardOutput $tempOut -RedirectStandardError $tempErr
 
-    if (Test-Path $tempOut) {
-        Get-Content -LiteralPath $tempOut -ErrorAction SilentlyContinue | ForEach-Object {
+    foreach ($tempFile in @($tempOut, $tempErr)) {
+        Read-ProcessOutputFile -Path $tempFile | ForEach-Object {
             if ($_ -and ($_ -match '\S')) { Write-LogLine -LogFile $log -Message $_ -Level "SFC" }
         }
-        Remove-Item -LiteralPath $tempOut -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
     }
     Write-LogLine -LogFile $log -Message ("sfc exit code: {0}" -f $proc.ExitCode) -Level "INFO"
     if ($proc.ExitCode -eq 0) {
@@ -58,6 +83,11 @@ try {
 } catch {
     Write-LogLine -LogFile $log -Message ("SFC scan failed: {0}" -f $_.Exception.Message) -Level "ERROR"
 } finally {
+    foreach ($tempFile in @($tempOut, $tempErr)) {
+        if ($tempFile -and (Test-Path $tempFile)) {
+            Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+        }
+    }
     # Unregister the scheduled task so this only runs once after reboot.
     try {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
