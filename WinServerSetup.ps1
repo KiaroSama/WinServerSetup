@@ -33,6 +33,7 @@ function Get-ProjectRoot {
 $Global:ProjectRoot      = Get-ProjectRoot
 $Global:ConfigPath       = Join-Path $Global:ProjectRoot "WinServerSetup.config.json"
 $Global:Config           = $null
+$Global:ScriptVersion    = "1.2.0"
 $Global:TranscriptStarted= $false
 $Global:LogFile          = $null
 $Global:StructuredLog    = $null
@@ -177,7 +178,7 @@ function Initialize-StructuredLog {
     }
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $Global:StructuredLog = Join-Path $LogDirectory ("WinServerSetup-structured-{0}.log" -f $stamp)
-    Set-Content -LiteralPath $Global:StructuredLog -Value ("# WinServerSetup structured log started {0}" -f (Get-Date -Format "u")) -Encoding utf8
+    Set-Content -LiteralPath $Global:StructuredLog -Value ("# WinServerSetup {0} structured log started {1}" -f $Global:ScriptVersion, (Get-Date -Format "u")) -Encoding utf8
 }
 
 function Write-StructuredLog {
@@ -447,6 +448,7 @@ function Initialize-Environment {
         try {
             Start-Transcript -Path $Global:LogFile -Append -Encoding utf8 -Force | Out-Null
             $Global:TranscriptStarted = $true
+            Write-Info "WinServerSetup version: $Global:ScriptVersion"
             Write-Info "Console transcript:  $Global:LogFile"
             Write-Info "Structured log file: $Global:StructuredLog"
         } catch {
@@ -1026,12 +1028,20 @@ function Repair-WingetSources {
         $updateResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("source", "update") -DisplayName "winget source update"
         if ($updateResult.ExitCode -eq 0) { Write-Ok "winget sources refreshed." }
         else {
-            Write-Warn "winget source update exited with code $($updateResult.ExitCode). Attempting source reset fallback."
-            $needsReset = $true
+            Write-Warn "winget source update exited with code $($updateResult.ExitCode)."
+            if ($needsReset) {
+                Write-Info "A winget source listing/removal failure was detected; using source reset fallback."
+            } else {
+                Write-Info "Skipping winget source reset because source listing/removal already succeeded and only source update failed."
+            }
         }
     } catch {
         Write-Warn "winget source update failed: $($_.Exception.Message)"
-        $needsReset = $true
+        if ($needsReset) {
+            Write-Info "A winget source listing/removal failure was detected; using source reset fallback."
+        } else {
+            Write-Info "Skipping winget source reset because source listing/removal already succeeded and only source update failed."
+        }
     }
 
     if ($needsReset) {
@@ -1058,26 +1068,6 @@ function Repair-WingetSources {
 function Test-WingetPackageInstalled {
     param([Parameter(Mandatory)][string]$Id)
     if ([string]::IsNullOrWhiteSpace($Id)) { return $false }
-
-    try {
-        $jsonResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("list", "--id", $Id, "--exact", "--accept-source-agreements", "--source", "winget", "--output", "json") -DisplayName "winget list $Id json"
-        $jsonText = ($jsonResult.Output -join "`n")
-        if ($jsonResult.ExitCode -eq 0) {
-            $starts = @($jsonText.IndexOf('{'), $jsonText.IndexOf('[')) | Where-Object { $_ -ge 0 } | Sort-Object
-            foreach ($startIndex in $starts) {
-                try {
-                    $jsonPayload = $jsonText.Substring($startIndex)
-                    $null = $jsonPayload | ConvertFrom-Json -ErrorAction Stop
-                    if ($jsonPayload -match [regex]::Escape($Id)) { return $true }
-                    break
-                } catch {
-                    Write-StructuredLog -Level WINGET -Message ("Could not parse winget JSON payload for {0} starting at index {1}: {2}" -f $Id, $startIndex, $_.Exception.Message)
-                }
-            }
-        }
-    } catch {
-        Write-StructuredLog -Level WINGET -Message ("JSON package detection failed for {0}: {1}" -f $Id, $_.Exception.Message)
-    }
 
     try {
         $listResult = Invoke-LoggedCommand -FilePath "winget" -Arguments @("list", "--id", $Id, "--exact", "--accept-source-agreements", "--source", "winget") -DisplayName "winget list $Id"
@@ -1118,6 +1108,41 @@ function Enable-FileExtensions {
         } catch {
             Write-StructuredLog -Level WARN -Message ("Explorer file-extension refresh failed: {0}" -f $_.Exception.Message)
         }
+    }
+}
+
+# =============================================================================
+# SECTION 1B: WINDOWS LONG PATHS
+# =============================================================================
+function Enable-LongPathSupport {
+    if ($Global:Config.filesystem -and ($Global:Config.filesystem.PSObject.Properties.Name -contains "enableLongPaths") -and -not $Global:Config.filesystem.enableLongPaths) {
+        Write-Info "Windows long paths toggle disabled in config."
+        return
+    }
+
+    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem"
+    $current = (Get-ItemProperty -Path $regPath -Name "LongPathsEnabled" -ErrorAction SilentlyContinue).LongPathsEnabled
+    if ($current -eq 1) {
+        Write-Ok "Windows long paths are already enabled."
+        return
+    }
+
+    $result = Invoke-LoggedCommand -FilePath "reg.exe" -Arguments @(
+        "add",
+        "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem",
+        "/v",
+        "LongPathsEnabled",
+        "/t",
+        "REG_DWORD",
+        "/d",
+        "1",
+        "/f"
+    ) -DisplayName "reg add LongPathsEnabled"
+
+    if ($result.ExitCode -eq 0) {
+        Write-Ok "Enabled Windows long paths (LongPathsEnabled=1)."
+    } else {
+        Write-Warn ("Could not enable Windows long paths; reg.exe exited with code {0}." -f $result.ExitCode)
     }
 }
 
@@ -2977,6 +3002,7 @@ function Invoke-HealthCheck {
         @{ Name = "EmptyStandbyList Task";                   Test = { [bool](Get-ScheduledTask -TaskName ([string]$Global:Config.emptyStandbyList.taskName) -TaskPath ([string]$Global:Config.emptyStandbyList.taskPath) -ErrorAction SilentlyContinue) } },
         @{ Name = "RDP Blocker Task";                        Test = { [bool](Get-ScheduledTask -TaskName ([string]$Global:Config.rdpBruteforceBlocker.taskName) -ErrorAction SilentlyContinue) } },
         @{ Name = "Show File Extensions";                    Test = { (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name HideFileExt -ErrorAction SilentlyContinue).HideFileExt -eq 0 } },
+        @{ Name = "Windows Long Paths";                      Test = { (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled -eq 1 } },
         @{ Name = "Dark Mode";                               Test = { (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name AppsUseLightTheme -ErrorAction SilentlyContinue).AppsUseLightTheme -eq 0 } },
         @{ Name = "PowerShell 7 default for .ps1";            Test = { (Get-RegistryDefaultValue -Path "HKCU:\Software\Classes\.ps1") -eq "WinServerSetup.PowerShell7Script" } },
         @{ Name = "7-Zip default for .zip";                  Test = { (Get-RegistryDefaultValue -Path "HKCU:\Software\Classes\.zip") -eq "7-Zip.zip" } },
@@ -3062,6 +3088,7 @@ function Invoke-FullSetup {
     # Quick wins / settings that don't need network. Apply early.
     Invoke-RecordedSetupStep -Name "Apply dark mode" -Action { Set-WindowsDarkMode }
     Invoke-RecordedSetupStep -Name "Show file extensions" -Action { Enable-FileExtensions }
+    Invoke-RecordedSetupStep -Name "Enable Windows long paths" -Action { Enable-LongPathSupport }
     Invoke-RecordedSetupStep -Name "Add Persian keyboard layout" -Action { Add-PersianKeyboardLayout }
     Invoke-RecordedSetupStep -Name "Create custom folders and Defender exclusions" -Action { Configure-CustomFoldersAndDefenderExclusions }
 
@@ -3130,6 +3157,7 @@ function Show-MainMenu {
         Write-Option -Number "3"  -Label "Activation from config only"
         Write-Option -Number "4"  -Label "Apply dark mode + taskbar"
         Write-Option -Number "5"  -Label "Show file extensions"
+        Write-Option -Number "5b" -Label "Enable Windows long paths"
         Write-Option -Number "6"  -Label "Add Persian keyboard layout"
         Write-Option -Number "7"  -Label "Install applications (winget + direct + v2rayN + PS7 + WT)"
         Write-Option -Number "8"  -Label "Install Brave extensions"
@@ -3163,6 +3191,7 @@ function Show-MainMenu {
                 "3"  { Invoke-Timed -Name "Activation from config"                  -Action { Invoke-ActivationIfConfigured };                 Pause-IfNeeded }
                 "4"  { Invoke-Timed -Name "Apply dark mode"                         -Action { Set-WindowsDarkMode };                           Pause-IfNeeded }
                 "5"  { Invoke-Timed -Name "Show file extensions"                    -Action { Enable-FileExtensions };                         Pause-IfNeeded }
+                "5b" { Invoke-Timed -Name "Enable Windows long paths"                -Action { Enable-LongPathSupport };                       Pause-IfNeeded }
                 "6"  { Invoke-Timed -Name "Add Persian keyboard layout"             -Action { Add-PersianKeyboardLayout };                     Pause-IfNeeded }
                 "7"  { Invoke-Timed -Name "Install applications"                    -Action { Install-Applications };                          Pause-IfNeeded }
                 "8"  { Invoke-Timed -Name "Install Brave extensions"                -Action { Install-BraveExtensions };                       Pause-IfNeeded }

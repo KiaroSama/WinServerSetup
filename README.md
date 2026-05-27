@@ -15,7 +15,7 @@ GitHub: https://github.com/KiaroSama
 - Application download prefetch while Windows Update is running.
 - Sequential application installation so only one installer runs at a time.
 - Optional SHA256 and required Authenticode validation for direct installer downloads.
-- Dark mode, Explorer file extensions, Persian keyboard layout, and Windows Search Indexing.
+- Dark mode, Explorer file extensions, Windows long paths, Persian keyboard layout, and Windows Search Indexing.
 - Safe RDP port change to TCP `5801` with firewall verification before registry changes.
 - Hidden, highest-privilege scheduled tasks for EmptyStandbyList, RDP brute-force blocking, and post-reboot SFC.
 - PowerShell 7 install, Windows Terminal default profile configuration, and `.ps1` open handler setup.
@@ -103,21 +103,22 @@ Run from the current folder without self-relocation:
 The full setup workflow performs these actions:
 
 1. Applies dark mode and Explorer settings.
-2. Adds the Persian keyboard layout without removing existing layouts.
-3. Creates configured portable folders.
-4. Starts app download prefetch with the configured safe parallel limit.
-5. Runs multi-pass Windows Update while downloads continue in the background.
-6. Applies QoS and Windows Update bandwidth policies.
-7. Installs configured applications and runtimes sequentially.
-8. Configures default browser, media player, 7-Zip associations, PowerShell 7, and Windows Terminal where Windows allows it.
-9. Changes the RDP port safely.
-10. Enables Windows Search Indexing.
-11. Registers scheduled tasks.
-12. Disables configured startup entries and removes configured Windows components.
-13. Pins configured Quick Access entries and replaces taskbar pins where Windows allows it.
-14. Runs health checks and cleanup.
-15. Prints the final summary.
-16. Schedules post-reboot SFC and restarts only after all setup tasks finish when a reboot is required.
+2. Enables Windows long paths.
+3. Adds the Persian keyboard layout without removing existing layouts.
+4. Creates configured portable folders.
+5. Starts app download prefetch with the configured safe parallel limit.
+6. Runs multi-pass Windows Update while downloads continue in the background.
+7. Applies QoS and Windows Update bandwidth policies.
+8. Installs configured applications and runtimes sequentially.
+9. Configures default browser, media player, 7-Zip associations, PowerShell 7, and Windows Terminal where Windows allows it.
+10. Changes the RDP port safely.
+11. Enables Windows Search Indexing.
+12. Registers scheduled tasks.
+13. Disables configured startup entries and removes configured Windows components.
+14. Pins configured Quick Access entries and replaces taskbar pins where Windows allows it.
+15. Runs health checks and cleanup.
+16. Prints the final summary.
+17. Schedules post-reboot SFC and restarts only after all setup tasks finish when a reboot is required.
 
 ## Configured Applications
 
@@ -182,6 +183,7 @@ Important sections:
 | `parallel` | Controls safe parallel download/background work. |
 | `windowsUpdate` | Controls Windows Update behavior and pass count. |
 | `activation` | Controls optional Windows activation helper behavior. |
+| `filesystem` | Controls Windows long paths enablement. |
 | `rdp` | Controls RDP port, old-port blocking, and service restart behavior. |
 | `winget.packages` | Controls winget-installed applications. |
 | `directInstallers` | Controls direct installer downloads. |
@@ -204,6 +206,8 @@ Logs are written under the resolved project `logs` directory:
 | `rdp-blocker.log` | RDP brute-force blocker log. |
 | `sfc-result.log` | Post-reboot SFC result log. |
 
+The running script version is printed to the console transcript and written in the structured log header.
+
 The default download cache is `%TEMP%\WinServerSetup-downloads`. The project no longer creates `C:\portable\_downloads` unless you explicitly configure a permanent download root.
 
 When `cleanup.cleanUserTemp` is enabled, the script removes only WinServerSetup-owned artifacts from the user temp folder, such as `WinServerSetup-downloads`, relocation logs, partial downloads, and relocation cleanup scripts. It does not wipe the whole `%TEMP%` directory.
@@ -218,6 +222,7 @@ This project performs real system changes. Review `WinServerSetup.config.json` b
 - It can download and execute installers.
 - It can install or upgrade applications.
 - It can edit registry keys.
+- It can enable Windows long paths through `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled`.
 - It can change the RDP port.
 - It can add, update, or remove Windows Firewall rules.
 - It can create hidden scheduled tasks running as `SYSTEM`.

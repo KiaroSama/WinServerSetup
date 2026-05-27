@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.0] - 2026-05-28
+
+### Added
+
+- Added Windows long paths enablement to the full setup workflow.
+- Added a standalone menu option for enabling Windows long paths.
+- Added `filesystem.enableLongPaths` configuration for controlling the long paths step.
+- Added script version logging to the console transcript and structured log header.
+- Added Windows long paths state to the health check output.
+
+### Changed
+
+- Avoided winget source reset fallback when `msstore` is already absent and only `winget source update` fails.
+
+### Fixed
+
+- Removed unsupported `winget list --output json` package detection to avoid wasted winget calls and noisy structured logs.
+
 ## [1.1.0] - 2026-05-23
 
 ### Added

@@ -1,43 +1,28 @@
-# WinServerSetup v1.1.0
+# WinServerSetup v1.2.0
 
-**Suggested tag:** `v1.1.0`
+**Tag:** `v1.2.0`
 
 ## Summary
 
-WinServerSetup v1.1.0 is a reliability, safety, and release-documentation update for the Windows Server setup automation project. It focuses on preventing data loss, reducing RDP lockout risk, improving download validation, making cleanup safer, and improving release readiness.
+WinServerSetup v1.2.0 adds Windows long paths enablement to the automated setup workflow, exposes the same action as a standalone menu option, and improves release/runtime diagnostics.
 
 ## Added
 
-- App download prefetch support while Windows Update is running.
-- Optional `expectedSha256` validation for direct installer entries.
-- Optional `requireValidSignature` validation for direct installer entries.
-- Per-step full setup task recording so the final summary reflects real workflow progress.
-- Winget source reset fallback when source listing, removal, or update fails.
-- Changelog file for versioned release tracking.
+- Windows long paths enablement through `LongPathsEnabled=1` under `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`.
+- Full setup now runs the Windows long paths step automatically.
+- Main menu now includes a standalone `Enable Windows long paths` option.
+- New `filesystem.enableLongPaths` configuration toggle.
+- Script version logging in the console transcript and structured log header.
+- Windows long paths state in the health check output.
 
 ## Changed
 
-- Default parallel download limit is now `4`.
-- v2rayN refresh now copies new files without purging user configuration files.
-- User temp cleanup is now scoped to WinServerSetup-owned artifacts instead of wiping the whole `%TEMP%` folder.
-- RDP brute-force blocking now counts only RemoteInteractive logon failures.
-- RDP brute-force threshold is now `7`, preserving the intended "more than 6 failed attempts" behavior.
-- Windows Terminal settings updates now handle legacy `profiles` array files.
-- Default app import messaging now clarifies that DISM imports apply to new user profiles.
-- GitHub release notes now target the next versioned release instead of the initial release.
+- Documentation now lists Windows long paths as part of the system configuration workflow.
+- Winget source repair now avoids `source reset --force` when `msstore` is already absent and only `winget source update` fails.
 
 ## Fixed
 
-- Fixed RDP port-change rollback when Remote Desktop Services cannot restart after the registry update.
-- Fixed RDP listener verification by waiting for the new port before blocking the old port.
-- Fixed post-reboot SFC output capture and logging.
-- Fixed winget package detection to prefer JSON output and avoid table truncation where possible.
-- Fixed `.ps1` PowerShell 7 file association metadata by adding a friendly name, icon, and edit flags.
-- Fixed relocation cleanup script leakage from `%TEMP%`.
-- Fixed scheduled task hidden/highest-privilege behavior for project-created scheduled tasks.
-- Fixed `Publish-ToGitHub.ps1` remote validation so accidental non-GitHub pushes are blocked unless forced.
-- Fixed `Run-WinServerSetup.ps1` elevated process exit-code propagation.
-- Fixed EmptyStandbyList task template start boundary for manual imports.
+- Removed unsupported `winget list --output json` package detection to avoid wasted winget calls and noisy structured logs.
 
 ## Removed
 
@@ -60,6 +45,7 @@ WinServerSetup performs real system changes. Review `WinServerSetup.config.json`
 
 - It can download and run installers.
 - It can edit registry keys.
+- It can enable Windows long paths by setting `LongPathsEnabled=1`.
 - It can change the RDP port and Windows Firewall rules.
 - It can create hidden scheduled tasks running as `SYSTEM`.
 - It can remove configured Appx packages and Windows capabilities.
@@ -70,9 +56,8 @@ WinServerSetup performs real system changes. Review `WinServerSetup.config.json`
 ## Upgrade Notes
 
 - Review `WinServerSetup.config.json` before running this version.
-- Direct installer entries may optionally use `expectedSha256` and `requireValidSignature`; existing entries continue to work without those fields.
-- The RDP brute-force threshold is now `7`, which preserves the intended default behavior of blocking after more than 6 failed RemoteInteractive logons.
-- The default download cache remains `%TEMP%\WinServerSetup-downloads`.
+- `filesystem.enableLongPaths` defaults to `true`, so full setup enables Windows long paths automatically unless you disable that setting.
+- The running script version is now included in the logs, which helps verify support reports against the released version.
 
 ## License and Attribution
 
