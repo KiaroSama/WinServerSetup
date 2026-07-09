@@ -21,20 +21,43 @@ function Assert-Contains {
     }
 }
 
+function Assert-True {
+    param(
+        [Parameter(Mandatory)][bool]$Condition,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    if (-not $Condition) {
+        throw $Message
+    }
+}
+
 Assert-Contains `
     -Text $main `
     -Pattern 'Read-HostUntimed\s+-Prompt\s+"Select"\s+-DefaultValue\s+"1"' `
     -Message "Main menu must show Select with default [1] and submit option 1 when Enter is pressed."
 
-Assert-Contains `
-    -Text $main `
-    -Pattern 'Write-Option\s+-Number\s+"10"\s+-Label\s+"Configure RDP port and firewall \(safe\)"\s+-Color\s+"Red"' `
-    -Message "RDP menu option should use a red category color for stronger visual separation."
+$menuBlockMatch = [regex]::Match(
+    $main,
+    '(?s)Write-Option\s+-Number\s+"1".*?Write-Option\s+-Number\s+"0"\s+-Label\s+"Back / Exit"\s+-Color\s+"[^"]+"'
+)
+Assert-True -Condition $menuBlockMatch.Success -Message "Main menu Write-Option block was not found."
 
-Assert-Contains `
-    -Text $main `
-    -Pattern 'Write-Option\s+-Number\s+"22"\s+-Label\s+"Clean temp and cache"\s+-Color\s+"Magenta"' `
-    -Message "Cleanup menu option should use its own bright category color."
+$menuColors = [regex]::Matches($menuBlockMatch.Value, '-Color\s+"([^"]+)"') |
+    ForEach-Object { $_.Groups[1].Value }
+$uniqueMenuColors = @($menuColors | Sort-Object -Unique)
+
+Assert-True `
+    -Condition ($menuColors.Count -ge 27) `
+    -Message "Every main menu option should declare the unified menu label color."
+
+Assert-True `
+    -Condition (($uniqueMenuColors.Count -eq 1) -and ($uniqueMenuColors[0] -eq "Cyan")) `
+    -Message ("Main menu labels must use one unified bright color. Actual colors: {0}" -f ($uniqueMenuColors -join ", "))
+
+Assert-True `
+    -Condition ($menuBlockMatch.Value -notmatch '-Color\s+"(Red|Magenta|Dark[^"]*)"') `
+    -Message "Main menu labels must not use dark-looking red, purple, or Dark* colors."
 
 Assert-Contains `
     -Text $launcher `
@@ -43,12 +66,38 @@ Assert-Contains `
 
 Assert-Contains `
     -Text $launcher `
+    -Pattern 'function\s+Get-PreferredPowerShellExe' `
+    -Message "Launcher must resolve a preferred PowerShell executable instead of hard-coding Windows PowerShell 5."
+
+$pwshIndex = $launcher.IndexOf('Get-Command "pwsh.exe"')
+$winPsIndex = $launcher.IndexOf('WindowsPowerShell\v1.0\powershell.exe')
+Assert-True `
+    -Condition (($pwshIndex -ge 0) -and ($winPsIndex -gt $pwshIndex)) `
+    -Message "Launcher must prefer PowerShell 7 (pwsh.exe) before falling back to Windows PowerShell 5."
+
+Assert-Contains `
+    -Text $launcher `
+    -Pattern 'function\s+Get-WindowsTerminalExe' `
+    -Message "Launcher must resolve Windows Terminal when available."
+
+Assert-Contains `
+    -Text $launcher `
+    -Pattern '@\("-w",\s*"0",\s*"new-tab"' `
+    -Message "Launcher must prefer a Windows Terminal tab in the most recent window."
+
+Assert-Contains `
+    -Text $launcher `
+    -Pattern 'Start-Process\s+\$windowsTerminalExe\s+-ArgumentList\s+\$terminalArgumentLine\s+-WorkingDirectory\s+\$scriptRoot\s+-Verb\s+RunAs' `
+    -Message "Launcher must start elevated runs through Windows Terminal when available."
+
+Assert-Contains `
+    -Text $launcher `
     -Pattern 'Start-Process\s+\$powerShellExe\s+-ArgumentList\s+\$elevatedArgumentLine\s+-WorkingDirectory\s+\$scriptRoot\s+-Verb\s+RunAs' `
-    -Message "Launcher must start the elevated child from the script directory with a robust quoted argument line."
+    -Message "Launcher must keep a direct PowerShell elevation fallback with a robust quoted argument line."
 
 Assert-Contains `
     -Text $launcher `
     -Pattern 'Press Enter to close this launcher' `
     -Message "Launcher must keep the window open after elevation or child-process failures."
 
-Write-Host "PASS menu defaults, colorful categories, and launcher diagnostics are present."
+Write-Host "PASS menu default, unified bright menu color, PowerShell 7 priority, Windows Terminal priority, and launcher diagnostics are present."

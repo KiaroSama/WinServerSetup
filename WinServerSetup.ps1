@@ -68,7 +68,7 @@ $Global:WinServerSetupColors = @{
     Title      = 'White'
     TitleRule  = 'Cyan'
     Section    = 'Yellow'
-    Option     = 'White'
+    Option     = 'Cyan'
     OptionNum  = 'Green'
     Status     = 'Cyan'
     Summary    = 'White'
@@ -159,7 +159,7 @@ function Write-Option {
     param(
         [Parameter(Mandatory)][string]$Number,
         [Parameter(Mandatory)][string]$Label,
-        [string]$Color = "White",
+        [string]$Color = "Cyan",
         [string]$NumberColor = "Green"
     )
     Write-InlineColor ("{0,3}. " -f $Number) -Color $NumberColor
@@ -3187,35 +3187,35 @@ function Show-MainMenu {
         Write-Rule  -Width 36
         Write-Title " WinServerSetup Main Menu"
         Write-Rule  -Width 36
-        Write-Option -Number "1"  -Label "Run full setup"                                      -Color "Green"
+        Write-Option -Number "1"  -Label "Run full setup"                                      -Color "Cyan"
         Write-Option -Number "2"  -Label "Windows Update (multi-pass)"                         -Color "Cyan"
-        Write-Option -Number "3"  -Label "Activation from config only"                         -Color "Yellow"
-        Write-Option -Number "4"  -Label "Apply dark mode + taskbar"                           -Color "Magenta"
+        Write-Option -Number "3"  -Label "Activation from config only"                         -Color "Cyan"
+        Write-Option -Number "4"  -Label "Apply dark mode + taskbar"                           -Color "Cyan"
         Write-Option -Number "5"  -Label "Show file extensions"                                -Color "Cyan"
         Write-Option -Number "5b" -Label "Enable Windows long paths"                           -Color "Cyan"
-        Write-Option -Number "6"  -Label "Add Persian keyboard layout"                         -Color "Yellow"
-        Write-Option -Number "7"  -Label "Install applications (winget + direct + v2rayN + PS7 + WT)" -Color "Green"
-        Write-Option -Number "8"  -Label "Install Brave extensions"                            -Color "Magenta"
+        Write-Option -Number "6"  -Label "Add Persian keyboard layout"                         -Color "Cyan"
+        Write-Option -Number "7"  -Label "Install applications (winget + direct + v2rayN + PS7 + WT)" -Color "Cyan"
+        Write-Option -Number "8"  -Label "Install Brave extensions"                            -Color "Cyan"
         Write-Option -Number "9"  -Label "Configure default browser/player"                    -Color "Cyan"
-        Write-Option -Number "9b" -Label "Set 7-Zip as default for compressed file extensions" -Color "Yellow"
-        Write-Option -Number "10" -Label "Configure RDP port and firewall (safe)"              -Color "Red"
+        Write-Option -Number "9b" -Label "Set 7-Zip as default for compressed file extensions" -Color "Cyan"
+        Write-Option -Number "10" -Label "Configure RDP port and firewall (safe)"              -Color "Cyan"
         Write-Option -Number "11" -Label "Enable Search Indexing"                              -Color "Cyan"
-        Write-Option -Number "12" -Label "Install .NET + Visual C++ runtimes (no ASP.NET)"     -Color "Green"
-        Write-Option -Number "13" -Label "Setup Empty Cache task"                              -Color "Magenta"
-        Write-Option -Number "14" -Label "Configure Windows Update bandwidth / QoS"            -Color "Yellow"
-        Write-Option -Number "15" -Label "Install RDP brute-force blocker (hidden)"            -Color "Red"
-        Write-Option -Number "16" -Label "Disable startup apps (AzureArcSysTray, S9Proxy, etc)" -Color "Red"
-        Write-Option -Number "17" -Label "Remove Feedback Hub / Appx packages"                 -Color "Red"
-        Write-Option -Number "18" -Label "Remove Windows capabilities (AzureArcSetup, etc)"    -Color "Red"
-        Write-Option -Number "19" -Label "Replace Edge taskbar pin with Brave"                 -Color "Magenta"
+        Write-Option -Number "12" -Label "Install .NET + Visual C++ runtimes (no ASP.NET)"     -Color "Cyan"
+        Write-Option -Number "13" -Label "Setup Empty Cache task"                              -Color "Cyan"
+        Write-Option -Number "14" -Label "Configure Windows Update bandwidth / QoS"            -Color "Cyan"
+        Write-Option -Number "15" -Label "Install RDP brute-force blocker (hidden)"            -Color "Cyan"
+        Write-Option -Number "16" -Label "Disable startup apps (AzureArcSysTray, S9Proxy, etc)" -Color "Cyan"
+        Write-Option -Number "17" -Label "Remove Feedback Hub / Appx packages"                 -Color "Cyan"
+        Write-Option -Number "18" -Label "Remove Windows capabilities (AzureArcSetup, etc)"    -Color "Cyan"
+        Write-Option -Number "19" -Label "Replace Edge taskbar pin with Brave"                 -Color "Cyan"
         Write-Option -Number "20" -Label "Pin folders to Quick Access"                         -Color "Cyan"
-        Write-Option -Number "21" -Label "Custom folders and Defender exclusions"              -Color "Yellow"
-        Write-Option -Number "22" -Label "Clean temp and cache"                                -Color "Magenta"
-        Write-Option -Number "23" -Label "Health check"                                        -Color "Green"
-        Write-Option -Number "24" -Label "Final summary"                                       -Color "White"
-        Write-Option -Number "25" -Label "Schedule post-reboot SFC"                            -Color "Yellow"
-        Write-Option -Number "26" -Label "Reboot now (if pending)"                             -Color "Red"
-        Write-Option -Number "0"  -Label "Back / Exit"                                         -Color "Gray"
+        Write-Option -Number "21" -Label "Custom folders and Defender exclusions"              -Color "Cyan"
+        Write-Option -Number "22" -Label "Clean temp and cache"                                -Color "Cyan"
+        Write-Option -Number "23" -Label "Health check"                                        -Color "Cyan"
+        Write-Option -Number "24" -Label "Final summary"                                       -Color "Cyan"
+        Write-Option -Number "25" -Label "Schedule post-reboot SFC"                            -Color "Cyan"
+        Write-Option -Number "26" -Label "Reboot now (if pending)"                             -Color "Cyan"
+        Write-Option -Number "0"  -Label "Back / Exit"                                         -Color "Cyan"
         Write-Host ""
 
         $choice = Read-HostUntimed -Prompt "Select" -DefaultValue "1"

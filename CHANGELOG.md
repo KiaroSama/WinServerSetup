@@ -5,13 +5,15 @@
 ### Added
 
 - Added stronger `Run-WinServerSetup.ps1` launcher diagnostics with a per-run UTC log file, resolved path details, forwarded switch logging, elevation flow logging, child exit-code logging, and stack details for launcher failures.
-- Added a brighter, category-colored main menu with red security/destructive actions, magenta cleanup/customization actions, and green/cyan/yellow workflow groups.
+- Added a brighter, unified main menu style that keeps option numbers green and option labels cyan for a consistent black-terminal layout.
 - Added a default main-menu selection so pressing Enter at `Select: [1]` runs option `1`.
-- Added static regression coverage for menu defaults, menu colors, and launcher diagnostics.
+- Added static regression coverage for menu defaults, unified menu colors, PowerShell 7 launcher priority, Windows Terminal launcher priority, and launcher diagnostics.
 
 ### Changed
 
 - Updated RDP brute-force blocker documentation to describe LogonType `3` and `10` detection and targeted username logging.
+- Changed `Run-WinServerSetup.ps1` to prefer PowerShell 7 (`pwsh.exe`) and fall back to Windows PowerShell 5 only when PowerShell 7 is unavailable.
+- Changed elevated launcher relaunches to prefer Windows Terminal `wt.exe -w 0 new-tab` when available, with direct PowerShell elevation as the fallback.
 
 ### Fixed
 

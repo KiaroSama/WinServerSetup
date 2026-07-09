@@ -4,15 +4,15 @@
 
 ## Summary
 
-This draft release improves launcher diagnostics, makes the interactive menu more readable on black terminals, adds an Enter-to-run-full-setup default, and documents the expanded RDP brute-force blocker behavior.
+This draft release improves launcher diagnostics, makes the interactive menu more consistent on black terminals, adds an Enter-to-run-full-setup default, prioritizes PowerShell 7 and Windows Terminal, and documents the expanded RDP brute-force blocker behavior.
 
 ## Added
 
 - Stronger `Run-WinServerSetup.ps1` launcher diagnostics with a per-run UTC log file under `logs`.
 - Launcher logging for resolved paths, execution ID, user/host/runtime details, forwarded switches, elevation flow, child exit code, duration, and launcher stack details.
-- A brighter category-colored main menu with red security/destructive actions and additional green, cyan, yellow, and magenta grouping.
+- A brighter unified main menu style with green option numbers and cyan option labels.
 - `Select: [1]` as the main-menu default, so pressing Enter runs the full setup workflow.
-- Static regression coverage for menu defaults, menu colors, and launcher diagnostics.
+- Static regression coverage for menu defaults, unified menu colors, PowerShell 7 launcher priority, Windows Terminal launcher priority, and launcher diagnostics.
 - Windows long paths enablement through `LongPathsEnabled=1` under `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`.
 - Full setup now runs the Windows long paths step automatically.
 - Main menu now includes a standalone `Enable Windows long paths` option.
@@ -23,6 +23,8 @@ This draft release improves launcher diagnostics, makes the interactive menu mor
 ## Changed
 
 - RDP brute-force blocker documentation now describes LogonType `3` and `10` detection and targeted username logging.
+- `Run-WinServerSetup.ps1` now prefers PowerShell 7 (`pwsh.exe`) and falls back to Windows PowerShell 5 only when PowerShell 7 is unavailable.
+- Elevated launcher relaunches now prefer Windows Terminal `wt.exe -w 0 new-tab`, with direct PowerShell elevation as the fallback.
 - Documentation now lists Windows long paths as part of the system configuration workflow.
 - Winget source repair now avoids `source reset --force` when `msstore` is already absent and only `winget source update` fails.
 

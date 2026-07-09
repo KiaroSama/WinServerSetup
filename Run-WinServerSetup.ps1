@@ -108,6 +108,82 @@ function Test-IsElevated {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-PreferredPowerShellExe {
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $pwshFromPath = Get-Command "pwsh.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($pwshFromPath -and $pwshFromPath.Source) {
+            $candidates.Add($pwshFromPath.Source) | Out-Null
+        }
+    } catch {
+        Write-LauncherLog -Level "DEBUG" -Message ("Could not resolve pwsh.exe from PATH: {0}" -f $_.Exception.Message)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $candidates.Add((Join-Path $env:ProgramFiles "PowerShell\7\pwsh.exe")) | Out-Null
+        $powerShellRoot = Join-Path $env:ProgramFiles "PowerShell"
+        if (Test-Path -LiteralPath $powerShellRoot) {
+            $installedPwsh = Get-ChildItem -LiteralPath $powerShellRoot -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName "pwsh.exe" }
+            foreach ($candidate in $installedPwsh) {
+                $candidates.Add($candidate) | Out-Null
+            }
+        }
+    }
+
+    if (($env:ProgramW6432) -and ($env:ProgramW6432 -ne $env:ProgramFiles)) {
+        $candidates.Add((Join-Path $env:ProgramW6432 "PowerShell\7\pwsh.exe")) | Out-Null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:WINDIR)) {
+        $candidates.Add((Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe")) | Out-Null
+    }
+
+    try {
+        $windowsPowerShellFromPath = Get-Command "powershell.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($windowsPowerShellFromPath -and $windowsPowerShellFromPath.Source) {
+            $candidates.Add($windowsPowerShellFromPath.Source) | Out-Null
+        }
+    } catch {
+        Write-LauncherLog -Level "DEBUG" -Message ("Could not resolve powershell.exe from PATH: {0}" -f $_.Exception.Message)
+    }
+
+    foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $candidate) {
+            return (Get-Item -LiteralPath $candidate).FullName
+        }
+    }
+
+    throw "No PowerShell executable was found. Install PowerShell 7 or ensure Windows PowerShell is available."
+}
+
+function Get-WindowsTerminalExe {
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $wtFromPath = Get-Command "wt.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($wtFromPath -and $wtFromPath.Source) {
+            $candidates.Add($wtFromPath.Source) | Out-Null
+        }
+    } catch {
+        Write-LauncherLog -Level "DEBUG" -Message ("Could not resolve wt.exe from PATH: {0}" -f $_.Exception.Message)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $candidates.Add((Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\wt.exe")) | Out-Null
+    }
+
+    foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $candidate) {
+            return (Get-Item -LiteralPath $candidate).FullName
+        }
+    }
+
+    return $null
+}
+
 function Join-CommandLineArgument {
     param([AllowEmptyString()][string]$Value)
 
@@ -160,12 +236,14 @@ try {
         exit 1
     }
 
-    $powerShellExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
-    if (-not (Test-Path -LiteralPath $powerShellExe)) {
-        $powerShellExe = "powershell.exe"
-        Write-LauncherLog -Level "WARNING" -Message "System Windows PowerShell path was not found; falling back to powershell.exe from PATH."
-    }
+    $powerShellExe = Get-PreferredPowerShellExe
+    $windowsTerminalExe = Get-WindowsTerminalExe
     Write-LauncherLog -Level "INFO" -Message ("powerShellExe={0}" -f $powerShellExe)
+    if ($windowsTerminalExe) {
+        Write-LauncherLog -Level "INFO" -Message ("windowsTerminalExe={0}" -f $windowsTerminalExe)
+    } else {
+        Write-LauncherLog -Level "WARNING" -Message "Windows Terminal was not found; elevated relaunch will use the selected PowerShell host directly."
+    }
 
     $childArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $mainScriptPath)
     $forwardedSwitches = @()
@@ -229,18 +307,39 @@ try {
     Write-LauncherLog -Level "INFO" -Message "Not elevated; starting elevated child through UAC."
     Write-LauncherLog -Level "DEBUG" -Message ("elevatedArgumentLine={0}" -f $elevatedArgumentLine)
 
-    try {
-        $elevated = Start-Process $powerShellExe -ArgumentList $elevatedArgumentLine -WorkingDirectory $scriptRoot -Verb RunAs -Wait -PassThru
-        $exitCode = if ($null -ne $elevated.ExitCode) { $elevated.ExitCode } else { 0 }
-        Write-LauncherLog -Level "INFO" -Message ("Elevated child completed. processId={0} exitCode={1}" -f $elevated.Id, $exitCode)
-        exit $exitCode
-    } catch {
-        Write-LauncherException -Level "CRITICAL" -ErrorRecord $_ -Context "Failed to start elevated child"
-        Write-Host "Failed to elevate. Please right-click PowerShell and choose 'Run as Administrator'." -ForegroundColor Red
-        Write-Host $_.Exception.Message -ForegroundColor Red
-        if ($script:LauncherLogReady) { Write-Host ("Launcher log: {0}" -f $script:LauncherLog) -ForegroundColor Yellow }
-        Read-LauncherPause
-        exit 1
+    if ($windowsTerminalExe) {
+        $terminalArgs = @("-w", "0", "new-tab", "--title", "Administrator: WinServerSetup", "--suppressApplicationTitle", "--startingDirectory", $scriptRoot, $powerShellExe) + $elevatedArgs
+        $terminalArgumentLine = ($terminalArgs | ForEach-Object { Join-CommandLineArgument -Value $_ }) -join " "
+        Write-LauncherLog -Level "INFO" -Message "Windows Terminal is available; starting elevated child in a Terminal tab."
+        Write-LauncherLog -Level "DEBUG" -Message ("terminalArgumentLine={0}" -f $terminalArgumentLine)
+
+        try {
+            $terminal = Start-Process $windowsTerminalExe -ArgumentList $terminalArgumentLine -WorkingDirectory $scriptRoot -Verb RunAs -Wait -PassThru
+            $terminalExitCode = if ($null -ne $terminal.ExitCode) { $terminal.ExitCode } else { 0 }
+            Write-LauncherLog -Level "INFO" -Message ("Windows Terminal launch completed. processId={0} exitCode={1}" -f $terminal.Id, $terminalExitCode)
+            exit $terminalExitCode
+        } catch {
+            Write-LauncherException -Level "CRITICAL" -ErrorRecord $_ -Context "Failed to start elevated Windows Terminal child"
+            Write-Host "Failed to elevate through Windows Terminal." -ForegroundColor Red
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            if ($script:LauncherLogReady) { Write-Host ("Launcher log: {0}" -f $script:LauncherLog) -ForegroundColor Yellow }
+            Read-LauncherPause
+            exit 1
+        }
+    } else {
+        try {
+            $elevated = Start-Process $powerShellExe -ArgumentList $elevatedArgumentLine -WorkingDirectory $scriptRoot -Verb RunAs -Wait -PassThru
+            $exitCode = if ($null -ne $elevated.ExitCode) { $elevated.ExitCode } else { 0 }
+            Write-LauncherLog -Level "INFO" -Message ("Elevated child completed. processId={0} exitCode={1}" -f $elevated.Id, $exitCode)
+            exit $exitCode
+        } catch {
+            Write-LauncherException -Level "CRITICAL" -ErrorRecord $_ -Context "Failed to start elevated child"
+            Write-Host "Failed to elevate. Please right-click PowerShell and choose 'Run as Administrator'." -ForegroundColor Red
+            Write-Host $_.Exception.Message -ForegroundColor Red
+            if ($script:LauncherLogReady) { Write-Host ("Launcher log: {0}" -f $script:LauncherLog) -ForegroundColor Yellow }
+            Read-LauncherPause
+            exit 1
+        }
     }
 } finally {
     $duration = [DateTime]::UtcNow - $launcherStartedUtc
