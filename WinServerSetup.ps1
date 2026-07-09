@@ -64,6 +64,7 @@ $Global:WinServerSetupColors = @{
     Warning    = 'Yellow'
     Info       = 'Cyan'
     Prompt     = 'Yellow'
+    Default    = 'Green'
     Title      = 'White'
     TitleRule  = 'Cyan'
     Section    = 'Yellow'
@@ -118,6 +119,17 @@ function Write-Color {
     Write-Host $Message
 }
 
+function Write-InlineColor {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Message,
+        [string]$Color = "White"
+    )
+    if (Test-ColorSupported -and -not [string]::IsNullOrWhiteSpace($Color)) {
+        try { Write-Host $Message -ForegroundColor $Color -NoNewline; return } catch { }
+    }
+    Write-Host $Message -NoNewline
+}
+
 # Semantic console helpers (also forward to the structured log when active).
 function Write-Info    { param([string]$Message) Write-Themed "[INFO]  $Message" -Kind Info;    Write-StructuredLog -Level INFO    -Message $Message }
 function Write-Ok      { param([string]$Message) Write-Themed "[OK]    $Message" -Kind Success; Write-StructuredLog -Level OK      -Message $Message }
@@ -144,9 +156,15 @@ function Write-Rule {
 }
 
 function Write-Option {
-    param([Parameter(Mandatory)][string]$Number, [Parameter(Mandatory)][string]$Label)
-    Write-Themed ("{0,3}. " -f $Number) -Kind OptionNum -NoNewline
-    Write-Themed $Label -Kind Option
+    param(
+        [Parameter(Mandatory)][string]$Number,
+        [Parameter(Mandatory)][string]$Label,
+        [string]$Color = "White",
+        [string]$NumberColor = "Green"
+    )
+    Write-InlineColor ("{0,3}. " -f $Number) -Color $NumberColor
+    Write-InlineColor $Label -Color $Color
+    Write-Host ""
 }
 
 # In-place status line (overwrites previous line, no spinner spam).
@@ -289,18 +307,35 @@ function Read-AnyKeyThemed {
 }
 
 function Read-HostThemed {
-    param([Parameter(Mandatory)][string]$Prompt)
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [string]$DefaultValue = ""
+    )
     $wasRunning = ($Global:OpStopwatch -and $Global:OpStopwatch.IsRunning)
     Suspend-ActiveTimer
     try {
         Write-Themed ($Prompt + ": ") -Kind Prompt -NoNewline
-        return Read-Host
+        if (-not [string]::IsNullOrWhiteSpace($DefaultValue)) {
+            Write-InlineColor ("[{0}]" -f $DefaultValue) -Color $Global:WinServerSetupColors['Default']
+            Write-Host " " -NoNewline
+        }
+        $value = Read-Host
+        if ([string]::IsNullOrWhiteSpace($value) -and -not [string]::IsNullOrWhiteSpace($DefaultValue)) {
+            return $DefaultValue
+        }
+        return $value
     } finally {
         if ($wasRunning) { Resume-ActiveTimer }
     }
 }
 
-function Read-HostUntimed { param([string]$Prompt) Read-HostThemed -Prompt $Prompt }
+function Read-HostUntimed {
+    param(
+        [string]$Prompt,
+        [string]$DefaultValue = ""
+    )
+    Read-HostThemed -Prompt $Prompt -DefaultValue $DefaultValue
+}
 
 function Pause-IfNeeded {
     if (-not $Global:NoPause) {
@@ -3152,38 +3187,38 @@ function Show-MainMenu {
         Write-Rule  -Width 36
         Write-Title " WinServerSetup Main Menu"
         Write-Rule  -Width 36
-        Write-Option -Number "1"  -Label "Run full setup"
-        Write-Option -Number "2"  -Label "Windows Update (multi-pass)"
-        Write-Option -Number "3"  -Label "Activation from config only"
-        Write-Option -Number "4"  -Label "Apply dark mode + taskbar"
-        Write-Option -Number "5"  -Label "Show file extensions"
-        Write-Option -Number "5b" -Label "Enable Windows long paths"
-        Write-Option -Number "6"  -Label "Add Persian keyboard layout"
-        Write-Option -Number "7"  -Label "Install applications (winget + direct + v2rayN + PS7 + WT)"
-        Write-Option -Number "8"  -Label "Install Brave extensions"
-        Write-Option -Number "9"  -Label "Configure default browser/player"
-        Write-Option -Number "9b" -Label "Set 7-Zip as default for compressed file extensions"
-        Write-Option -Number "10" -Label "Configure RDP port and firewall (safe)"
-        Write-Option -Number "11" -Label "Enable Search Indexing"
-        Write-Option -Number "12" -Label "Install .NET + Visual C++ runtimes (no ASP.NET)"
-        Write-Option -Number "13" -Label "Setup Empty Cache task"
-        Write-Option -Number "14" -Label "Configure Windows Update bandwidth / QoS"
-        Write-Option -Number "15" -Label "Install RDP brute-force blocker (hidden)"
-        Write-Option -Number "16" -Label "Disable startup apps (AzureArcSysTray, S9Proxy, etc)"
-        Write-Option -Number "17" -Label "Remove Feedback Hub / Appx packages"
-        Write-Option -Number "18" -Label "Remove Windows capabilities (AzureArcSetup, etc)"
-        Write-Option -Number "19" -Label "Replace Edge taskbar pin with Brave"
-        Write-Option -Number "20" -Label "Pin folders to Quick Access"
-        Write-Option -Number "21" -Label "Custom folders and Defender exclusions"
-        Write-Option -Number "22" -Label "Clean temp and cache"
-        Write-Option -Number "23" -Label "Health check"
-        Write-Option -Number "24" -Label "Final summary"
-        Write-Option -Number "25" -Label "Schedule post-reboot SFC"
-        Write-Option -Number "26" -Label "Reboot now (if pending)"
-        Write-Option -Number "0"  -Label "Back / Exit"
+        Write-Option -Number "1"  -Label "Run full setup"                                      -Color "Green"
+        Write-Option -Number "2"  -Label "Windows Update (multi-pass)"                         -Color "Cyan"
+        Write-Option -Number "3"  -Label "Activation from config only"                         -Color "Yellow"
+        Write-Option -Number "4"  -Label "Apply dark mode + taskbar"                           -Color "Magenta"
+        Write-Option -Number "5"  -Label "Show file extensions"                                -Color "Cyan"
+        Write-Option -Number "5b" -Label "Enable Windows long paths"                           -Color "Cyan"
+        Write-Option -Number "6"  -Label "Add Persian keyboard layout"                         -Color "Yellow"
+        Write-Option -Number "7"  -Label "Install applications (winget + direct + v2rayN + PS7 + WT)" -Color "Green"
+        Write-Option -Number "8"  -Label "Install Brave extensions"                            -Color "Magenta"
+        Write-Option -Number "9"  -Label "Configure default browser/player"                    -Color "Cyan"
+        Write-Option -Number "9b" -Label "Set 7-Zip as default for compressed file extensions" -Color "Yellow"
+        Write-Option -Number "10" -Label "Configure RDP port and firewall (safe)"              -Color "Red"
+        Write-Option -Number "11" -Label "Enable Search Indexing"                              -Color "Cyan"
+        Write-Option -Number "12" -Label "Install .NET + Visual C++ runtimes (no ASP.NET)"     -Color "Green"
+        Write-Option -Number "13" -Label "Setup Empty Cache task"                              -Color "Magenta"
+        Write-Option -Number "14" -Label "Configure Windows Update bandwidth / QoS"            -Color "Yellow"
+        Write-Option -Number "15" -Label "Install RDP brute-force blocker (hidden)"            -Color "Red"
+        Write-Option -Number "16" -Label "Disable startup apps (AzureArcSysTray, S9Proxy, etc)" -Color "Red"
+        Write-Option -Number "17" -Label "Remove Feedback Hub / Appx packages"                 -Color "Red"
+        Write-Option -Number "18" -Label "Remove Windows capabilities (AzureArcSetup, etc)"    -Color "Red"
+        Write-Option -Number "19" -Label "Replace Edge taskbar pin with Brave"                 -Color "Magenta"
+        Write-Option -Number "20" -Label "Pin folders to Quick Access"                         -Color "Cyan"
+        Write-Option -Number "21" -Label "Custom folders and Defender exclusions"              -Color "Yellow"
+        Write-Option -Number "22" -Label "Clean temp and cache"                                -Color "Magenta"
+        Write-Option -Number "23" -Label "Health check"                                        -Color "Green"
+        Write-Option -Number "24" -Label "Final summary"                                       -Color "White"
+        Write-Option -Number "25" -Label "Schedule post-reboot SFC"                            -Color "Yellow"
+        Write-Option -Number "26" -Label "Reboot now (if pending)"                             -Color "Red"
+        Write-Option -Number "0"  -Label "Back / Exit"                                         -Color "Gray"
         Write-Host ""
 
-        $choice = Read-HostUntimed "Select"
+        $choice = Read-HostUntimed -Prompt "Select" -DefaultValue "1"
         try {
             switch ($choice) {
                 "1"  { Invoke-FullSetupWithActiveTimer;                                                                          Pause-IfNeeded }

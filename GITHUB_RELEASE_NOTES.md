@@ -1,13 +1,18 @@
-# WinServerSetup v1.2.0
+# WinServerSetup Next Release Draft
 
-**Tag:** `v1.2.0`
+**Tag:** to be selected for the next release
 
 ## Summary
 
-WinServerSetup v1.2.0 adds Windows long paths enablement to the automated setup workflow, exposes the same action as a standalone menu option, and improves release/runtime diagnostics.
+This draft release improves launcher diagnostics, makes the interactive menu more readable on black terminals, adds an Enter-to-run-full-setup default, and documents the expanded RDP brute-force blocker behavior.
 
 ## Added
 
+- Stronger `Run-WinServerSetup.ps1` launcher diagnostics with a per-run UTC log file under `logs`.
+- Launcher logging for resolved paths, execution ID, user/host/runtime details, forwarded switches, elevation flow, child exit code, duration, and launcher stack details.
+- A brighter category-colored main menu with red security/destructive actions and additional green, cyan, yellow, and magenta grouping.
+- `Select: [1]` as the main-menu default, so pressing Enter runs the full setup workflow.
+- Static regression coverage for menu defaults, menu colors, and launcher diagnostics.
 - Windows long paths enablement through `LongPathsEnabled=1` under `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`.
 - Full setup now runs the Windows long paths step automatically.
 - Main menu now includes a standalone `Enable Windows long paths` option.
@@ -17,11 +22,13 @@ WinServerSetup v1.2.0 adds Windows long paths enablement to the automated setup 
 
 ## Changed
 
+- RDP brute-force blocker documentation now describes LogonType `3` and `10` detection and targeted username logging.
 - Documentation now lists Windows long paths as part of the system configuration workflow.
 - Winget source repair now avoids `source reset --force` when `msstore` is already absent and only `winget source update` fails.
 
 ## Fixed
 
+- Launcher failures are now easier to diagnose because the console remains open after elevation or child-process failures and the launcher log records the failure path.
 - Removed unsupported `winget list --output json` package detection to avoid wasted winget calls and noisy structured logs.
 
 ## Removed

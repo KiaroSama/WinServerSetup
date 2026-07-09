@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added stronger `Run-WinServerSetup.ps1` launcher diagnostics with a per-run UTC log file, resolved path details, forwarded switch logging, elevation flow logging, child exit-code logging, and stack details for launcher failures.
+- Added a brighter, category-colored main menu with red security/destructive actions, magenta cleanup/customization actions, and green/cyan/yellow workflow groups.
+- Added a default main-menu selection so pressing Enter at `Select: [1]` runs option `1`.
+- Added static regression coverage for menu defaults, menu colors, and launcher diagnostics.
+
+### Changed
+
+- Updated RDP brute-force blocker documentation to describe LogonType `3` and `10` detection and targeted username logging.
+
+### Fixed
+
+- Fixed launcher failure visibility by keeping the launcher console open after elevation or child-process failures.
+
 ## [1.2.0] - 2026-05-28
 
 ### Added

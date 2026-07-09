@@ -10,7 +10,7 @@ GitHub: https://github.com/KiaroSama
 ## Features
 
 - First-run self-relocation to `C:\portable\Scripts\WinServerSetup`.
-- Menu-driven and full unattended setup modes.
+- Color-coded menu-driven and full unattended setup modes. Pressing Enter at `Select: [1]` runs the full setup by default.
 - Multi-pass Windows Update with Microsoft Update support and reboot suppression.
 - Application download prefetch while Windows Update is running.
 - Sequential application installation so only one installer runs at a time.
@@ -22,7 +22,7 @@ GitHub: https://github.com/KiaroSama
 - 7-Zip archive file associations for the current user.
 - Quick Access pinning for configured folders and Recycle Bin.
 - Startup cleanup and optional removal of configured Windows components.
-- Structured UTF-8 logs and concise colored console output.
+- Structured UTF-8 logs, per-run launcher diagnostics, and concise colorful console output.
 
 ## Supported Platforms
 
@@ -63,6 +63,8 @@ Interactive menu:
 ```powershell
 .\Run-WinServerSetup.ps1
 ```
+
+The main menu shows the default action as `Select: [1]`. Press Enter without typing a value to run option `1`, the full setup workflow.
 
 Full setup:
 
@@ -200,11 +202,14 @@ Logs are written under the resolved project `logs` directory:
 
 | Log file | Purpose |
 | --- | --- |
+| `Run-WinServerSetup_<timestamp>_UTC.log` | Launcher diagnostics, elevation flow, resolved paths, forwarded switches, child process exit code, and launcher failures. |
 | `WinServerSetup-<timestamp>.log` | Console transcript. |
 | `WinServerSetup-structured-<timestamp>.log` | Structured task, command, output, warning, and summary log. |
 | `WinServerSetup-prefetch-<timestamp>.log` | Background app prefetch log. |
 | `rdp-blocker.log` | RDP brute-force blocker log. |
 | `sfc-result.log` | Post-reboot SFC result log. |
+
+The launcher log is created before elevation, relative to the launcher directory, so double-click and UAC failures still leave a diagnostic file. The launcher keeps the console open after elevation or child-process failures so the red error text can be read before closing the window.
 
 The running script version is printed to the console transcript and written in the structured log header.
 
@@ -239,13 +244,17 @@ The Persian keyboard layout is appended to the current user's language list. Exi
 
 Default app association XML imports through DISM apply to new user profiles. Current-user defaults are also attempted where the project has safe per-user logic, but Windows may still require manual selection in Settings for protected defaults.
 
-The RDP brute-force blocker scans failed RemoteInteractive logons and blocks sources that meet the configured threshold. The default threshold is `7`, which means more than 6 failed attempts in the lookback window.
+The RDP brute-force blocker scans failed network and RemoteInteractive logons (`LogonType` 3 and 10) and blocks sources that meet the configured threshold. The default threshold is `7`, which means more than 6 failed attempts in the lookback window. Block messages include IP address, fail count, logon type(s), and targeted username(s).
 
 ## Troubleshooting
 
 ### The script says it must run as Administrator
 
 Run `Run-WinServerSetup.ps1` by right-clicking it and choosing **Run with PowerShell**, or start PowerShell as Administrator and run the script manually.
+
+### The launcher closes after a red error
+
+The launcher now writes `logs\Run-WinServerSetup_<timestamp>_UTC.log` and keeps the console open after elevation or child-process failures. Review the newest launcher log for the resolved script path, elevation status, forwarded switches, exit code, and stack details.
 
 ### Winget fails with an `msstore` certificate error
 
