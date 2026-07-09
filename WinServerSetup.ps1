@@ -64,14 +64,14 @@ $Global:WinServerSetupColors = @{
     Warning    = 'Yellow'
     Info       = 'Cyan'
     Prompt     = 'Yellow'
-    Title      = 'Cyan'
-    TitleRule  = 'DarkCyan'
-    Section    = 'Magenta'
-    Option     = ''
-    OptionNum  = 'Cyan'
-    Status     = 'DarkCyan'
-    Summary    = 'Magenta'
-    SummaryDim = 'DarkGray'
+    Title      = 'White'
+    TitleRule  = 'Cyan'
+    Section    = 'Yellow'
+    Option     = 'White'
+    OptionNum  = 'Green'
+    Status     = 'Cyan'
+    Summary    = 'White'
+    SummaryDim = 'Gray'
 }
 
 function Test-ColorSupported {

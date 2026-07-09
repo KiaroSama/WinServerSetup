@@ -115,8 +115,20 @@ Desktop.ini
 *.lnk
 
 # Local tool state
+.ai/
+.agents/
 .claude/
 .codex/
+.cursor/
+.kiro/
+.cline/
+AGENTS.md
+CLAUDE.md
+explain-AI.md
+reference.md
+.ignoreme
+**/.ignoreme
+graphify-out/
 
 # Language/tool-specific folders
 node_modules/

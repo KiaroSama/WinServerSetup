@@ -81,6 +81,20 @@ function Test-IsWhitelisted {
     return $false
 }
 
+function Format-RdpOffenderSummary {
+    param(
+        [Parameter(Mandatory)][object]$Offender
+    )
+
+    $logonTypes = @($Offender.LogonTypes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object { [int]$_ } -Unique)
+    $targetUsers = @($Offender.TargetUserNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+
+    $logonTypesText = if ($logonTypes.Count -gt 0) { $logonTypes -join "," } else { "unknown" }
+    $targetUsersText = if ($targetUsers.Count -gt 0) { $targetUsers -join "," } else { "unknown" }
+
+    return "{0} failed login attempts; logon types: {1}; targeted users: {2}" -f $Offender.Count, $logonTypesText, $targetUsersText
+}
+
 function Get-FailedLogonSourceIPs {
     param(
         [int]$LookbackMinutes,
@@ -89,7 +103,7 @@ function Get-FailedLogonSourceIPs {
 
     $startTime = (Get-Date).AddMinutes(-1 * $LookbackMinutes)
     $events = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4625; StartTime = $startTime } -ErrorAction SilentlyContinue
-    $ips = New-Object System.Collections.Generic.List[string]
+    $failedLogons = New-Object System.Collections.Generic.List[object]
 
     foreach ($evt in $events) {
         try {
@@ -101,21 +115,43 @@ function Get-FailedLogonSourceIPs {
 
             $ip = $data['IpAddress']
             $logonType = $data['LogonType']
+            $targetUserName = $data['TargetUserName']
 
             if ([string]::IsNullOrWhiteSpace($ip)) { continue }
             if ($ip -eq '-' -or $ip -eq '::1' -or $ip -eq '127.0.0.1') { continue }
             if ($ip -notmatch '^(\d{1,3}\.){3}\d{1,3}$') { continue }
 
-            # LogonType 10 is RemoteInteractive (RDP). Network logons are intentionally ignored.
-            if ($logonType -ne '10') { continue }
+            # LogonType 3 is Network, and LogonType 10 is RemoteInteractive (RDP).
+            if (@('3', '10') -notcontains [string]$logonType) { continue }
 
-            $ips.Add($ip)
+            if ([string]::IsNullOrWhiteSpace($targetUserName) -or $targetUserName -eq '-') {
+                $targetUserName = "unknown"
+            }
+
+            $failedLogons.Add([pscustomobject]@{
+                IpAddress = $ip
+                LogonType = [string]$logonType
+                TargetUserName = [string]$targetUserName
+            })
         } catch {
             Write-LogLine "Could not parse failed-logon event: $($_.Exception.Message)" "WARN"
         }
     }
 
-    return $ips | Group-Object | Where-Object { $_.Count -ge $Threshold } | Sort-Object Count -Descending
+    return $failedLogons |
+        Group-Object -Property IpAddress |
+        Where-Object { $_.Count -ge $Threshold } |
+        ForEach-Object {
+            $groupEvents = @($_.Group)
+            [pscustomobject]@{
+                Name = $_.Name
+                IpAddress = $_.Name
+                Count = $_.Count
+                LogonTypes = @($groupEvents | ForEach-Object { $_.LogonType } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+                TargetUserNames = @($groupEvents | ForEach-Object { $_.TargetUserName } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+            }
+        } |
+        Sort-Object Count -Descending
 }
 
 function Get-CurrentRdpClientIPs {
@@ -140,13 +176,21 @@ function Block-IpAddress {
     param(
         [Parameter(Mandatory)][string]$IpAddress,
         [Parameter(Mandatory)][string]$RulePrefix,
-        [Parameter(Mandatory)][int]$Count
+        [Parameter(Mandatory)][int]$Count,
+        [string[]]$LogonTypes = @(),
+        [string[]]$TargetUserNames = @()
     )
 
     $displayName = "$RulePrefix $IpAddress"
     $existing = Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue
+    $offenderSummary = Format-RdpOffenderSummary ([pscustomobject]@{
+        Count = $Count
+        LogonTypes = @($LogonTypes)
+        TargetUserNames = @($TargetUserNames)
+    })
+
     if ($existing) {
-        Write-LogLine "Already blocked: $IpAddress ($Count failed attempts in current window)."
+        Write-LogLine "Already blocked: $IpAddress ($offenderSummary)."
         return
     }
 
@@ -158,7 +202,7 @@ function Block-IpAddress {
         -Profile Any `
         -Enabled True | Out-Null
 
-    Write-LogLine "Blocked $IpAddress after $Count failed login attempts."
+    Write-LogLine "Blocked $IpAddress after $offenderSummary."
 }
 
 try {
@@ -195,15 +239,16 @@ try {
 
     foreach ($offender in $offenders) {
         $ip = $offender.Name
+        $offenderSummary = Format-RdpOffenderSummary $offender
         if ($currentRdpClients -contains $ip) {
-            Write-LogLine "Skipped active RDP client IP: $ip"
+            Write-LogLine "Skipped active RDP client IP: $ip ($offenderSummary)"
             continue
         }
         if (Test-IsWhitelisted -IpAddress $ip -WhitelistCIDRs $whitelist) {
-            Write-LogLine "Skipped whitelisted IP: $ip"
+            Write-LogLine "Skipped whitelisted IP: $ip ($offenderSummary)"
             continue
         }
-        Block-IpAddress -IpAddress $ip -RulePrefix $rulePrefix -Count $offender.Count
+        Block-IpAddress -IpAddress $ip -RulePrefix $rulePrefix -Count $offender.Count -LogonTypes $offender.LogonTypes -TargetUserNames $offender.TargetUserNames
     }
 
     if (-not $offenders) {
