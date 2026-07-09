@@ -14,10 +14,12 @@
 - Updated RDP brute-force blocker documentation to describe LogonType `3` and `10` detection and targeted username logging.
 - Changed `Run-WinServerSetup.ps1` to prefer PowerShell 7 (`pwsh.exe`) and fall back to Windows PowerShell 5 only when PowerShell 7 is unavailable.
 - Changed elevated launcher relaunches to prefer Windows Terminal `wt.exe -w 0 new-tab` when available, with direct PowerShell elevation as the fallback.
+- Changed self-relocation relaunches to prefer PowerShell 7 instead of hard-coded Windows PowerShell 5.
 
 ### Fixed
 
 - Fixed launcher failure visibility by keeping the launcher console open after elevation or child-process failures.
+- Fixed Windows PowerShell 5.1 transcript startup warnings by avoiding the unsupported `Start-Transcript -Encoding` parameter.
 
 ## [1.2.0] - 2026-05-28
 

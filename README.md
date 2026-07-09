@@ -66,7 +66,7 @@ Interactive menu:
 
 The main menu shows the default action as `Select: [1]`. Press Enter without typing a value to run option `1`, the full setup workflow.
 
-The launcher prefers PowerShell 7 (`pwsh.exe`) when available, falls back to Windows PowerShell 5 only when needed, and prefers opening elevated runs through Windows Terminal as a tab in the most recent Terminal window.
+The launcher and self-relocation relaunch prefer PowerShell 7 (`pwsh.exe`) when available, fall back to Windows PowerShell 5 only when needed, and prefer opening elevated launcher runs through Windows Terminal as a tab in the most recent Terminal window.
 
 Full setup:
 

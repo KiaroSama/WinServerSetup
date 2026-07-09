@@ -481,7 +481,7 @@ function Initialize-Environment {
     if (-not $Global:TranscriptStarted) {
         $Global:LogFile = Join-Path $logRoot ("WinServerSetup-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
         try {
-            Start-Transcript -Path $Global:LogFile -Append -Encoding utf8 -Force | Out-Null
+            Start-Transcript -Path $Global:LogFile -Append -Force | Out-Null
             $Global:TranscriptStarted = $true
             Write-Info "WinServerSetup version: $Global:ScriptVersion"
             Write-Info "Console transcript:  $Global:LogFile"
@@ -495,6 +495,57 @@ function Initialize-Environment {
 function Test-CommandExists {
     param([Parameter(Mandatory)][string]$Command)
     return [bool](Get-Command $Command -ErrorAction SilentlyContinue)
+}
+
+function Get-PreferredPowerShellForRelaunch {
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $pwshFromPath = Get-Command "pwsh.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($pwshFromPath -and $pwshFromPath.Source) {
+            $candidates.Add($pwshFromPath.Source) | Out-Null
+        }
+    } catch {
+        Write-StructuredLog -Level DEBUG -Message ("Could not resolve pwsh.exe from PATH: {0}" -f $_.Exception.Message)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $candidates.Add((Join-Path $env:ProgramFiles "PowerShell\7\pwsh.exe")) | Out-Null
+        $powerShellRoot = Join-Path $env:ProgramFiles "PowerShell"
+        if (Test-Path -LiteralPath $powerShellRoot) {
+            $installedPwsh = Get-ChildItem -LiteralPath $powerShellRoot -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName "pwsh.exe" }
+            foreach ($candidate in $installedPwsh) {
+                $candidates.Add($candidate) | Out-Null
+            }
+        }
+    }
+
+    if (($env:ProgramW6432) -and ($env:ProgramW6432 -ne $env:ProgramFiles)) {
+        $candidates.Add((Join-Path $env:ProgramW6432 "PowerShell\7\pwsh.exe")) | Out-Null
+    }
+
+    try {
+        $currentProcessPath = (Get-Process -Id $PID -ErrorAction Stop).Path
+        if ($currentProcessPath) {
+            $candidates.Add($currentProcessPath) | Out-Null
+        }
+    } catch {
+        Write-StructuredLog -Level DEBUG -Message ("Could not resolve current PowerShell process path: {0}" -f $_.Exception.Message)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:WINDIR)) {
+        $candidates.Add((Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe")) | Out-Null
+    }
+
+    foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $candidate) {
+            return (Get-Item -LiteralPath $candidate).FullName
+        }
+    }
+
+    return "powershell.exe"
 }
 
 # =============================================================================
@@ -590,7 +641,9 @@ function Invoke-SelfRelocateIfNeeded {
     if ($Global:NoReboot){ $childArgs += "-NoReboot" }
 
     Write-Info ("Relaunching from new location: {0}" -f $newScript)
-    $relocatedProcess = Start-Process powershell.exe -ArgumentList $childArgs -PassThru
+    $relaunchPowerShellExe = Get-PreferredPowerShellForRelaunch
+    Write-Info ("Relaunch PowerShell host: {0}" -f $relaunchPowerShellExe)
+    $relocatedProcess = Start-Process $relaunchPowerShellExe -ArgumentList $childArgs -PassThru
     Write-Info ("Relocated setup process started. PID={0}; relocation log={1}" -f $relocatedProcess.Id, $relocateLog)
     try {
         $cleanupScript = Join-Path $env:TEMP ("WinServerSetup-clean-source-{0}.ps1" -f ([guid]::NewGuid().ToString("N")))

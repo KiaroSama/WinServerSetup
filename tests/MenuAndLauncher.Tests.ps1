@@ -100,4 +100,18 @@ Assert-Contains `
     -Pattern 'Press Enter to close this launcher' `
     -Message "Launcher must keep the window open after elevation or child-process failures."
 
+Assert-Contains `
+    -Text $main `
+    -Pattern 'function\s+Get-PreferredPowerShellForRelaunch' `
+    -Message "Main script must resolve a preferred PowerShell executable before self-relocation relaunches."
+
+Assert-Contains `
+    -Text $main `
+    -Pattern 'Start-Process\s+\$relaunchPowerShellExe\s+-ArgumentList\s+\$childArgs' `
+    -Message "Self-relocation relaunch must use the preferred PowerShell executable instead of hard-coded powershell.exe."
+
+Assert-True `
+    -Condition ($main -notmatch 'Start-Transcript[^\r\n]*-Encoding') `
+    -Message "Start-Transcript must not use -Encoding because Windows PowerShell 5.1 does not support that parameter."
+
 Write-Host "PASS menu default, unified bright menu color, PowerShell 7 priority, Windows Terminal priority, and launcher diagnostics are present."

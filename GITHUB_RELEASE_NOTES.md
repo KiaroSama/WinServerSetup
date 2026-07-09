@@ -25,12 +25,14 @@ This draft release improves launcher diagnostics, makes the interactive menu mor
 - RDP brute-force blocker documentation now describes LogonType `3` and `10` detection and targeted username logging.
 - `Run-WinServerSetup.ps1` now prefers PowerShell 7 (`pwsh.exe`) and falls back to Windows PowerShell 5 only when PowerShell 7 is unavailable.
 - Elevated launcher relaunches now prefer Windows Terminal `wt.exe -w 0 new-tab`, with direct PowerShell elevation as the fallback.
+- Self-relocation relaunches now prefer PowerShell 7 instead of hard-coded Windows PowerShell 5.
 - Documentation now lists Windows long paths as part of the system configuration workflow.
 - Winget source repair now avoids `source reset --force` when `msstore` is already absent and only `winget source update` fails.
 
 ## Fixed
 
 - Launcher failures are now easier to diagnose because the console remains open after elevation or child-process failures and the launcher log records the failure path.
+- Windows PowerShell 5.1 no longer prints a transcript warning for the unsupported `Start-Transcript -Encoding` parameter.
 - Removed unsupported `winget list --output json` package detection to avoid wasted winget calls and noisy structured logs.
 
 ## Removed
