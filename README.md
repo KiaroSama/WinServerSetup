@@ -66,7 +66,7 @@ Interactive menu:
 
 The main menu shows the default action as `Select: [1]`. Press Enter without typing a value to run option `1`, the full setup workflow.
 
-The launcher and self-relocation relaunch prefer PowerShell 7 (`pwsh.exe`) when available, fall back to Windows PowerShell 5 only when needed, and prefer opening elevated launcher runs through Windows Terminal as a tab in the most recent Terminal window.
+The launcher treats Windows Terminal as the first-priority console host whenever it is available, then selects PowerShell 7 (`pwsh.exe`) as the shell and falls back to Windows PowerShell 5 only when needed. Runs started outside Windows Terminal are moved into a tab in the most recent Terminal window, including already-elevated ConsoleHost sessions. An already-elevated Windows Terminal session stays in its current tab, and first-run self-relocation keeps the selected PowerShell process in that same Terminal console.
 
 Full setup:
 
@@ -198,13 +198,13 @@ Important sections:
 
 ## Logs and Output
 
-The script separates concise console output from detailed diagnostics.
+The script separates concise console output from detailed diagnostics. Startup and self-relocation output uses aligned semantic states such as `[COPY]`, `[RUN]`, `[SHELL]`, `[LOG]`, `[CLEAN]`, `[NEXT]`, `[SKIP]`, and `[VERSION]`. State tags, neutral labels, paths, values, success, warnings, and errors use distinct bright semantic colors selected for dark-terminal readability; the text labels remain intact when `-NoColor` or `NO_COLOR` disables color.
 
 Logs are written under the resolved project `logs` directory:
 
 | Log file | Purpose |
 | --- | --- |
-| `Run-WinServerSetup_<timestamp>_UTC.log` | Launcher diagnostics, elevation flow, resolved paths, selected PowerShell host, Windows Terminal detection, forwarded switches, launch exit code, and launcher failures. |
+| `Run-WinServerSetup_<timestamp>_UTC.log` | Launcher diagnostics, elevation flow, resolved paths, selected PowerShell host, Windows Terminal session detection, selected launcher route, forwarded switches, launch exit code, and launcher failures. |
 | `WinServerSetup-<timestamp>.log` | Console transcript. |
 | `WinServerSetup-structured-<timestamp>.log` | Structured task, command, output, warning, and summary log. |
 | `WinServerSetup-prefetch-<timestamp>.log` | Background app prefetch log. |

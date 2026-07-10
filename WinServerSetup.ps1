@@ -58,6 +58,8 @@ $Global:RunStats = [pscustomobject]@{
 # by any of: -NoColor switch, $env:NO_COLOR, $env:WINSERVERSETUP_NOCOLOR.
 # We use Write-Host -ForegroundColor (ConsoleColor) so transcripts stay clean.
 
+# Semantic ConsoleColor tokens. Keep state text visible without color and use
+# the PowerShell 5-compatible bright palette instead of ANSI-only RGB values.
 $Global:WinServerSetupColors = @{
     Success    = 'Green'
     Error      = 'Red'
@@ -73,6 +75,10 @@ $Global:WinServerSetupColors = @{
     Status     = 'Cyan'
     Summary    = 'White'
     SummaryDim = 'Gray'
+    Action     = 'Magenta'
+    Label      = 'Gray'
+    Value      = 'Yellow'
+    Path       = 'Cyan'
 }
 
 function Test-ColorSupported {
@@ -90,7 +96,7 @@ function Set-ColorEnabled {
 function Write-Themed {
     param(
         [Parameter(Mandatory, Position=0)][AllowEmptyString()][string]$Message,
-        [ValidateSet('Success','Error','Warning','Info','Prompt','Title','TitleRule','Section','Option','OptionNum','Status','Summary','SummaryDim','Plain')]
+        [ValidateSet('Success','Error','Warning','Info','Prompt','Title','TitleRule','Section','Option','OptionNum','Status','Summary','SummaryDim','Action','Label','Value','Path','Plain')]
         [string]$Kind = 'Plain',
         [switch]$NoNewline
     )
@@ -131,12 +137,63 @@ function Write-InlineColor {
 }
 
 # Semantic console helpers (also forward to the structured log when active).
-function Write-Info    { param([string]$Message) Write-Themed "[INFO]  $Message" -Kind Info;    Write-StructuredLog -Level INFO    -Message $Message }
-function Write-Ok      { param([string]$Message) Write-Themed "[OK]    $Message" -Kind Success; Write-StructuredLog -Level OK      -Message $Message }
-function Write-Warn    { param([string]$Message) Write-Themed "[WARN]  $Message" -Kind Warning; Write-StructuredLog -Level WARN    -Message $Message; $null = $Global:RunStats.Warnings.Add($Message) }
-function Write-Fail    { param([string]$Message) Write-Themed "[ERROR] $Message" -Kind Error;   Write-StructuredLog -Level ERROR   -Message $Message }
+function Write-Info {
+    param([string]$Message)
+    Write-Themed ((("[INFO]").PadRight(10)) + $Message) -Kind Info
+    Write-StructuredLog -Level INFO -Message $Message
+}
+function Write-Ok {
+    param([string]$Message)
+    Write-Themed ((("[OK]").PadRight(10)) + $Message) -Kind Success
+    Write-StructuredLog -Level OK -Message $Message
+}
+function Write-Warn {
+    param([string]$Message)
+    Write-Themed ((("[WARN]").PadRight(10)) + $Message) -Kind Warning
+    Write-StructuredLog -Level WARN -Message $Message
+    $null = $Global:RunStats.Warnings.Add($Message)
+}
+function Write-Fail {
+    param([string]$Message)
+    Write-Themed ((("[ERROR]").PadRight(10)) + $Message) -Kind Error
+    Write-StructuredLog -Level ERROR -Message $Message
+}
 function Write-Status  { param([string]$Message) Write-Themed $Message -Kind Status;            Write-StructuredLog -Level STATUS  -Message $Message }
 function Write-Summary { param([string]$Message) Write-Themed $Message -Kind Summary;           Write-StructuredLog -Level SUMMARY -Message $Message }
+
+function Write-StateLine {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('COPY','RUN','SHELL','LOG','CLEAN','NEXT','SKIP','VERSION')]
+        [string]$State,
+        [Parameter(Mandatory)][string]$Label,
+        [AllowEmptyString()][string]$Value = '',
+        [ValidateSet('Summary','SummaryDim','Path','Value','Success','Warning','Error')]
+        [string]$ValueKind = 'Summary'
+    )
+
+    $stateKind = switch ($State) {
+        'COPY'    { 'Action' }
+        'RUN'     { 'Action' }
+        'CLEAN'   { 'Action' }
+        'SHELL'   { 'Prompt' }
+        'NEXT'    { 'Prompt' }
+        'VERSION' { 'Prompt' }
+        'LOG'     { 'Info' }
+        'SKIP'    { 'SummaryDim' }
+    }
+
+    Write-Themed (("[{0}]" -f $State).PadRight(10)) -Kind $stateKind -NoNewline
+    if ([string]::IsNullOrEmpty($Value)) {
+        Write-Themed $Label -Kind Summary
+        $plainMessage = $Label
+    } else {
+        Write-Themed ($Label + ': ') -Kind Label -NoNewline
+        Write-Themed $Value -Kind $ValueKind
+        $plainMessage = "{0}: {1}" -f $Label, $Value
+    }
+    Write-StructuredLog -Level $State -Message $plainMessage
+}
 
 function Write-Section {
     param([Parameter(Mandatory)][string]$Title)
@@ -483,9 +540,9 @@ function Initialize-Environment {
         try {
             Start-Transcript -Path $Global:LogFile -Append -Force | Out-Null
             $Global:TranscriptStarted = $true
-            Write-Info "WinServerSetup version: $Global:ScriptVersion"
-            Write-Info "Console transcript:  $Global:LogFile"
-            Write-Info "Structured log file: $Global:StructuredLog"
+            Write-StateLine -State "VERSION" -Label "WinServerSetup" -Value $Global:ScriptVersion -ValueKind "Value"
+            Write-StateLine -State "LOG" -Label "Console transcript" -Value $Global:LogFile -ValueKind "Path"
+            Write-StateLine -State "LOG" -Label "Structured log" -Value $Global:StructuredLog -ValueKind "Path"
         } catch {
             Write-Warn "Could not start transcript: $($_.Exception.Message)"
         }
@@ -584,13 +641,25 @@ function Test-WindowsRebootRequired {
 # run. Uses robocopy to preserve everything, then re-launches at the new path
 # and exits the current process cleanly.
 
+function Add-RelocationLog {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Level,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    Add-Content -LiteralPath $Path -Encoding utf8 -Value (
+        "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    )
+}
+
 function Invoke-SelfRelocateIfNeeded {
     if ($Global:NoRelocate) {
-        Write-Info "Self-relocate skipped: -NoRelocate switch is set."
+        Write-StateLine -State "SKIP" -Label "Self-relocate" -Value "-NoRelocate switch is set" -ValueKind "Summary"
         return $false
     }
     if (-not $Global:Config.selfRelocate -or -not $Global:Config.selfRelocate.enabled) {
-        Write-Info "Self-relocate skipped: disabled in config."
+        Write-StateLine -State "SKIP" -Label "Self-relocate" -Value "Disabled in config" -ValueKind "Summary"
         return $false
     }
 
@@ -601,7 +670,7 @@ function Invoke-SelfRelocateIfNeeded {
     $targetFull  = $target.TrimEnd('\')
 
     if ([string]::Equals($currentFull, $targetFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Write-Info "Project is already running from target location: $target"
+        Write-StateLine -State "SKIP" -Label "Already running from target" -Value $target -ValueKind "Path"
         return $false
     }
 
@@ -614,7 +683,8 @@ function Invoke-SelfRelocateIfNeeded {
     # Copy with robocopy, then schedule removal of the original source after the
     # relaunched target process starts. /E updates/merges without deleting
     # unexpected destination files.
-    Write-Info "Copying files from '$currentFull' to '$targetFull' ..."
+    Write-StateLine -State "COPY" -Label "Source" -Value $currentFull -ValueKind "Path"
+    Write-StateLine -State "COPY" -Label "Target" -Value $targetFull -ValueKind "Value"
     $robocopyLog = Join-Path $env:TEMP "WinServerSetup-relocate.log"
     $proc = Start-Process robocopy.exe `
         -ArgumentList @("`"$currentFull`"", "`"$targetFull`"", "/E", "/COPY:DAT", "/R:1", "/W:2", "/NFL", "/NDL", "/NJH", "/NJS", "/NC", "/NS", "/LOG:`"$robocopyLog`"") `
@@ -631,6 +701,7 @@ function Invoke-SelfRelocateIfNeeded {
         ("[{0}] [INFO] robocopy exit code: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $proc.ExitCode),
         ("[{0}] [INFO] robocopy log: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $robocopyLog)
     ) | Set-Content -LiteralPath $relocateLog -Encoding utf8
+    Add-RelocationLog -Path $relocateLog -Level "OK" -Message ("Project files copied. robocopy exit code {0}." -f $proc.ExitCode)
 
     # Relaunch from the new location and exit this process.
     $newScript = Join-Path $targetFull "WinServerSetup.ps1"
@@ -640,11 +711,15 @@ function Invoke-SelfRelocateIfNeeded {
     if ($Global:NoColor) { $childArgs += "-NoColor" }
     if ($Global:NoReboot){ $childArgs += "-NoReboot" }
 
-    Write-Info ("Relaunching from new location: {0}" -f $newScript)
+    Write-StateLine -State "RUN" -Label "Relaunch script" -Value $newScript -ValueKind "Path"
+    Add-RelocationLog -Path $relocateLog -Level "RUN" -Message ("Relaunch script: {0}" -f $newScript)
     $relaunchPowerShellExe = Get-PreferredPowerShellForRelaunch
-    Write-Info ("Relaunch PowerShell host: {0}" -f $relaunchPowerShellExe)
-    $relocatedProcess = Start-Process $relaunchPowerShellExe -ArgumentList $childArgs -PassThru
-    Write-Info ("Relocated setup process started. PID={0}; relocation log={1}" -f $relocatedProcess.Id, $relocateLog)
+    Write-StateLine -State "SHELL" -Label "PowerShell host" -Value $relaunchPowerShellExe -ValueKind "Value"
+    Add-RelocationLog -Path $relocateLog -Level "SHELL" -Message ("PowerShell host: {0}" -f $relaunchPowerShellExe)
+    $relocatedProcess = Start-Process $relaunchPowerShellExe -ArgumentList $childArgs -NoNewWindow -PassThru
+    Write-StateLine -State "RUN" -Label "Relocated setup PID" -Value ([string]$relocatedProcess.Id) -ValueKind "Value"
+    Add-RelocationLog -Path $relocateLog -Level "RUN" -Message ("Relocated setup PID: {0}" -f $relocatedProcess.Id)
+    Write-StateLine -State "LOG" -Label "Relocation log" -Value $relocateLog -ValueKind "Path"
     try {
         $cleanupScript = Join-Path $env:TEMP ("WinServerSetup-clean-source-{0}.ps1" -f ([guid]::NewGuid().ToString("N")))
         $parentPid = $PID
@@ -675,11 +750,16 @@ try { Remove-Item -LiteralPath `$MyInvocation.MyCommand.Path -Force -ErrorAction
             "-SourcePath", "`"$currentFull`"", "-TargetPath", "`"$targetFull`"",
             "-ParentProcessId", "$parentPid", "-RelocateLog", "`"$relocateLog`""
         )
-        Write-Info "Original source folder cleanup scheduled after this process exits."
+        Write-StateLine -State "CLEAN" -Label "Original source cleanup scheduled after this process exits."
+        Add-RelocationLog -Path $relocateLog -Level "CLEAN" -Message "Original source cleanup scheduled after this process exits."
     } catch {
         Write-Warn "Could not schedule source cleanup after relocation: $($_.Exception.Message)"
+        Add-RelocationLog -Path $relocateLog -Level "WARN" -Message ("Could not schedule source cleanup after relocation: {0}" -f $_.Exception.Message)
     }
-    Write-Info "Original script will now exit. Future runs should use the new location."
+    Write-StateLine -State "CLEAN" -Label "Original setup process will now exit."
+    Add-RelocationLog -Path $relocateLog -Level "CLEAN" -Message "Original setup process will now exit."
+    Write-StateLine -State "NEXT" -Label "Future runs" -Value $targetFull -ValueKind "Path"
+    Add-RelocationLog -Path $relocateLog -Level "NEXT" -Message ("Future runs: {0}" -f $targetFull)
     return $true
 }
 

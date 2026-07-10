@@ -1,7 +1,7 @@
 # Run-WinServerSetup.ps1
 # Launcher: right-click "Run with PowerShell" or run from any PowerShell window.
-# Auto-elevates if not already running as Administrator. Forwards all switches
-# to WinServerSetup.ps1 so callers can do e.g. `Run-WinServerSetup.ps1 -Full -NoPause`.
+# Prefers Windows Terminal as the console host, PowerShell 7 as the shell, and
+# Windows PowerShell 5 only as a fallback. Auto-elevates and forwards all switches.
 
 [CmdletBinding()]
 param(
@@ -106,6 +106,28 @@ function Test-IsElevated {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-IsWindowsTerminalSession {
+    return -not [string]::IsNullOrWhiteSpace($env:WT_SESSION)
+}
+
+function Get-LauncherRoute {
+    param(
+        [Parameter(Mandatory)][bool]$WindowsTerminalAvailable,
+        [Parameter(Mandatory)][bool]$IsWindowsTerminalSession,
+        [Parameter(Mandatory)][bool]$IsElevated
+    )
+
+    if ($WindowsTerminalAvailable -and ((-not $IsWindowsTerminalSession) -or (-not $IsElevated))) {
+        return "WindowsTerminal"
+    }
+
+    if ($IsElevated) {
+        return "CurrentConsole"
+    }
+
+    return "ElevatedPowerShell"
 }
 
 function Get-PreferredPowerShellExe {
@@ -255,10 +277,16 @@ try {
     Write-LauncherLog -Level "INFO" -Message ("childArgs={0}" -f (Get-SafeProcessArgumentSummary -Arguments $childArgs))
 
     $isElevated = Test-IsElevated
+    $isWindowsTerminalSession = Test-IsWindowsTerminalSession
+    $launcherRoute = Get-LauncherRoute `
+        -WindowsTerminalAvailable ($null -ne $windowsTerminalExe) `
+        -IsWindowsTerminalSession $isWindowsTerminalSession `
+        -IsElevated $isElevated
     Write-LauncherLog -Level "INFO" -Message ("isElevated={0}" -f $isElevated)
+    Write-LauncherLog -Level "INFO" -Message ("isWindowsTerminalSession={0} launcherRoute={1}" -f $isWindowsTerminalSession, $launcherRoute)
 
-    if ($isElevated) {
-        Write-LauncherLog -Level "INFO" -Message "Already elevated; running WinServerSetup in the current console."
+    if ($launcherRoute -eq "CurrentConsole") {
+        Write-LauncherLog -Level "INFO" -Message "Using the current elevated Windows Terminal session, or the current console because Windows Terminal is unavailable."
         try {
             Push-Location -LiteralPath $scriptRoot
             & $powerShellExe @childArgs
@@ -304,13 +332,13 @@ try {
 "@
     $elevatedArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $wrapperCommand)
     $elevatedArgumentLine = ($elevatedArgs | ForEach-Object { Join-CommandLineArgument -Value $_ }) -join " "
-    Write-LauncherLog -Level "INFO" -Message "Not elevated; starting elevated child through UAC."
+    Write-LauncherLog -Level "INFO" -Message ("Starting selected child route. launcherRoute={0} elevationRequired={1}" -f $launcherRoute, (-not $isElevated))
     Write-LauncherLog -Level "DEBUG" -Message ("elevatedArgumentLine={0}" -f $elevatedArgumentLine)
 
-    if ($windowsTerminalExe) {
+    if ($launcherRoute -eq "WindowsTerminal") {
         $terminalArgs = @("-w", "0", "new-tab", "--title", "Administrator: WinServerSetup", "--suppressApplicationTitle", "--startingDirectory", $scriptRoot, $powerShellExe) + $elevatedArgs
         $terminalArgumentLine = ($terminalArgs | ForEach-Object { Join-CommandLineArgument -Value $_ }) -join " "
-        Write-LauncherLog -Level "INFO" -Message "Windows Terminal is available; starting elevated child in a Terminal tab."
+        Write-LauncherLog -Level "INFO" -Message "Windows Terminal has first priority; starting the selected PowerShell host in an elevated Terminal tab."
         Write-LauncherLog -Level "DEBUG" -Message ("terminalArgumentLine={0}" -f $terminalArgumentLine)
 
         try {

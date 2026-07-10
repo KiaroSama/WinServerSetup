@@ -7,19 +7,22 @@
 - Added stronger `Run-WinServerSetup.ps1` launcher diagnostics with a per-run UTC log file, resolved path details, forwarded switch logging, elevation flow logging, child exit-code logging, and stack details for launcher failures.
 - Added a brighter, unified main menu style that keeps option numbers green and option labels cyan for a consistent black-terminal layout.
 - Added a default main-menu selection so pressing Enter at `Select: [1]` runs option `1`.
-- Added static regression coverage for menu defaults, unified menu colors, PowerShell 7 launcher priority, Windows Terminal launcher priority, and launcher diagnostics.
+- Added regression coverage for menu defaults, unified menu colors, semantic startup states, PowerShell 7 launcher priority, Windows Terminal launcher priority, and launcher diagnostics.
 
 ### Changed
 
 - Updated RDP brute-force blocker documentation to describe LogonType `3` and `10` detection and targeted username logging.
 - Changed `Run-WinServerSetup.ps1` to prefer PowerShell 7 (`pwsh.exe`) and fall back to Windows PowerShell 5 only when PowerShell 7 is unavailable.
-- Changed elevated launcher relaunches to prefer Windows Terminal `wt.exe -w 0 new-tab` when available, with direct PowerShell elevation as the fallback.
+- Changed launcher routing to use Windows Terminal `wt.exe -w 0 new-tab` as the first-priority console host whenever available, then PowerShell 7, with Windows PowerShell 5 as the final fallback.
 - Changed self-relocation relaunches to prefer PowerShell 7 instead of hard-coded Windows PowerShell 5.
+- Changed startup and self-relocation output to use aligned semantic state tags with separate label, path, value, success, warning, and error colors inspired by the FFmWiz terminal design system.
 
 ### Fixed
 
 - Fixed launcher failure visibility by keeping the launcher console open after elevation or child-process failures.
 - Fixed Windows PowerShell 5.1 transcript startup warnings by avoiding the unsupported `Start-Transcript -Encoding` parameter.
+- Fixed already-elevated ConsoleHost runs bypassing Windows Terminal.
+- Fixed first-run self-relocation opening a separate PowerShell 7 window instead of remaining in the current Windows Terminal console.
 
 ## [1.2.0] - 2026-05-28
 
