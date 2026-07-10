@@ -198,7 +198,9 @@ Important sections:
 
 ## Logs and Output
 
-The script separates concise console output from detailed diagnostics. Startup and self-relocation output uses aligned semantic states such as `[COPY]`, `[RUN]`, `[SHELL]`, `[LOG]`, `[CLEAN]`, `[NEXT]`, `[SKIP]`, and `[VERSION]`. State tags, neutral labels, paths, values, success, warnings, and errors use distinct bright semantic colors selected for dark-terminal readability; the text labels remain intact when `-NoColor` or `NO_COLOR` disables color.
+The script separates concise console output from detailed diagnostics. A run opens with a centered banner over a full-width rule, then reports startup facts as plain `Label: value` lines (`Source`, `Target`, `Copied`, `Relaunch script`, `PowerShell host`, `Version`, `Logging to`, and so on) with labels, paths, values, and success text in distinct colors. Long-running task output keeps its aligned `[INFO]`, `[OK]`, `[WARN]`, and `[ERROR]` severity column so problems stay scannable across a full provisioning run. The machine-readable state names (`COPY`, `RUN`, `SHELL`, `LOG`, `CLEAN`, `NEXT`, `SKIP`, `VERSION`) are still recorded in the structured log.
+
+The banner, startup lines, and menu header render in true-color ANSI on PowerShell 7 in a virtual-terminal console, and fall back to the built-in ConsoleColor palette on Windows PowerShell 5.1 or when output is redirected, which keeps escape sequences out of transcript logs and pipes. All text labels remain intact when `-NoColor` or `NO_COLOR` disables color.
 
 Logs are written under the resolved project `logs` directory:
 

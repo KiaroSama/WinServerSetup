@@ -7,7 +7,9 @@
 - Added stronger `Run-WinServerSetup.ps1` launcher diagnostics with a per-run UTC log file, resolved path details, forwarded switch logging, elevation flow logging, child exit-code logging, and stack details for launcher failures.
 - Added a brighter, unified main menu style that keeps option numbers green and option labels cyan for a consistent black-terminal layout.
 - Added a default main-menu selection so pressing Enter at `Select: [1]` runs option `1`.
-- Added regression coverage for menu defaults, unified menu colors, semantic startup states, PowerShell 7 launcher priority, Windows Terminal launcher priority, and launcher diagnostics.
+- Added a centered startup banner over a full-width rule, rendered in true-color ANSI where the host supports it.
+- Added `Get-AnsiCapability` so the true-color decision is a pure, testable function, and `Get-ConsoleWidth` so banner width detection falls back to 80 columns in hosts without a console window.
+- Added regression coverage for menu defaults, unified menu colors, startup line rendering, banner centering across console widths, the ANSI capability matrix, PowerShell 7 launcher priority, Windows Terminal launcher priority, and launcher diagnostics.
 
 ### Changed
 
@@ -15,7 +17,9 @@
 - Changed `Run-WinServerSetup.ps1` to prefer PowerShell 7 (`pwsh.exe`) and fall back to Windows PowerShell 5 only when PowerShell 7 is unavailable.
 - Changed launcher routing to use Windows Terminal `wt.exe -w 0 new-tab` as the first-priority console host whenever available, then PowerShell 7, with Windows PowerShell 5 as the final fallback.
 - Changed self-relocation relaunches to prefer PowerShell 7 instead of hard-coded Windows PowerShell 5.
-- Changed startup and self-relocation output to use aligned semantic state tags with separate label, path, value, success, warning, and error colors inspired by the FFmWiz terminal design system.
+- Changed startup and self-relocation output to plain `Label: value` lines under a centered banner, following the FFmWiz terminal design system. The bracketed `[COPY]`, `[RUN]`, `[SHELL]`, `[LOG]`, `[CLEAN]`, `[NEXT]`, `[SKIP]`, and `[VERSION]` startup column is gone from the console but the state names are still recorded in the structured log.
+- Changed the main menu header from a boxed `==== title ====` block to a single bold header line.
+- Kept the aligned `[INFO]`, `[OK]`, `[WARN]`, and `[ERROR]` severity column for long-running task output, where severity must stay scannable.
 
 ### Fixed
 

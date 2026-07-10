@@ -56,36 +56,98 @@ $Global:RunStats = [pscustomobject]@{
 # All terminal output goes through Write-Themed or a semantic wrapper. The
 # palette can be retuned from $Global:WinServerSetupColors. Color is disabled
 # by any of: -NoColor switch, $env:NO_COLOR, $env:WINSERVERSETUP_NOCOLOR.
-# We use Write-Host -ForegroundColor (ConsoleColor) so transcripts stay clean.
+# Long-running task output uses Write-Host -ForegroundColor (ConsoleColor) so
+# the transcript stays free of escape sequences.
 
-# Semantic ConsoleColor tokens. Keep state text visible without color and use
-# the PowerShell 5-compatible bright palette instead of ANSI-only RGB values.
+# Semantic ConsoleColor tokens. Every kind resolves here, so any host that
+# cannot render ANSI still gets a readable PowerShell 5-compatible color.
 $Global:WinServerSetupColors = @{
-    Success    = 'Green'
-    Error      = 'Red'
-    Warning    = 'Yellow'
-    Info       = 'Cyan'
-    Prompt     = 'Yellow'
-    Default    = 'Green'
-    Title      = 'White'
-    TitleRule  = 'Cyan'
-    Section    = 'Yellow'
-    Option     = 'Cyan'
-    OptionNum  = 'Green'
-    Status     = 'Cyan'
-    Summary    = 'White'
-    SummaryDim = 'Gray'
-    Action     = 'Magenta'
-    Label      = 'Gray'
-    Value      = 'Yellow'
-    Path       = 'Cyan'
+    Success      = 'Green'
+    Error        = 'Red'
+    Warning      = 'Yellow'
+    Info         = 'Cyan'
+    Prompt       = 'Yellow'
+    Default      = 'Green'
+    Section      = 'Yellow'
+    Option       = 'Cyan'
+    OptionNum    = 'Green'
+    Status       = 'Cyan'
+    Summary      = 'White'
+    SummaryDim   = 'Gray'
+    Banner       = 'Magenta'
+    BannerRule   = 'Magenta'
+    MenuHeader   = 'Cyan'
+    StartupLabel = 'Cyan'
+    StartupValue = 'Yellow'
+    StartupPath  = 'White'
+    StartupOk    = 'Green'
+    StartupDim   = 'DarkGray'
 }
+
+# The startup banner, startup facts, and menu header are the only output that
+# asks for colors ConsoleColor cannot express (the exact banner pink). They opt
+# into 24-bit / 256-color ANSI when the host can render it without dirtying the
+# transcript, and fall back to the ConsoleColor token above when it cannot.
+$Global:WinServerSetupAnsiColors = @{
+    Banner       = "$([char]27)[1m$([char]27)[38;2;255;50;115m"
+    BannerRule   = "$([char]27)[38;2;255;50;115m"
+    MenuHeader   = "$([char]27)[1m$([char]27)[38;5;117m"
+    StartupLabel = "$([char]27)[38;5;117m"
+    StartupValue = "$([char]27)[38;5;229m"
+    StartupPath  = "$([char]27)[38;5;159m"
+    StartupOk    = "$([char]27)[38;5;120m"
+    StartupDim   = "$([char]27)[38;5;250m"
+}
+
+$Global:WinServerSetupAnsiSupported = $null
 
 function Test-ColorSupported {
     if ($Global:NoColor) { return $false }
     if (-not [string]::IsNullOrEmpty($env:NO_COLOR)) { return $false }
     if (-not [string]::IsNullOrEmpty($env:WINSERVERSETUP_NOCOLOR)) { return $false }
     return $true
+}
+
+# Pure capability decision, kept separate from host probing so the whole matrix
+# stays testable. Two hosts must never see escape sequences:
+#   * a redirected stream, which is a file or a pipe where they are noise;
+#   * Windows PowerShell 5.1, which copies raw escape bytes into Start-Transcript
+#     logs. Both the launcher and the self-relocation relaunch prefer pwsh 7, so
+#     5.1 is a fallback host and degrades to the ConsoleColor palette.
+function Get-AnsiCapability {
+    param(
+        [Parameter(Mandatory)][bool]$IsOutputRedirected,
+        [Parameter(Mandatory)][int]$PSMajorVersion,
+        [bool]$SupportsVirtualTerminal = $false,
+        [bool]$IsWindowsTerminal = $false
+    )
+    if ($IsOutputRedirected) { return $false }
+    if ($PSMajorVersion -lt 6) { return $false }
+    if ($SupportsVirtualTerminal) { return $true }
+    return $IsWindowsTerminal
+}
+
+function Test-AnsiSupported {
+    if (-not (Test-ColorSupported)) { return $false }
+    if ($null -ne $Global:WinServerSetupAnsiSupported) { return $Global:WinServerSetupAnsiSupported }
+
+    $supported = $false
+    try {
+        $supportsVt = $false
+        if ($Host.UI.PSObject.Properties.Match('SupportsVirtualTerminal').Count -gt 0) {
+            $supportsVt = [bool]$Host.UI.SupportsVirtualTerminal
+        }
+        $supported = Get-AnsiCapability `
+            -IsOutputRedirected ([Console]::IsOutputRedirected) `
+            -PSMajorVersion $PSVersionTable.PSVersion.Major `
+            -SupportsVirtualTerminal $supportsVt `
+            -IsWindowsTerminal (-not [string]::IsNullOrEmpty($env:WT_SESSION))
+    } catch {
+        $supported = $false
+    }
+
+    $Global:WinServerSetupAnsiSupported = $supported
+    return $supported
 }
 
 function Set-ColorEnabled {
@@ -96,10 +158,20 @@ function Set-ColorEnabled {
 function Write-Themed {
     param(
         [Parameter(Mandatory, Position=0)][AllowEmptyString()][string]$Message,
-        [ValidateSet('Success','Error','Warning','Info','Prompt','Title','TitleRule','Section','Option','OptionNum','Status','Summary','SummaryDim','Action','Label','Value','Path','Plain')]
+        [ValidateSet('Success','Error','Warning','Info','Prompt','Section','Option','OptionNum','Status','Summary','SummaryDim','Banner','BannerRule','MenuHeader','StartupLabel','StartupValue','StartupPath','StartupOk','StartupDim','Plain')]
         [string]$Kind = 'Plain',
         [switch]$NoNewline
     )
+    if ($Kind -ne 'Plain' -and $Global:WinServerSetupAnsiColors.ContainsKey($Kind) -and (Test-AnsiSupported)) {
+        try {
+            Write-Host ("{0}{1}{2}[0m" -f $Global:WinServerSetupAnsiColors[$Kind], $Message, [char]27) -NoNewline:$NoNewline
+            return
+        } catch {
+            Write-Host $Message -NoNewline:$NoNewline
+            return
+        }
+    }
+
     $useColor = (Test-ColorSupported) -and ($Kind -ne 'Plain')
     $color = $null
     if ($useColor) {
@@ -161,38 +233,56 @@ function Write-Fail {
 function Write-Status  { param([string]$Message) Write-Themed $Message -Kind Status;            Write-StructuredLog -Level STATUS  -Message $Message }
 function Write-Summary { param([string]$Message) Write-Themed $Message -Kind Summary;           Write-StructuredLog -Level SUMMARY -Message $Message }
 
-function Write-StateLine {
+# Startup facts print as plain "Label: value" lines. The label carries the
+# meaning, so no bracketed state column is drawn, but $State is still forwarded
+# to the structured log so machine-readable state names survive.
+function Write-StartupLine {
     param(
-        [Parameter(Mandatory)]
-        [ValidateSet('COPY','RUN','SHELL','LOG','CLEAN','NEXT','SKIP','VERSION')]
-        [string]$State,
         [Parameter(Mandatory)][string]$Label,
         [AllowEmptyString()][string]$Value = '',
-        [ValidateSet('Summary','SummaryDim','Path','Value','Success','Warning','Error')]
-        [string]$ValueKind = 'Summary'
+        [ValidateSet('StartupValue','StartupPath','StartupOk','StartupDim')]
+        [string]$ValueKind = 'StartupValue',
+        [ValidateSet('COPY','RUN','SHELL','LOG','CLEAN','NEXT','SKIP','VERSION','OK','INFO')]
+        [string]$State = 'INFO'
     )
 
-    $stateKind = switch ($State) {
-        'COPY'    { 'Action' }
-        'RUN'     { 'Action' }
-        'CLEAN'   { 'Action' }
-        'SHELL'   { 'Prompt' }
-        'NEXT'    { 'Prompt' }
-        'VERSION' { 'Prompt' }
-        'LOG'     { 'Info' }
-        'SKIP'    { 'SummaryDim' }
-    }
-
-    Write-Themed (("[{0}]" -f $State).PadRight(10)) -Kind $stateKind -NoNewline
     if ([string]::IsNullOrEmpty($Value)) {
-        Write-Themed $Label -Kind Summary
+        Write-Themed $Label -Kind StartupDim
         $plainMessage = $Label
     } else {
-        Write-Themed ($Label + ': ') -Kind Label -NoNewline
+        Write-Themed ($Label + ': ') -Kind StartupLabel -NoNewline
         Write-Themed $Value -Kind $ValueKind
         $plainMessage = "{0}: {1}" -f $Label, $Value
     }
     Write-StructuredLog -Level $State -Message $plainMessage
+}
+
+# Hosts without a real console (bare runspaces, some remoting sessions) report no
+# window size or throw outright, so fall back to a classic 80 columns. A null or
+# non-positive width fails the comparison and takes the same fallback.
+function Get-ConsoleWidth {
+    param([int]$Fallback = 80)
+    try {
+        $hostWidth = $Host.UI.RawUI.WindowSize.Width
+        if ($hostWidth -gt 0) { return [int]$hostWidth }
+    } catch {
+        return $Fallback
+    }
+    return $Fallback
+}
+
+# Centered title over a full-width rule, printed once before any other output.
+function Write-Banner {
+    param([int]$Width = 0)
+
+    $title = "Windows Server Setup (WinServerSetup)"
+    if ($Width -le 0) { $Width = Get-ConsoleWidth }
+    if ($Width -lt $title.Length) { $Width = $title.Length }
+
+    $padding = [Math]::Max(0, [int](($Width - $title.Length) / 2))
+    Write-Host ""
+    Write-Themed ((' ' * $padding) + $title) -Kind Banner
+    Write-Themed ('=' * $Width) -Kind BannerRule
 }
 
 function Write-Section {
@@ -200,16 +290,6 @@ function Write-Section {
     Write-Host ""
     Write-Themed ("==== {0} ====" -f $Title) -Kind Section
     Write-StructuredLog -Level SECTION -Message $Title
-}
-
-function Write-Title {
-    param([Parameter(Mandatory)][string]$Title)
-    Write-Themed $Title -Kind Title
-}
-
-function Write-Rule {
-    param([int]$Width = 30, [string]$Char = '=')
-    Write-Themed ($Char * $Width) -Kind TitleRule
 }
 
 function Write-Option {
@@ -540,9 +620,9 @@ function Initialize-Environment {
         try {
             Start-Transcript -Path $Global:LogFile -Append -Force | Out-Null
             $Global:TranscriptStarted = $true
-            Write-StateLine -State "VERSION" -Label "WinServerSetup" -Value $Global:ScriptVersion -ValueKind "Value"
-            Write-StateLine -State "LOG" -Label "Console transcript" -Value $Global:LogFile -ValueKind "Path"
-            Write-StateLine -State "LOG" -Label "Structured log" -Value $Global:StructuredLog -ValueKind "Path"
+            Write-StartupLine -State "VERSION" -Label "Version" -Value $Global:ScriptVersion -ValueKind "StartupValue"
+            Write-StartupLine -State "LOG" -Label "Logging to" -Value $Global:LogFile -ValueKind "StartupPath"
+            Write-StartupLine -State "LOG" -Label "Structured log" -Value $Global:StructuredLog -ValueKind "StartupPath"
         } catch {
             Write-Warn "Could not start transcript: $($_.Exception.Message)"
         }
@@ -655,11 +735,11 @@ function Add-RelocationLog {
 
 function Invoke-SelfRelocateIfNeeded {
     if ($Global:NoRelocate) {
-        Write-StateLine -State "SKIP" -Label "Self-relocate" -Value "-NoRelocate switch is set" -ValueKind "Summary"
+        Write-StartupLine -State "SKIP" -Label "Self-relocate" -Value "skipped, -NoRelocate switch is set" -ValueKind "StartupDim"
         return $false
     }
     if (-not $Global:Config.selfRelocate -or -not $Global:Config.selfRelocate.enabled) {
-        Write-StateLine -State "SKIP" -Label "Self-relocate" -Value "Disabled in config" -ValueKind "Summary"
+        Write-StartupLine -State "SKIP" -Label "Self-relocate" -Value "disabled in config" -ValueKind "StartupDim"
         return $false
     }
 
@@ -670,11 +750,11 @@ function Invoke-SelfRelocateIfNeeded {
     $targetFull  = $target.TrimEnd('\')
 
     if ([string]::Equals($currentFull, $targetFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Write-StateLine -State "SKIP" -Label "Already running from target" -Value $target -ValueKind "Path"
+        Write-StartupLine -State "SKIP" -Label "Running from" -Value $target -ValueKind "StartupPath"
         return $false
     }
 
-    Write-Section "Self-relocating project to $target"
+    Write-StartupLine -State "RUN" -Label "Relocating project to" -Value $targetFull -ValueKind "StartupPath"
     $parent = Split-Path -Parent $target
     Ensure-Directory $parent
     $targetLogDir = Join-Path $targetFull "logs"
@@ -683,8 +763,8 @@ function Invoke-SelfRelocateIfNeeded {
     # Copy with robocopy, then schedule removal of the original source after the
     # relaunched target process starts. /E updates/merges without deleting
     # unexpected destination files.
-    Write-StateLine -State "COPY" -Label "Source" -Value $currentFull -ValueKind "Path"
-    Write-StateLine -State "COPY" -Label "Target" -Value $targetFull -ValueKind "Value"
+    Write-StartupLine -State "COPY" -Label "Source" -Value $currentFull -ValueKind "StartupPath"
+    Write-StartupLine -State "COPY" -Label "Target" -Value $targetFull -ValueKind "StartupPath"
     $robocopyLog = Join-Path $env:TEMP "WinServerSetup-relocate.log"
     $proc = Start-Process robocopy.exe `
         -ArgumentList @("`"$currentFull`"", "`"$targetFull`"", "/E", "/COPY:DAT", "/R:1", "/W:2", "/NFL", "/NDL", "/NJH", "/NJS", "/NC", "/NS", "/LOG:`"$robocopyLog`"") `
@@ -693,7 +773,7 @@ function Invoke-SelfRelocateIfNeeded {
     if ($proc.ExitCode -ge 8) {
         throw "robocopy failed with exit code $($proc.ExitCode). See $robocopyLog"
     }
-    Write-Ok "Project files copied. robocopy exit code $($proc.ExitCode)."
+    Write-StartupLine -State "OK" -Label "Copied" -Value ("project files, robocopy exit code {0}." -f $proc.ExitCode) -ValueKind "StartupOk"
     Ensure-Directory $targetLogDir
     @(
         ("[{0}] [INFO] Source: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $currentFull),
@@ -711,15 +791,15 @@ function Invoke-SelfRelocateIfNeeded {
     if ($Global:NoColor) { $childArgs += "-NoColor" }
     if ($Global:NoReboot){ $childArgs += "-NoReboot" }
 
-    Write-StateLine -State "RUN" -Label "Relaunch script" -Value $newScript -ValueKind "Path"
+    Write-StartupLine -State "RUN" -Label "Relaunch script" -Value $newScript -ValueKind "StartupPath"
     Add-RelocationLog -Path $relocateLog -Level "RUN" -Message ("Relaunch script: {0}" -f $newScript)
     $relaunchPowerShellExe = Get-PreferredPowerShellForRelaunch
-    Write-StateLine -State "SHELL" -Label "PowerShell host" -Value $relaunchPowerShellExe -ValueKind "Value"
+    Write-StartupLine -State "SHELL" -Label "PowerShell host" -Value $relaunchPowerShellExe -ValueKind "StartupPath"
     Add-RelocationLog -Path $relocateLog -Level "SHELL" -Message ("PowerShell host: {0}" -f $relaunchPowerShellExe)
     $relocatedProcess = Start-Process $relaunchPowerShellExe -ArgumentList $childArgs -NoNewWindow -PassThru
-    Write-StateLine -State "RUN" -Label "Relocated setup PID" -Value ([string]$relocatedProcess.Id) -ValueKind "Value"
+    Write-StartupLine -State "RUN" -Label "Relocated setup PID" -Value ([string]$relocatedProcess.Id) -ValueKind "StartupValue"
     Add-RelocationLog -Path $relocateLog -Level "RUN" -Message ("Relocated setup PID: {0}" -f $relocatedProcess.Id)
-    Write-StateLine -State "LOG" -Label "Relocation log" -Value $relocateLog -ValueKind "Path"
+    Write-StartupLine -State "LOG" -Label "Relocation log" -Value $relocateLog -ValueKind "StartupPath"
     try {
         $cleanupScript = Join-Path $env:TEMP ("WinServerSetup-clean-source-{0}.ps1" -f ([guid]::NewGuid().ToString("N")))
         $parentPid = $PID
@@ -750,15 +830,15 @@ try { Remove-Item -LiteralPath `$MyInvocation.MyCommand.Path -Force -ErrorAction
             "-SourcePath", "`"$currentFull`"", "-TargetPath", "`"$targetFull`"",
             "-ParentProcessId", "$parentPid", "-RelocateLog", "`"$relocateLog`""
         )
-        Write-StateLine -State "CLEAN" -Label "Original source cleanup scheduled after this process exits."
+        Write-StartupLine -State "CLEAN" -Label "Cleanup" -Value "original source is removed after this process exits." -ValueKind "StartupDim"
         Add-RelocationLog -Path $relocateLog -Level "CLEAN" -Message "Original source cleanup scheduled after this process exits."
     } catch {
         Write-Warn "Could not schedule source cleanup after relocation: $($_.Exception.Message)"
         Add-RelocationLog -Path $relocateLog -Level "WARN" -Message ("Could not schedule source cleanup after relocation: {0}" -f $_.Exception.Message)
     }
-    Write-StateLine -State "CLEAN" -Label "Original setup process will now exit."
+    Write-StartupLine -State "CLEAN" -Label "This process" -Value "exits now, setup continues in the relocated copy." -ValueKind "StartupDim"
     Add-RelocationLog -Path $relocateLog -Level "CLEAN" -Message "Original setup process will now exit."
-    Write-StateLine -State "NEXT" -Label "Future runs" -Value $targetFull -ValueKind "Path"
+    Write-StartupLine -State "NEXT" -Label "Future runs" -Value $targetFull -ValueKind "StartupPath"
     Add-RelocationLog -Path $relocateLog -Level "NEXT" -Message ("Future runs: {0}" -f $targetFull)
     return $true
 }
@@ -3317,9 +3397,7 @@ function Invoke-FullSetupWithActiveTimer {
 function Show-MainMenu {
     while ($true) {
         Write-Host ""
-        Write-Rule  -Width 36
-        Write-Title " WinServerSetup Main Menu"
-        Write-Rule  -Width 36
+        Write-Themed "WinServerSetup Main menu:" -Kind MenuHeader
         Write-Option -Number "1"  -Label "Run full setup"                                      -Color "Cyan"
         Write-Option -Number "2"  -Label "Windows Update (multi-pass)"                         -Color "Cyan"
         Write-Option -Number "3"  -Label "Activation from config only"                         -Color "Cyan"
@@ -3397,6 +3475,7 @@ function Show-MainMenu {
 # ENTRY POINT
 # =============================================================================
 try {
+    Write-Banner
     Assert-Admin
     Load-Config
 

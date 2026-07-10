@@ -188,15 +188,29 @@ Assert-True `
     -Message "Start-Transcript must not use -Encoding because Windows PowerShell 5.1 does not support that parameter."
 
 foreach ($tokenPattern in @(
-    "Action\s*=\s*'Magenta'",
-    "Label\s*=\s*'Gray'",
-    "Value\s*=\s*'Yellow'",
-    "Path\s*=\s*'Cyan'"
+    "Banner\s*=\s*'Magenta'",
+    "MenuHeader\s*=\s*'Cyan'",
+    "StartupLabel\s*=\s*'Cyan'",
+    "StartupValue\s*=\s*'Yellow'",
+    "StartupPath\s*=\s*'White'",
+    "StartupOk\s*=\s*'Green'",
+    "StartupDim\s*=\s*'DarkGray'"
 )) {
     Assert-Contains `
         -Text $main `
         -Pattern $tokenPattern `
-        -Message ("Console palette must define the extracted semantic token: {0}" -f $tokenPattern)
+        -Message ("Console palette must define a ConsoleColor fallback for the startup token: {0}" -f $tokenPattern)
+}
+
+foreach ($ansiPattern in @(
+    "Banner\s*=\s*`"\`$\(\[char\]27\)\[1m\`$\(\[char\]27\)\[38;2;255;50;115m`"",
+    "BannerRule\s*=\s*`"\`$\(\[char\]27\)\[38;2;255;50;115m`"",
+    "MenuHeader\s*=\s*`"\`$\(\[char\]27\)\[1m\`$\(\[char\]27\)\[38;5;117m`""
+)) {
+    Assert-Contains `
+        -Text $main `
+        -Pattern $ansiPattern `
+        -Message ("Startup output must define its exact true-color ANSI sequence: {0}" -f $ansiPattern)
 }
 
 $mainTokens = $null
@@ -208,22 +222,34 @@ $mainAst = [System.Management.Automation.Language.Parser]::ParseFile(
 )
 Assert-True -Condition ($mainParseErrors.Count -eq 0) -Message "Main script must parse before its console state renderer can be tested."
 
-$stateFunctionAst = $mainAst.FindAll(
+Assert-True `
+    -Condition ($main -notmatch 'function\s+Write-StateLine') `
+    -Message "The bracketed [STATE] startup column must be gone; startup lines now read as plain 'Label: value'."
+
+Assert-True `
+    -Condition ($main -notmatch 'Write-Rule|Write-Title') `
+    -Message "The boxed '==== title ====' menu header must be replaced by a single bold menu-header line."
+
+Assert-Contains `
+    -Text $main `
+    -Pattern 'Write-Themed\s+"WinServerSetup Main menu:"\s+-Kind\s+MenuHeader' `
+    -Message "Main menu must open with one bold menu-header line instead of rule characters."
+
+$startupFunctionAst = $mainAst.FindAll(
     {
         param($node)
         ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
-            ($node.Name -eq "Write-StateLine")
+            ($node.Name -eq "Write-StartupLine")
     },
     $true
 ) | Select-Object -First 1
 
 Assert-True `
-    -Condition ($null -ne $stateFunctionAst) `
-    -Message "Console startup output must use a reusable semantic state-line renderer."
+    -Condition ($null -ne $startupFunctionAst) `
+    -Message "Console startup output must use a reusable 'Label: value' renderer."
 
-$stateFunctionText = $stateFunctionAst.Extent.Text
-$stateFunctionBlock = [scriptblock]::Create($stateFunctionText)
-. $stateFunctionBlock
+$startupFunctionBlock = [scriptblock]::Create($startupFunctionAst.Extent.Text)
+. $startupFunctionBlock
 
 $script:CapturedThemedCalls = @()
 $script:CapturedStructuredCalls = @()
@@ -244,60 +270,196 @@ function Write-StructuredLog {
 }
 
 try {
-    Write-StateLine -State "RUN" -Label "Relaunch script" -Value "C:\Target\WinServerSetup.ps1" -ValueKind "Path"
+    Write-StartupLine -State "RUN" -Label "Relaunch script" -Value "C:\Target\WinServerSetup.ps1" -ValueKind "StartupPath"
 
-    Assert-Equal -Expected 3 -Actual $script:CapturedThemedCalls.Count -Message "A value state line must render state, label, and value as separate color segments."
-    Assert-Equal -Expected "[RUN]     " -Actual $script:CapturedThemedCalls[0].Message -Message "State tag must use a stable ten-character column."
-    Assert-Equal -Expected "Action" -Actual $script:CapturedThemedCalls[0].Kind -Message "RUN state must use the action token."
-    Assert-Equal -Expected "Relaunch script: " -Actual $script:CapturedThemedCalls[1].Message -Message "State label must include a readable separator."
-    Assert-Equal -Expected "Label" -Actual $script:CapturedThemedCalls[1].Kind -Message "State label must use the neutral label token."
-    Assert-Equal -Expected "C:\Target\WinServerSetup.ps1" -Actual $script:CapturedThemedCalls[2].Message -Message "State value must preserve the supplied path."
-    Assert-Equal -Expected "Path" -Actual $script:CapturedThemedCalls[2].Kind -Message "Path value must use the path token."
-    Assert-Equal -Expected $false -Actual $script:CapturedThemedCalls[2].NoNewline -Message "The final state segment must end the line."
-    Assert-Equal -Expected "RUN" -Actual $script:CapturedStructuredCalls[0].Level -Message "The state renderer must forward the visible state to structured logging."
-    Assert-Equal -Expected "Relaunch script: C:\Target\WinServerSetup.ps1" -Actual $script:CapturedStructuredCalls[0].Message -Message "The state renderer must forward the plain-text state content to structured logging."
+    Assert-Equal -Expected 2 -Actual $script:CapturedThemedCalls.Count -Message "A startup line must render label and value as two color segments, with no state column."
+    Assert-Equal -Expected "Relaunch script: " -Actual $script:CapturedThemedCalls[0].Message -Message "Startup label must include a readable separator and no bracketed tag."
+    Assert-Equal -Expected "StartupLabel" -Actual $script:CapturedThemedCalls[0].Kind -Message "Startup label must use the startup label token."
+    Assert-Equal -Expected $true -Actual $script:CapturedThemedCalls[0].NoNewline -Message "Startup label must not end the line."
+    Assert-Equal -Expected "C:\Target\WinServerSetup.ps1" -Actual $script:CapturedThemedCalls[1].Message -Message "Startup value must preserve the supplied path."
+    Assert-Equal -Expected "StartupPath" -Actual $script:CapturedThemedCalls[1].Kind -Message "Path value must use the startup path token."
+    Assert-Equal -Expected $false -Actual $script:CapturedThemedCalls[1].NoNewline -Message "The final startup segment must end the line."
+    Assert-Equal -Expected "RUN" -Actual $script:CapturedStructuredCalls[0].Level -Message "The startup renderer must forward the machine-readable state to structured logging."
+    Assert-Equal -Expected "Relaunch script: C:\Target\WinServerSetup.ps1" -Actual $script:CapturedStructuredCalls[0].Message -Message "The startup renderer must forward the plain-text content to structured logging."
 
-    $expectedStateKinds = @{
-        COPY = "Action"
-        RUN = "Action"
-        SHELL = "Prompt"
-        LOG = "Info"
-        CLEAN = "Action"
-        NEXT = "Prompt"
-        SKIP = "SummaryDim"
-        VERSION = "Prompt"
-    }
-    foreach ($stateName in $expectedStateKinds.Keys) {
+    foreach ($stateName in @("COPY", "RUN", "SHELL", "LOG", "CLEAN", "NEXT", "SKIP", "VERSION", "OK")) {
         $script:CapturedThemedCalls = @()
         $script:CapturedStructuredCalls = @()
-        Write-StateLine -State $stateName -Label "State message"
+        Write-StartupLine -State $stateName -Label "Startup message"
         Assert-Equal `
-            -Expected $expectedStateKinds[$stateName] `
-            -Actual $script:CapturedThemedCalls[0].Kind `
-            -Message ("{0} must use its semantic state color token." -f $stateName)
+            -Expected 1 `
+            -Actual $script:CapturedThemedCalls.Count `
+            -Message ("{0} without a value must render as one plain line." -f $stateName)
         Assert-Equal `
             -Expected $stateName `
             -Actual $script:CapturedStructuredCalls[0].Level `
             -Message ("{0} must keep its state name in structured logging." -f $stateName)
     }
 } finally {
-    Remove-Item -LiteralPath Function:\Write-StateLine -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Function:\Write-StartupLine -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath Function:\Write-Themed -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath Function:\Write-StructuredLog -ErrorAction SilentlyContinue
 }
 
-foreach ($state in @("COPY", "RUN", "SHELL", "LOG", "CLEAN", "NEXT", "SKIP", "VERSION")) {
+foreach ($state in @("COPY", "RUN", "SHELL", "LOG", "CLEAN", "NEXT", "SKIP", "VERSION", "OK")) {
     Assert-Contains `
         -Text $main `
-        -Pattern ('Write-StateLine\s+-State\s+"{0}"' -f $state) `
-        -Message ("Startup output must include the {0} semantic state." -f $state)
+        -Pattern ('Write-StartupLine\s+-State\s+"{0}"' -f $state) `
+        -Message ("Startup output must include the {0} state." -f $state)
 }
+
+$bannerFunctionAst = $mainAst.FindAll(
+    {
+        param($node)
+        ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
+            ($node.Name -eq "Write-Banner")
+    },
+    $true
+) | Select-Object -First 1
+
+Assert-True -Condition ($null -ne $bannerFunctionAst) -Message "Startup must print a centered banner over a full-width rule."
+
+$widthFunctionAst = $mainAst.FindAll(
+    {
+        param($node)
+        ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
+            ($node.Name -eq "Get-ConsoleWidth")
+    },
+    $true
+) | Select-Object -First 1
+
+Assert-True -Condition ($null -ne $widthFunctionAst) -Message "Banner width detection must be isolated so hosts without a console can fall back."
+
+. ([scriptblock]::Create($bannerFunctionAst.Extent.Text))
+. ([scriptblock]::Create($widthFunctionAst.Extent.Text))
+
+$script:CapturedThemedCalls = @()
+function Write-Themed {
+    param([string]$Message, [string]$Kind, [switch]$NoNewline)
+    $script:CapturedThemedCalls += [pscustomobject]@{ Message = $Message; Kind = $Kind }
+}
+
+try {
+    Write-Banner
+
+    Assert-Equal -Expected 2 -Actual $script:CapturedThemedCalls.Count -Message "The banner must render a title line and a rule line."
+    Assert-Equal -Expected "Banner" -Actual $script:CapturedThemedCalls[0].Kind -Message "The banner title must use the banner token."
+    Assert-Equal -Expected "BannerRule" -Actual $script:CapturedThemedCalls[1].Kind -Message "The banner rule must use the banner rule token."
+
+    # In a real console the detected width must be usable. A bare runspace has no
+    # RawUI at all, which is where the 80-column fallback has to hold.
+    Assert-True -Condition ((Get-ConsoleWidth) -gt 0) -Message "Width detection must return a usable console width when a console exists."
+
+    $hostlessRunspace = [powershell]::Create()
+    try {
+        $null = $hostlessRunspace.AddScript(($widthFunctionAst.Extent.Text + "`nGet-ConsoleWidth"))
+        $hostlessWidth = $hostlessRunspace.Invoke() | Select-Object -First 1
+        Assert-Equal -Expected 0 -Actual $hostlessRunspace.Streams.Error.Count -Message "Width detection must not raise errors in a host without RawUI."
+        Assert-Equal -Expected 80 -Actual $hostlessWidth -Message "Width detection must fall back to 80 columns in a host without a console window."
+    } finally {
+        $hostlessRunspace.Dispose()
+    }
+
+    $bannerTitleText = "Windows Server Setup (WinServerSetup)"
+    foreach ($requestedWidth in @(120, 80, 40, 20, 1)) {
+        $script:CapturedThemedCalls = @()
+        Write-Banner -Width $requestedWidth
+
+        $bannerTitle = $script:CapturedThemedCalls[0].Message
+        $bannerRule = $script:CapturedThemedCalls[1].Message
+        $expectedWidth = [Math]::Max($requestedWidth, $bannerTitleText.Length)
+
+        Assert-Equal -Expected $bannerTitleText -Actual $bannerTitle.TrimStart() -Message ("Banner title must survive centering at width {0}." -f $requestedWidth)
+        Assert-True -Condition ($bannerRule -match '^=+$') -Message ("Banner rule must be a solid line at width {0}." -f $requestedWidth)
+        Assert-Equal -Expected $expectedWidth -Actual $bannerRule.Length -Message ("Banner rule must never shrink below the title at width {0}." -f $requestedWidth)
+        Assert-True `
+            -Condition ($bannerTitle.Length -le $bannerRule.Length) `
+            -Message ("Centered banner title must not overhang its rule at width {0}." -f $requestedWidth)
+
+        $leadingPadding = $bannerTitle.Length - $bannerTitle.TrimStart().Length
+        Assert-Equal `
+            -Expected ([Math]::Max(0, [int](($expectedWidth - $bannerTitleText.Length) / 2))) `
+            -Actual $leadingPadding `
+            -Message ("Banner title must be centered against the rule at width {0}." -f $requestedWidth)
+    }
+} finally {
+    Remove-Item -LiteralPath Function:\Write-Banner -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Function:\Get-ConsoleWidth -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Function:\Write-Themed -ErrorAction SilentlyContinue
+}
+
+Assert-Contains `
+    -Text $main `
+    -Pattern '(?s)try\s*\{\s*Write-Banner' `
+    -Message "The banner must print before any other startup output."
 
 foreach ($standardState in @("INFO", "OK", "WARN", "ERROR")) {
     Assert-Contains `
         -Text $main `
         -Pattern ('\("\[{0}\]"\)\.PadRight\(10\)' -f $standardState) `
-        -Message ("Standard {0} messages must align with the ten-character startup state column." -f $standardState)
+        -Message ("Long-running task output must keep the aligned [{0}] severity column." -f $standardState)
+}
+
+$ansiFunctionAst = $mainAst.FindAll(
+    {
+        param($node)
+        ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
+            ($node.Name -eq "Test-AnsiSupported")
+    },
+    $true
+) | Select-Object -First 1
+
+Assert-True `
+    -Condition ($null -ne $ansiFunctionAst) `
+    -Message "True-color startup output must be gated behind a virtual-terminal capability probe."
+
+Assert-Contains `
+    -Text $main `
+    -Pattern '(?s)function\s+Write-Themed.*?\$Global:WinServerSetupAnsiColors\.ContainsKey\(\$Kind\)\s+-and\s+\(Test-AnsiSupported\)' `
+    -Message "Write-Themed must fall back to ConsoleColor whenever ANSI is unsupported or the kind has no ANSI sequence."
+
+$capabilityFunctionAst = $mainAst.FindAll(
+    {
+        param($node)
+        ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
+            ($node.Name -eq "Get-AnsiCapability")
+    },
+    $true
+) | Select-Object -First 1
+
+Assert-True `
+    -Condition ($null -ne $capabilityFunctionAst) `
+    -Message "The ANSI decision must be a pure, testable function separate from host probing."
+
+. ([scriptblock]::Create($capabilityFunctionAst.Extent.Text))
+
+try {
+    Assert-Equal `
+        -Expected $true `
+        -Actual (Get-AnsiCapability -IsOutputRedirected $false -PSMajorVersion 7 -SupportsVirtualTerminal $true) `
+        -Message "PowerShell 7 on a virtual-terminal console must render the exact true-color banner."
+
+    Assert-Equal `
+        -Expected $true `
+        -Actual (Get-AnsiCapability -IsOutputRedirected $false -PSMajorVersion 7 -SupportsVirtualTerminal $false -IsWindowsTerminal $true) `
+        -Message "Windows Terminal must be trusted for ANSI even when the host reports no virtual-terminal flag."
+
+    Assert-Equal `
+        -Expected $false `
+        -Actual (Get-AnsiCapability -IsOutputRedirected $false -PSMajorVersion 7 -SupportsVirtualTerminal $false -IsWindowsTerminal $false) `
+        -Message "A PowerShell 7 host with no virtual-terminal support must fall back to ConsoleColor."
+
+    Assert-Equal `
+        -Expected $false `
+        -Actual (Get-AnsiCapability -IsOutputRedirected $true -PSMajorVersion 7 -SupportsVirtualTerminal $true -IsWindowsTerminal $true) `
+        -Message "Redirected output is a file or pipe and must never receive escape sequences."
+
+    Assert-Equal `
+        -Expected $false `
+        -Actual (Get-AnsiCapability -IsOutputRedirected $false -PSMajorVersion 5 -SupportsVirtualTerminal $true -IsWindowsTerminal $true) `
+        -Message "Windows PowerShell 5.1 copies raw escape bytes into Start-Transcript logs, so it must keep the ConsoleColor palette."
+} finally {
+    Remove-Item -LiteralPath Function:\Get-AnsiCapability -ErrorAction SilentlyContinue
 }
 
 foreach ($standardHelper in @("Write-Info", "Write-Ok", "Write-Warn", "Write-Fail")) {
@@ -357,4 +519,4 @@ foreach ($relocationLevel in @("OK", "RUN", "SHELL", "CLEAN", "NEXT")) {
         -Message ("Relocation log must persist the {0} state before the normal structured log starts." -f $relocationLevel)
 }
 
-Write-Host "PASS menu behavior, semantic startup colors, Windows Terminal-first routing, PowerShell fallback order, self-relocation console preservation, and launcher diagnostics are present."
+Write-Host "PASS menu behavior, banner and startup line rendering, ANSI capability fallback, Windows Terminal-first routing, PowerShell fallback order, self-relocation console preservation, and launcher diagnostics are present."
