@@ -51,25 +51,18 @@ Assert-Contains `
 
 $menuBlockMatch = [regex]::Match(
     $main,
-    '(?s)Write-Option\s+-Number\s+"1".*?Write-Option\s+-Number\s+"0"\s+-Label\s+"Back / Exit"\s+-Color\s+"[^"]+"'
+    '(?s)Write-Option\s+-Number\s+"1".*?Write-Option\s+-Number\s+"0"\s+-Label\s+"Back / Exit"'
 )
 Assert-True -Condition $menuBlockMatch.Success -Message "Main menu Write-Option block was not found."
 
-$menuColors = [regex]::Matches($menuBlockMatch.Value, '-Color\s+"([^"]+)"') |
-    ForEach-Object { $_.Groups[1].Value }
-$uniqueMenuColors = @($menuColors | Sort-Object -Unique)
-
 Assert-True `
-    -Condition ($menuColors.Count -ge 27) `
-    -Message "Every main menu option should declare the unified menu label color."
+    -Condition ($menuBlockMatch.Value -notmatch '-Color|-NumberColor') `
+    -Message "Menu options must not declare per-option colors; the style is a light-blue number and a plain label."
 
-Assert-True `
-    -Condition (($uniqueMenuColors.Count -eq 1) -and ($uniqueMenuColors[0] -eq "Cyan")) `
-    -Message ("Main menu labels must use one unified bright color. Actual colors: {0}" -f ($uniqueMenuColors -join ", "))
-
-Assert-True `
-    -Condition ($menuBlockMatch.Value -notmatch '-Color\s+"(Red|Magenta|Dark[^"]*)"') `
-    -Message "Main menu labels must not use dark-looking red, purple, or Dark* colors."
+Assert-Contains `
+    -Text $main `
+    -Pattern '(?s)function\s+Write-Option.*?-Kind\s+StartupLabel\s+-NoNewline\s+Write-Host\s+\$Label' `
+    -Message "Write-Option must render a light-blue option number followed by a plain label."
 
 Assert-Contains `
     -Text $launcher `
@@ -194,7 +187,8 @@ foreach ($tokenPattern in @(
     "StartupValue\s*=\s*'Yellow'",
     "StartupPath\s*=\s*'White'",
     "StartupOk\s*=\s*'Green'",
-    "StartupDim\s*=\s*'DarkGray'"
+    "StartupDim\s*=\s*'DarkGray'",
+    "StartupNote\s*=\s*'Yellow'"
 )) {
     Assert-Contains `
         -Text $main `
@@ -282,6 +276,16 @@ try {
     Assert-Equal -Expected "RUN" -Actual $script:CapturedStructuredCalls[0].Level -Message "The startup renderer must forward the machine-readable state to structured logging."
     Assert-Equal -Expected "Relaunch script: C:\Target\WinServerSetup.ps1" -Actual $script:CapturedStructuredCalls[0].Message -Message "The startup renderer must forward the plain-text content to structured logging."
 
+    # A LOG line prints as one solid note-yellow line, not a split label/value
+    # pair, so LOG must render as a single Themed call.
+    $script:CapturedThemedCalls = @()
+    $script:CapturedStructuredCalls = @()
+    Write-StartupLine -State "LOG" -Label "Logging to" -Value "C:\logs\WinServerSetup.log" -ValueKind "StartupPath"
+    Assert-Equal -Expected 1 -Actual $script:CapturedThemedCalls.Count -Message "A LOG line must render label and value as one solid-color segment."
+    Assert-Equal -Expected "Logging to: C:\logs\WinServerSetup.log" -Actual $script:CapturedThemedCalls[0].Message -Message "A LOG line must keep the label and value joined in a single message."
+    Assert-Equal -Expected "StartupNote" -Actual $script:CapturedThemedCalls[0].Kind -Message "A LOG line must use the note-yellow token instead of the label/value split tokens."
+    Assert-Equal -Expected "LOG" -Actual $script:CapturedStructuredCalls[0].Level -Message "A LOG line must still forward its state to structured logging."
+
     foreach ($stateName in @("COPY", "RUN", "SHELL", "LOG", "CLEAN", "NEXT", "SKIP", "VERSION", "OK")) {
         $script:CapturedThemedCalls = @()
         $script:CapturedStructuredCalls = @()
@@ -360,7 +364,7 @@ try {
         $hostlessRunspace.Dispose()
     }
 
-    $bannerTitleText = "Windows Server Setup (WinServerSetup)"
+    $bannerTitleText = "Windows Server Setup"
     foreach ($requestedWidth in @(120, 80, 40, 20, 1)) {
         $script:CapturedThemedCalls = @()
         Write-Banner -Width $requestedWidth

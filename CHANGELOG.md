@@ -17,7 +17,7 @@
 - Changed `Run-WinServerSetup.ps1` to prefer PowerShell 7 (`pwsh.exe`) and fall back to Windows PowerShell 5 only when PowerShell 7 is unavailable.
 - Changed launcher routing to use Windows Terminal `wt.exe -w 0 new-tab` as the first-priority console host whenever available, then PowerShell 7, with Windows PowerShell 5 as the final fallback.
 - Changed self-relocation relaunches to prefer PowerShell 7 instead of hard-coded Windows PowerShell 5.
-- Changed startup and self-relocation output to plain `Label: value` lines under a centered banner, following the FFmWiz terminal design system. The bracketed `[COPY]`, `[RUN]`, `[SHELL]`, `[LOG]`, `[CLEAN]`, `[NEXT]`, `[SKIP]`, and `[VERSION]` startup column is gone from the console but the state names are still recorded in the structured log.
+- Changed startup and self-relocation output to plain `Label: value` lines under a centered banner. The bracketed `[COPY]`, `[RUN]`, `[SHELL]`, `[LOG]`, `[CLEAN]`, `[NEXT]`, `[SKIP]`, and `[VERSION]` startup column is gone from the console but the state names are still recorded in the structured log.
 - Changed the main menu header from a boxed `==== title ====` block to a single bold header line.
 - Kept the aligned `[INFO]`, `[OK]`, `[WARN]`, and `[ERROR]` severity column for long-running task output, where severity must stay scannable.
 

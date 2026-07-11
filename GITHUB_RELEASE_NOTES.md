@@ -26,7 +26,7 @@ This draft release improves launcher diagnostics and startup color hierarchy, ma
 - `Run-WinServerSetup.ps1` now prefers PowerShell 7 (`pwsh.exe`) and falls back to Windows PowerShell 5 only when PowerShell 7 is unavailable.
 - Launcher routing now uses Windows Terminal `wt.exe -w 0 new-tab` as the first-priority console host whenever available, then PowerShell 7, with Windows PowerShell 5 as the final fallback.
 - Self-relocation relaunches now prefer PowerShell 7 instead of hard-coded Windows PowerShell 5.
-- Startup and self-relocation output now uses aligned semantic state tags with separate label, path, value, success, warning, and error colors inspired by the FFmWiz terminal design system.
+- Startup and self-relocation output now uses aligned semantic state tags with separate label, path, value, success, warning, and error colors.
 - Documentation now lists Windows long paths as part of the system configuration workflow.
 - Winget source repair now avoids `source reset --force` when `msstore` is already absent and only `winget source update` fails.
 

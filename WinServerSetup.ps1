@@ -69,8 +69,6 @@ $Global:WinServerSetupColors = @{
     Prompt       = 'Yellow'
     Default      = 'Green'
     Section      = 'Yellow'
-    Option       = 'Cyan'
-    OptionNum    = 'Green'
     Status       = 'Cyan'
     Summary      = 'White'
     SummaryDim   = 'Gray'
@@ -82,6 +80,7 @@ $Global:WinServerSetupColors = @{
     StartupPath  = 'White'
     StartupOk    = 'Green'
     StartupDim   = 'DarkGray'
+    StartupNote  = 'Yellow'
 }
 
 # The startup banner, startup facts, and menu header are the only output that
@@ -97,6 +96,7 @@ $Global:WinServerSetupAnsiColors = @{
     StartupPath  = "$([char]27)[38;5;159m"
     StartupOk    = "$([char]27)[38;5;120m"
     StartupDim   = "$([char]27)[38;5;250m"
+    StartupNote  = "$([char]27)[38;5;227m"
 }
 
 $Global:WinServerSetupAnsiSupported = $null
@@ -150,15 +150,10 @@ function Test-AnsiSupported {
     return $supported
 }
 
-function Set-ColorEnabled {
-    param([Parameter(Mandatory)][bool]$Enabled)
-    $Global:NoColor = -not $Enabled
-}
-
 function Write-Themed {
     param(
         [Parameter(Mandatory, Position=0)][AllowEmptyString()][string]$Message,
-        [ValidateSet('Success','Error','Warning','Info','Prompt','Section','Option','OptionNum','Status','Summary','SummaryDim','Banner','BannerRule','MenuHeader','StartupLabel','StartupValue','StartupPath','StartupOk','StartupDim','Plain')]
+        [ValidateSet('Success','Error','Warning','Info','Prompt','Default','Section','Status','Summary','SummaryDim','Banner','BannerRule','MenuHeader','StartupLabel','StartupValue','StartupPath','StartupOk','StartupDim','StartupNote','Plain')]
         [string]$Kind = 'Plain',
         [switch]$NoNewline
     )
@@ -189,25 +184,6 @@ function Write-Themed {
     }
 }
 
-function Write-Color {
-    param([Parameter(Mandatory)][string]$Message, [string]$Color = "White")
-    if (Test-ColorSupported) {
-        try { Write-Host $Message -ForegroundColor $Color; return } catch { }
-    }
-    Write-Host $Message
-}
-
-function Write-InlineColor {
-    param(
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Message,
-        [string]$Color = "White"
-    )
-    if (Test-ColorSupported -and -not [string]::IsNullOrWhiteSpace($Color)) {
-        try { Write-Host $Message -ForegroundColor $Color -NoNewline; return } catch { }
-    }
-    Write-Host $Message -NoNewline
-}
-
 # Semantic console helpers (also forward to the structured log when active).
 function Write-Info {
     param([string]$Message)
@@ -230,7 +206,6 @@ function Write-Fail {
     Write-Themed ((("[ERROR]").PadRight(10)) + $Message) -Kind Error
     Write-StructuredLog -Level ERROR -Message $Message
 }
-function Write-Status  { param([string]$Message) Write-Themed $Message -Kind Status;            Write-StructuredLog -Level STATUS  -Message $Message }
 function Write-Summary { param([string]$Message) Write-Themed $Message -Kind Summary;           Write-StructuredLog -Level SUMMARY -Message $Message }
 
 # Startup facts print as plain "Label: value" lines. The label carries the
@@ -246,13 +221,17 @@ function Write-StartupLine {
         [string]$State = 'INFO'
     )
 
-    if ([string]::IsNullOrEmpty($Value)) {
+    $plainMessage = if ([string]::IsNullOrEmpty($Value)) { $Label } else { "{0}: {1}" -f $Label, $Value }
+
+    if ($State -eq 'LOG') {
+        # Print the log line as one solid note-yellow line, not a split
+        # label/value pair.
+        Write-Themed $plainMessage -Kind StartupNote
+    } elseif ([string]::IsNullOrEmpty($Value)) {
         Write-Themed $Label -Kind StartupDim
-        $plainMessage = $Label
     } else {
         Write-Themed ($Label + ': ') -Kind StartupLabel -NoNewline
         Write-Themed $Value -Kind $ValueKind
-        $plainMessage = "{0}: {1}" -f $Label, $Value
     }
     Write-StructuredLog -Level $State -Message $plainMessage
 }
@@ -275,7 +254,7 @@ function Get-ConsoleWidth {
 function Write-Banner {
     param([int]$Width = 0)
 
-    $title = "Windows Server Setup (WinServerSetup)"
+    $title = "Windows Server Setup"
     if ($Width -le 0) { $Width = Get-ConsoleWidth }
     if ($Width -lt $title.Length) { $Width = $title.Length }
 
@@ -292,16 +271,14 @@ function Write-Section {
     Write-StructuredLog -Level SECTION -Message $Title
 }
 
+# Menu style: light-blue option number, plain label.
 function Write-Option {
     param(
         [Parameter(Mandatory)][string]$Number,
-        [Parameter(Mandatory)][string]$Label,
-        [string]$Color = "Cyan",
-        [string]$NumberColor = "Green"
+        [Parameter(Mandatory)][string]$Label
     )
-    Write-InlineColor ("{0,3}. " -f $Number) -Color $NumberColor
-    Write-InlineColor $Label -Color $Color
-    Write-Host ""
+    Write-Themed ("{0,3}. " -f $Number) -Kind StartupLabel -NoNewline
+    Write-Host $Label
 }
 
 # In-place status line (overwrites previous line, no spinner spam).
@@ -453,7 +430,7 @@ function Read-HostThemed {
     try {
         Write-Themed ($Prompt + ": ") -Kind Prompt -NoNewline
         if (-not [string]::IsNullOrWhiteSpace($DefaultValue)) {
-            Write-InlineColor ("[{0}]" -f $DefaultValue) -Color $Global:WinServerSetupColors['Default']
+            Write-Themed ("[{0}]" -f $DefaultValue) -Kind Default -NoNewline
             Write-Host " " -NoNewline
         }
         $value = Read-Host
@@ -844,130 +821,10 @@ try { Remove-Item -LiteralPath `$MyInvocation.MyCommand.Path -Force -ErrorAction
 }
 
 # =============================================================================
-# CONTROLLED PARALLEL RUNNER
+# APPLICATION DOWNLOAD PREFETCH
 # =============================================================================
-# Runs a set of safe, independent script blocks concurrently with a hard cap on
-# how many can be in flight at once. Prefers Start-ThreadJob (lightweight, same
-# process) and falls back to Start-Job. Designed for VM-friendly limits.
-
-function Test-ThreadJobAvailable {
-    if (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue) { return $true }
-    if (Get-Module -ListAvailable -Name ThreadJob) { return $true }
-    return $false
-}
-
-function Invoke-Parallel {
-    param(
-        [Parameter(Mandatory)][array]$Tasks,        # each item: @{ Name='...'; Action={ ... } }
-        [int]$MaxParallel = 2
-    )
-    if (-not $Tasks -or $Tasks.Count -eq 0) { return }
-    if ($MaxParallel -lt 1) { $MaxParallel = 1 }
-
-    $useThreadJob = Test-ThreadJobAvailable
-    if ($useThreadJob -and -not (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)) {
-        try { Import-Module ThreadJob -ErrorAction Stop } catch { $useThreadJob = $false }
-    }
-    $runnerLabel = if ($useThreadJob) { 'ThreadJob' } else { 'Process Job' }
-    Write-Info ("Parallel runner: {0} task(s), max {1} concurrent ({2})." -f $Tasks.Count, $MaxParallel, $runnerLabel)
-
-    $jobs    = @{}
-    $pending = New-Object System.Collections.Generic.Queue[object]
-    foreach ($t in $Tasks) { $pending.Enqueue($t) }
-
-    while ($pending.Count -gt 0 -or $jobs.Count -gt 0) {
-        while ($jobs.Count -lt $MaxParallel -and $pending.Count -gt 0) {
-            $task = $pending.Dequeue()
-            $name = [string]$task.Name
-            $sb   = [scriptblock]$task.Action
-            try {
-                $job = if ($useThreadJob) { Start-ThreadJob -Name $name -ScriptBlock $sb } else { Start-Job -Name $name -ScriptBlock $sb }
-                $jobs[$job.Id] = @{ Name = $name; Job = $job; Started = Get-Date }
-                Write-Info ("Parallel start: {0}" -f $name)
-            } catch {
-                Write-Fail ("Parallel start failed for {0}: {1}" -f $name, $_.Exception.Message)
-                $null = $Global:RunStats.FailedTasks.Add("(parallel) $name")
-            }
-        }
-
-        if ($jobs.Count -eq 0) { break }
-
-        $finished = $jobs.Values | Where-Object { $_.Job.State -in @('Completed','Failed','Stopped') } | Select-Object -First 1
-        if ($finished) {
-            $j = $finished.Job
-            $elapsed = (Get-Date) - $finished.Started
-            try { $output = Receive-Job -Job $j -ErrorAction Stop -Keep } catch { $output = $_.Exception.Message }
-            if ($j.State -eq 'Completed') {
-                Write-Ok ("Parallel done : {0}  [{1:N1}s]" -f $finished.Name, $elapsed.TotalSeconds)
-            } else {
-                Write-Fail ("Parallel fail : {0}  [{1:N1}s]  {2}" -f $finished.Name, $elapsed.TotalSeconds, ($output -join '; '))
-                $null = $Global:RunStats.FailedTasks.Add("(parallel) $($finished.Name)")
-            }
-            Remove-Job -Job $j -Force -ErrorAction SilentlyContinue | Out-Null
-            $jobs.Remove($j.Id) | Out-Null
-        } else {
-            Start-Sleep -Milliseconds 250
-        }
-    }
-}
-
-function Start-ParallelTasks {
-    param(
-        [Parameter(Mandatory)][array]$Tasks,
-        [int]$MaxParallel = 2
-    )
-    if (-not $Tasks -or $Tasks.Count -eq 0) { return @() }
-    if ($MaxParallel -lt 1) { $MaxParallel = 1 }
-
-    $useThreadJob = Test-ThreadJobAvailable
-    if ($useThreadJob -and -not (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)) {
-        try { Import-Module ThreadJob -ErrorAction Stop } catch { $useThreadJob = $false }
-    }
-
-    $started = New-Object System.Collections.Generic.List[object]
-    foreach ($task in $Tasks | Select-Object -First $MaxParallel) {
-        $name = [string]$task.Name
-        $sb = [scriptblock]$task.Action
-        try {
-            $job = if ($useThreadJob) { Start-ThreadJob -Name $name -ScriptBlock $sb } else { Start-Job -Name $name -ScriptBlock $sb }
-            $started.Add([pscustomobject]@{ Name = $name; Job = $job; Started = Get-Date }) | Out-Null
-            Write-Info ("Parallel start: {0}" -f $name)
-        } catch {
-            Write-Warn ("Parallel start failed for {0}: {1}" -f $name, $_.Exception.Message)
-            $null = $Global:RunStats.FailedTasks.Add("(parallel) $name")
-        }
-    }
-    return @($started)
-}
-
-function Wait-ParallelTasks {
-    param([array]$StartedTasks)
-    foreach ($item in @($StartedTasks)) {
-        if (-not $item -or -not $item.Job) { continue }
-        $job = $item.Job
-        try {
-            Wait-Job -Job $job | Out-Null
-            $elapsed = (Get-Date) - $item.Started
-            $output = @()
-            try { $output = @(Receive-Job -Job $job -ErrorAction SilentlyContinue) } catch { $output = @($_.Exception.Message) }
-            foreach ($line in $output) {
-                $text = [string]$line
-                if (-not [string]::IsNullOrWhiteSpace($text)) {
-                    Write-StructuredLog -Level OUTPUT -Message ("parallel {0}> {1}" -f $item.Name, $text.TrimEnd())
-                }
-            }
-            if ($job.State -eq 'Completed') {
-                Write-Ok ("Parallel done : {0}  [{1:N1}s]" -f $item.Name, $elapsed.TotalSeconds)
-                $null = $Global:RunStats.CompletedTasks.Add("(parallel) $($item.Name)")
-            } else {
-                Write-Warn ("Parallel fail : {0}  [{1:N1}s] state={2}" -f $item.Name, $elapsed.TotalSeconds, $job.State)
-                $null = $Global:RunStats.FailedTasks.Add("(parallel) $($item.Name)")
-            }
-        } finally {
-            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
-        }
-    }
-}
+# Runs the prefetch helper as a background process so installers download while
+# sequential setup continues, then waits for it before the install pass.
 
 function Start-ApplicationDownloadPrefetch {
     param([int]$MaxParallel = 4)
@@ -3398,35 +3255,35 @@ function Show-MainMenu {
     while ($true) {
         Write-Host ""
         Write-Themed "WinServerSetup Main menu:" -Kind MenuHeader
-        Write-Option -Number "1"  -Label "Run full setup"                                      -Color "Cyan"
-        Write-Option -Number "2"  -Label "Windows Update (multi-pass)"                         -Color "Cyan"
-        Write-Option -Number "3"  -Label "Activation from config only"                         -Color "Cyan"
-        Write-Option -Number "4"  -Label "Apply dark mode + taskbar"                           -Color "Cyan"
-        Write-Option -Number "5"  -Label "Show file extensions"                                -Color "Cyan"
-        Write-Option -Number "5b" -Label "Enable Windows long paths"                           -Color "Cyan"
-        Write-Option -Number "6"  -Label "Add Persian keyboard layout"                         -Color "Cyan"
-        Write-Option -Number "7"  -Label "Install applications (winget + direct + v2rayN + PS7 + WT)" -Color "Cyan"
-        Write-Option -Number "8"  -Label "Install Brave extensions"                            -Color "Cyan"
-        Write-Option -Number "9"  -Label "Configure default browser/player"                    -Color "Cyan"
-        Write-Option -Number "9b" -Label "Set 7-Zip as default for compressed file extensions" -Color "Cyan"
-        Write-Option -Number "10" -Label "Configure RDP port and firewall (safe)"              -Color "Cyan"
-        Write-Option -Number "11" -Label "Enable Search Indexing"                              -Color "Cyan"
-        Write-Option -Number "12" -Label "Install .NET + Visual C++ runtimes (no ASP.NET)"     -Color "Cyan"
-        Write-Option -Number "13" -Label "Setup Empty Cache task"                              -Color "Cyan"
-        Write-Option -Number "14" -Label "Configure Windows Update bandwidth / QoS"            -Color "Cyan"
-        Write-Option -Number "15" -Label "Install RDP brute-force blocker (hidden)"            -Color "Cyan"
-        Write-Option -Number "16" -Label "Disable startup apps (AzureArcSysTray, S9Proxy, etc)" -Color "Cyan"
-        Write-Option -Number "17" -Label "Remove Feedback Hub / Appx packages"                 -Color "Cyan"
-        Write-Option -Number "18" -Label "Remove Windows capabilities (AzureArcSetup, etc)"    -Color "Cyan"
-        Write-Option -Number "19" -Label "Replace Edge taskbar pin with Brave"                 -Color "Cyan"
-        Write-Option -Number "20" -Label "Pin folders to Quick Access"                         -Color "Cyan"
-        Write-Option -Number "21" -Label "Custom folders and Defender exclusions"              -Color "Cyan"
-        Write-Option -Number "22" -Label "Clean temp and cache"                                -Color "Cyan"
-        Write-Option -Number "23" -Label "Health check"                                        -Color "Cyan"
-        Write-Option -Number "24" -Label "Final summary"                                       -Color "Cyan"
-        Write-Option -Number "25" -Label "Schedule post-reboot SFC"                            -Color "Cyan"
-        Write-Option -Number "26" -Label "Reboot now (if pending)"                             -Color "Cyan"
-        Write-Option -Number "0"  -Label "Back / Exit"                                         -Color "Cyan"
+        Write-Option -Number "1"  -Label "Run full setup"
+        Write-Option -Number "2"  -Label "Windows Update (multi-pass)"
+        Write-Option -Number "3"  -Label "Activation from config only"
+        Write-Option -Number "4"  -Label "Apply dark mode + taskbar"
+        Write-Option -Number "5"  -Label "Show file extensions"
+        Write-Option -Number "5b" -Label "Enable Windows long paths"
+        Write-Option -Number "6"  -Label "Add Persian keyboard layout"
+        Write-Option -Number "7"  -Label "Install applications (winget + direct + v2rayN + PS7 + WT)"
+        Write-Option -Number "8"  -Label "Install Brave extensions"
+        Write-Option -Number "9"  -Label "Configure default browser/player"
+        Write-Option -Number "9b" -Label "Set 7-Zip as default for compressed file extensions"
+        Write-Option -Number "10" -Label "Configure RDP port and firewall (safe)"
+        Write-Option -Number "11" -Label "Enable Search Indexing"
+        Write-Option -Number "12" -Label "Install .NET + Visual C++ runtimes (no ASP.NET)"
+        Write-Option -Number "13" -Label "Setup Empty Cache task"
+        Write-Option -Number "14" -Label "Configure Windows Update bandwidth / QoS"
+        Write-Option -Number "15" -Label "Install RDP brute-force blocker (hidden)"
+        Write-Option -Number "16" -Label "Disable startup apps (AzureArcSysTray, S9Proxy, etc)"
+        Write-Option -Number "17" -Label "Remove Feedback Hub / Appx packages"
+        Write-Option -Number "18" -Label "Remove Windows capabilities (AzureArcSetup, etc)"
+        Write-Option -Number "19" -Label "Replace Edge taskbar pin with Brave"
+        Write-Option -Number "20" -Label "Pin folders to Quick Access"
+        Write-Option -Number "21" -Label "Custom folders and Defender exclusions"
+        Write-Option -Number "22" -Label "Clean temp and cache"
+        Write-Option -Number "23" -Label "Health check"
+        Write-Option -Number "24" -Label "Final summary"
+        Write-Option -Number "25" -Label "Schedule post-reboot SFC"
+        Write-Option -Number "26" -Label "Reboot now (if pending)"
+        Write-Option -Number "0"  -Label "Back / Exit"
         Write-Host ""
 
         $choice = Read-HostUntimed -Prompt "Select" -DefaultValue "1"
