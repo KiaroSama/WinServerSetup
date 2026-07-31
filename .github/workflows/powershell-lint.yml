@@ -1,14 +1,18 @@
-name: PowerShell Lint
+name: PowerShell CI
 
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
-  parse-and-analyze:
+  validate:
+    name: Parse, analyze and test
     runs-on: windows-latest
+    timeout-minutes: 25
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,38 +20,56 @@ jobs:
       - name: Validate JSON config
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           Get-Content -Raw -Encoding UTF8 .\WinServerSetup.config.json | ConvertFrom-Json | Out-Null
-          Write-Host "WinServerSetup.config.json is valid JSON."
+          Write-Host 'WinServerSetup.config.json is valid JSON.'
 
-      - name: Parse-check all *.ps1
+      # The runtime scripts must stay loadable on Windows PowerShell 5.1 as well as PowerShell 7,
+      # so both hosts parse every file.
+      - name: Parse-check all *.ps1 (PowerShell 7)
         shell: pwsh
-        run: |
-          $bad = 0
-          Get-ChildItem -Path . -Recurse -Filter *.ps1 | ForEach-Object {
-            $tokens = $null; $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
-            if ($errors -and $errors.Count -gt 0) {
-              $bad++
-              Write-Host "::error file=$($_.FullName)::Parse errors:"
-              $errors | ForEach-Object {
-                Write-Host ("::error file={0},line={1},col={2}::{3}" -f $_.Extent.File, $_.Extent.StartLineNumber, $_.Extent.StartColumnNumber, $_.Message)
-              }
-            } else {
-              Write-Host "OK $($_.FullName)"
-            }
-          }
-          if ($bad -gt 0) { exit 1 }
+        run: ./.github/parse-check.ps1
+
+      - name: Parse-check all *.ps1 (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./.github/parse-check.ps1
 
       - name: Install PSScriptAnalyzer
         shell: pwsh
-        run: Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
 
-      - name: Run PSScriptAnalyzer
+      # Error AND Warning severity. Suppressions are narrow and documented in
+      # PSScriptAnalyzerSettings.psd1; warnings are not blanket-ignored.
+      - name: Run PSScriptAnalyzer (Error + Warning)
         shell: pwsh
         run: |
-          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
-          if ($results) {
-            $results | Format-Table -AutoSize | Out-Host
-            exit 1
+          $ErrorActionPreference = 'Stop'
+          $targets = @('WinServerSetup.ps1', 'Run-WinServerSetup.ps1', 'Publish-ToGitHub.ps1') |
+              ForEach-Object { (Resolve-Path $_).Path }
+          $targets += (Get-ChildItem .\scripts -Filter *.ps1 -File).FullName
+          $targets += (Get-ChildItem .\tests   -Filter *.ps1 -File).FullName
+
+          $findings = foreach ($target in $targets) {
+              Invoke-ScriptAnalyzer -Path $target -Settings .\PSScriptAnalyzerSettings.psd1
           }
-          Write-Host "PSScriptAnalyzer found no Error-severity issues."
+          if ($findings) {
+              $findings | Format-Table -AutoSize | Out-Host
+              foreach ($finding in $findings) {
+                  Write-Host ("::error file={0},line={1}::{2}: {3}" -f `
+                      $finding.ScriptPath, $finding.Line, $finding.RuleName, $finding.Message)
+              }
+              exit 1
+          }
+          Write-Host ("PSScriptAnalyzer clean at Error+Warning across {0} files." -f $targets.Count)
+
+      # Suites are discovered from disk by the runner, so a newly added tests\*.Tests.ps1 can never
+      # be silently left out of CI. Each suite gets a bounded wall timeout.
+      - name: Run tests (PowerShell 7)
+        shell: pwsh
+        run: ./tests/Invoke-AllTests.ps1 -TimeoutSeconds 180
+
+      - name: Run tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./tests/Invoke-AllTests.ps1 -TimeoutSeconds 180

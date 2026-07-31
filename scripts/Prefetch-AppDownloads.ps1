@@ -16,6 +16,10 @@ $ProgressPreference = "SilentlyContinue"
     [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11
 
 $script:ProjectRootOverride = $ProjectRoot
+$script:PrefetchJobTimeoutSeconds = 300
+# Ceiling for the whole prefetch phase. Per-job timeouts alone do not bound the loop: a queue
+# that keeps starting fresh jobs can outlive the sequential setup it is supposed to run beside.
+$script:PrefetchTotalTimeoutSeconds = 1800
 
 function Resolve-ProjectRoot {
     if (-not [string]::IsNullOrWhiteSpace($script:ProjectRootOverride) -and (Test-Path $script:ProjectRootOverride)) { return (Resolve-Path -LiteralPath $script:ProjectRootOverride).Path }
@@ -29,7 +33,48 @@ function Write-PrefetchLog {
         [string]$Level = "INFO"
     )
     $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    Add-Content -LiteralPath $script:ResolvedLogPath -Value $line -Encoding utf8
+    # 'Local\' (per-session), not 'Global\': creating a kernel object in the global namespace
+    # needs SeCreateGlobalPrivilege, which a standard user does not hold. This script is
+    # documented as directly runnable, and every worker is a child job of this one process
+    # tree in the same session, so the session-local namespace is sufficient.
+    $mutex = New-Object System.Threading.Mutex($false, 'Local\WinServerSetup-PrefetchLog')
+    $acquired = $false
+    try {
+        try { $acquired = $mutex.WaitOne(30000) } catch [System.Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) { throw "Timed out waiting for the prefetch log lock." }
+        Add-Content -LiteralPath $script:ResolvedLogPath -Value $line -Encoding utf8
+    } finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+# Drains a job's stdout/error into the prefetch log so a failure can actually be diagnosed.
+# Previously this output went to Out-Null, leaving only "Failed: <name> state=Failed".
+function Write-JobDiagnostics {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [object[]]$Output
+    )
+    $written = 0
+    foreach ($item in @($Output)) {
+        $text = [string]$item
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        # Redact credentials embedded in URLs and token-bearing query parameters before logging.
+        $text = [regex]::Replace($text, '(?i)://[^/@\s]+:[^/@\s]+@', '://***:***@')
+        $text = [regex]::Replace($text, '(?i)([?&](?:token|key|sig|signature|password|secret|access[_-]?key)=)[^&\s]*', '${1}***')
+        foreach ($rawLine in ($text -split "`r?`n")) {
+            if ([string]::IsNullOrWhiteSpace($rawLine)) { continue }
+            if ($written -ge 40) {
+                Write-PrefetchLog ("[{0}] (output truncated)" -f $Name) "JOB"
+                return
+            }
+            $line = $rawLine.Trim()
+            if ($line.Length -gt 500) { $line = $line.Substring(0, 500) + " ..." }
+            Write-PrefetchLog ("[{0}] {1}" -f $Name, $line) "JOB"
+            $written++
+        }
+    }
 }
 
 function Ensure-Directory {
@@ -64,7 +109,10 @@ function Join-SafeDownloadPath {
 
 function Add-Task {
     param(
-        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Tasks,
+        # AllowEmptyCollection is required: a Mandatory collection parameter otherwise rejects an
+        # empty list, so the FIRST task could never be added and New-PrefetchTasks threw on every
+        # run before a single download started.
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Tasks,
         [Parameter(Mandatory)][hashtable]$Task
     )
     $Tasks.Add([pscustomobject]$Task) | Out-Null
@@ -73,7 +121,7 @@ function Add-Task {
 function Resolve-EverythingDownload {
     param([string]$Url)
     try {
-        $page = Invoke-WebRequest -Uri $Url -UseBasicParsing -ErrorAction Stop
+        $page = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
         $regexMatches = [regex]::Matches([string]$page.Content, 'Everything-(\d+\.\d+\.\d+\.\d+)\.x64-Setup\.exe')
         $latest = $regexMatches | ForEach-Object {
             [pscustomobject]@{ Version = [version]$_.Groups[1].Value; File = $_.Value }
@@ -98,7 +146,11 @@ function New-PrefetchTasks {
         [Parameter(Mandatory)][object]$Config,
         [Parameter(Mandatory)][string]$DownloadRoot
     )
-    $tasks = New-Object System.Collections.Generic.List[object]
+    # ::new(), not New-Object: a List[object] built by New-Object comes back PSObject-wrapped,
+    # and wrapping THAT in @() throws "Argument types do not match" on both 5.1 and 7 - which
+    # made `return @($tasks)` below fail on every run. List[string] is unaffected, so the trap
+    # only shows up for object lists.
+    $tasks = [System.Collections.Generic.List[object]]::new()
 
     foreach ($spec in @($Config.directInstallers)) {
         if (-not $spec.enabled) { continue }
@@ -139,25 +191,6 @@ function New-PrefetchTasks {
         }
     }
 
-    $wingetRoot = Join-Path $DownloadRoot "winget"
-    foreach ($pkg in @($Config.winget.packages)) {
-        if (-not $pkg.enabled) { continue }
-        Add-Task -Tasks $tasks -Task @{
-            Kind = "WingetDownload"
-            Name = [string]$pkg.name
-            Id = [string]$pkg.id
-            DownloadRoot = $wingetRoot
-        }
-    }
-    if ($Config.windowsTerminal -and $Config.windowsTerminal.enabled) {
-        Add-Task -Tasks $tasks -Task @{
-            Kind = "WingetDownload"
-            Name = "Windows Terminal"
-            Id = [string]$Config.windowsTerminal.packageId
-            DownloadRoot = $wingetRoot
-        }
-    }
-
     return @($tasks)
 }
 
@@ -178,7 +211,16 @@ function Invoke-TaskJob {
         function Log {
             param([string]$Message, [string]$Level = "INFO")
             $line = "[{0}] [{1}] [{2}] {3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, [string]$Task.Name, $Message
-            Add-Content -LiteralPath $script:WorkerLogPath -Value $line -Encoding utf8
+            $mutex = New-Object System.Threading.Mutex($false, 'Local\WinServerSetup-PrefetchLog')
+            $acquired = $false
+            try {
+                try { $acquired = $mutex.WaitOne(30000) } catch [System.Threading.AbandonedMutexException] { $acquired = $true }
+                if (-not $acquired) { throw "Timed out waiting for the prefetch log lock." }
+                Add-Content -LiteralPath $script:WorkerLogPath -Value $line -Encoding utf8
+            } finally {
+                if ($acquired) { $mutex.ReleaseMutex() }
+                $mutex.Dispose()
+            }
         }
 
         function EnsureDir {
@@ -200,7 +242,7 @@ function Invoke-TaskJob {
             $tmp = "$Destination.partial"
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
             Log "Downloading $Url -> $Destination"
-            Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -ErrorAction Stop
+            Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -TimeoutSec 120 -MaximumRedirection 5 -ErrorAction Stop
             if ((Get-Item -LiteralPath $tmp).Length -lt 1024) {
                 throw "Downloaded file is unexpectedly small."
             }
@@ -219,38 +261,19 @@ function Invoke-TaskJob {
                     $downloadRoot = [string]$Task.DownloadRoot
                     EnsureDir $downloadRoot
                     Log "Querying latest GitHub release: $repo"
-                    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing -Headers @{ 'User-Agent' = 'WinServerSetup' }
+                    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing -TimeoutSec 120 -Headers @{ 'User-Agent' = 'WinServerSetup' }
                     $asset = $release.assets | Where-Object { $_.name -match $regex } | Select-Object -First 1
                     if (-not $asset) { throw "No release asset matched regex: $regex" }
                     $destination = Join-Path $downloadRoot (Split-Path -Leaf ([string]$asset.name))
                     DownloadUrl -Url ([string]$asset.browser_download_url) -Destination $destination
                 }
-                "WingetDownload" {
-                    $id = [string]$Task.Id
-                    if ([string]::IsNullOrWhiteSpace($id)) { throw "Empty winget id." }
-                    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-                        Log "winget not available; pre-download skipped. Install phase will handle it." "WARN"
-                        break
-                    }
-                    $downloadRoot = [string]$Task.DownloadRoot
-                    EnsureDir $downloadRoot
-                    $wingetDownloadArgs = @("download", "--id", $id, "--exact", "--source", "winget", "--download-directory", $downloadRoot, "--accept-package-agreements", "--accept-source-agreements")
-                    Log ("Running: winget {0}" -f ($wingetDownloadArgs -join ' '))
-                    $output = @(& winget @wingetDownloadArgs 2>&1)
-                    foreach ($line in $output) {
-                        $text = [string]$line
-                        if (-not [string]::IsNullOrWhiteSpace($text)) { Log ("winget> {0}" -f $text.TrimEnd()) }
-                    }
-                    if ($LASTEXITCODE -eq 0) {
-                        Log "winget download completed." "OK"
-                    } else {
-                        Log "winget download exited with code $LASTEXITCODE. Sequential install may download during install." "WARN"
-                    }
-                }
             }
         } catch {
-            Log $_.Exception.Message "ERROR"
-            throw
+            # Capture the real failure first. Logging can itself fail (lock timeout, unwritable
+            # path, full disk); if it does, that secondary error must not replace the cause.
+            $original = $_
+            try { Log $original.Exception.Message "ERROR" } catch { $null = $_ }
+            throw $original
         }
     }
 
@@ -280,7 +303,29 @@ foreach ($task in $tasks) { $pending.Enqueue($task) }
 $jobs = @{}
 $failed = 0
 
+$deadline = (Get-Date).AddSeconds($script:PrefetchTotalTimeoutSeconds)
+
 while ($pending.Count -gt 0 -or $jobs.Count -gt 0) {
+    if ((Get-Date) -ge $deadline) {
+        Write-PrefetchLog ("Overall prefetch deadline of {0}s reached; stopping remaining work." -f $script:PrefetchTotalTimeoutSeconds) "ERROR"
+        foreach ($entry in @($jobs.GetEnumerator())) {
+            $failed++
+            Write-PrefetchLog "Incomplete at deadline: $($entry.Value.Name)" "ERROR"
+            Stop-Job -Job $entry.Value.Job -ErrorAction SilentlyContinue
+            $deadlineErrors = $null
+            $deadlineOutput = @()
+            try { $deadlineOutput = @(Receive-Job -Job $entry.Value.Job -ErrorAction SilentlyContinue -ErrorVariable deadlineErrors) } catch { $deadlineErrors = @($_) }
+            Write-JobDiagnostics -Name $entry.Value.Name -Output (@($deadlineOutput) + @($deadlineErrors))
+            Remove-Job -Job $entry.Value.Job -Force -ErrorAction SilentlyContinue
+            $jobs.Remove($entry.Key) | Out-Null
+        }
+        while ($pending.Count -gt 0) {
+            $failed++
+            Write-PrefetchLog "Never started before the deadline: $(($pending.Dequeue()).Name)" "ERROR"
+        }
+        break
+    }
+
     while ($jobs.Count -lt $MaxParallel -and $pending.Count -gt 0) {
         $task = $pending.Dequeue()
         try {
@@ -294,18 +339,34 @@ while ($pending.Count -gt 0 -or $jobs.Count -gt 0) {
     }
 
     if ($jobs.Count -eq 0) { break }
+    foreach ($entry in @($jobs.GetEnumerator())) {
+        if (((Get-Date) - $entry.Value.Started).TotalSeconds -le $script:PrefetchJobTimeoutSeconds) { continue }
+        $failed++
+        Write-PrefetchLog "Timed out: $($entry.Value.Name) after $($script:PrefetchJobTimeoutSeconds)s" "ERROR"
+        Stop-Job -Job $entry.Value.Job -ErrorAction SilentlyContinue
+        $timeoutErrors = $null
+        $timeoutOutput = @()
+        try { $timeoutOutput = @(Receive-Job -Job $entry.Value.Job -ErrorAction SilentlyContinue -ErrorVariable timeoutErrors) } catch { $timeoutErrors = @($_) }
+        Write-JobDiagnostics -Name $entry.Value.Name -Output (@($timeoutOutput) + @($timeoutErrors))
+        Remove-Job -Job $entry.Value.Job -Force -ErrorAction SilentlyContinue
+        $jobs.Remove($entry.Key) | Out-Null
+    }
+    if ($jobs.Count -eq 0) { continue }
     $finished = Wait-Job -Job ($jobs.Values.Job) -Any -Timeout 2
     if (-not $finished) { continue }
 
     foreach ($job in @($finished)) {
         $meta = $jobs[$job.Id]
         $elapsed = (Get-Date) - $meta.Started
-        try { Receive-Job -Job $job -ErrorAction SilentlyContinue | Out-Null } catch { Write-PrefetchLog "Receive-Job failed for $($meta.Name): $($_.Exception.Message)" "WARN" }
+        $jobErrors = $null
+        $jobOutput = @()
+        try { $jobOutput = @(Receive-Job -Job $job -ErrorAction SilentlyContinue -ErrorVariable jobErrors) } catch { $jobErrors = @($_) }
         if ($job.State -eq "Completed") {
             Write-PrefetchLog ("Completed: {0} [{1:N1}s]" -f $meta.Name, $elapsed.TotalSeconds) "OK"
         } else {
             $failed++
             Write-PrefetchLog ("Failed: {0} [{1:N1}s] state={2}" -f $meta.Name, $elapsed.TotalSeconds, $job.State) "ERROR"
+            Write-JobDiagnostics -Name $meta.Name -Output (@($jobOutput) + @($jobErrors))
         }
         Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
         $jobs.Remove($job.Id) | Out-Null

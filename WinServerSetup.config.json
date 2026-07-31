@@ -19,15 +19,16 @@
     "scheduleSfcAfterReboot": true
   },
   "activation": {
-    "enabled": true,
+    "enabled": false,
     "productKey": "",
-    "kmsServer": "kms.digiboy.ir"
+    "kmsServer": ""
   },
   "windowsUpdate": {
     "enabled": true,
     "usePSWindowsUpdateModule": true,
     "autoReboot": false,
-    "maxPasses": 4
+    "maxPasses": 4,
+    "jobTimeoutMinutes": 120
   },
   "appearance": {
     "darkMode": true,
@@ -59,7 +60,7 @@
     "installDotNetFramework4Plus": true,
     "dotNetFramework481OfflineUrl": "https://go.microsoft.com/fwlink/?linkid=2203305",
     "installDotNetCoreRuntimes": true,
-    "includeUnsupportedDotNetVersions": true
+    "includeUnsupportedDotNetVersions": false
   },
   "winget": {
     "installIfMissing": true,
@@ -85,7 +86,10 @@
       "fileName": "9proxy-windows-installer.exe",
       "silentArgs": "/S",
       "fallbackInteractive": true,
-      "verifyRegistryName": "9Proxy"
+      "verifyRegistryName": "9Proxy",
+      "requireValidSignature": true,
+      "allowedSignerSubjects": ["9Proxy"],
+      "allowedDownloadHosts": ["static.9proxy-cdn.net"]
     },
     {
       "name": "Dolphin Anty",
@@ -94,7 +98,10 @@
       "fileName": "dolphin-anty-win-latest.exe",
       "silentArgs": "/S",
       "fallbackInteractive": true,
-      "verifyRegistryName": "Dolphin Anty"
+      "verifyRegistryName": "Dolphin Anty",
+      "requireValidSignature": true,
+      "allowedSignerSubjects": ["Dolphin"],
+      "allowedDownloadHosts": ["app.dolphin-anty-mirror3.net"]
     },
     {
       "name": "GoLogin",
@@ -103,7 +110,10 @@
       "fileName": "gologin.exe",
       "silentArgs": "/S",
       "fallbackInteractive": true,
-      "verifyRegistryName": "GoLogin"
+      "verifyRegistryName": "GoLogin",
+      "requireValidSignature": true,
+      "allowedSignerSubjects": ["GoLogin"],
+      "allowedDownloadHosts": ["dl.gologin.com", "*.amazonaws.com"]
     },
     {
       "name": "Everything",
@@ -113,6 +123,9 @@
       "silentArgs": "/S",
       "fallbackInteractive": true,
       "verifyRegistryName": "Everything",
+      "requireValidSignature": true,
+      "allowedSignerSubjects": ["voidtools"],
+      "allowedDownloadHosts": ["www.voidtools.com"],
       "enableService": true
     }
   ],
@@ -123,6 +136,7 @@
     "installDir": "C:\\portable",
     "finalFolderName": "V2rayN",
     "exeName": "v2rayN.exe",
+    "preserveUserDataPaths": [ "guiNDB.db", "guiConfigs", "config.json" ],
     "createDesktopShortcut": true,
     "createStartMenuShortcut": true
   },
@@ -195,7 +209,7 @@
     ]
   },
   "emptyStandbyList": {
-    "enabled": true,
+    "enabled": false,
     "sourceRepo": "stefanpejcic/EmptyStandbyList",
     "installDir": "C:\\Empty Cache",
     "exeName": "EmptyStandbyList.exe",
@@ -217,9 +231,15 @@
     "threshold": 7,
     "lookbackMinutes": 30,
     "taskName": "WinServerSetup RDP Bruteforce Blocker",
-    "taskIntervalMinutes": 5,
+    "taskIntervalMinutes": 1,
     "rulePrefix": "WinServerSetup RDP Block",
     "hidden": true,
+    "includeNetworkLogonType3": false,
+    "blockAllInbound": false,
+    "permanentBlock": false,
+    "ruleRetentionDays": 30,
+    "logMaxBytes": 5242880,
+    "logRetentionFiles": 3,
     "whitelistCIDRs": [
       "127.0.0.1/32"
     ]
@@ -249,7 +269,17 @@
     "scriptsPath": "C:\\portable\\Scripts",
     "createCompressedInDownloads": true,
     "compressedFolderName": "compressed",
-    "excludeCompressedFromDefender": true
+    "excludeCompressedFromDefender": false
+  },
+  "administratorAccount": {
+    "enabled": false,
+    "promptDuringFullSetup": false,
+    "defaultNewName": ""
+  },
+  "accountLockout": {
+    "disableLocalAccountLockout": false,
+    "promptDuringFullSetup": false,
+    "runGpupdate": false
   },
   "cleanup": {
     "enabled": true,

@@ -248,7 +248,34 @@ The Persian keyboard layout is appended to the current user's language list. Exi
 
 Default app association XML imports through DISM apply to new user profiles. Current-user defaults are also attempted where the project has safe per-user logic, but Windows may still require manual selection in Settings for protected defaults.
 
-The RDP brute-force blocker scans failed network and RemoteInteractive logons (`LogonType` 3 and 10) and blocks sources that meet the configured threshold. The default threshold is `7`, which means more than 6 failed attempts in the lookback window. Block messages include IP address, fail count, logon type(s), and targeted username(s).
+The RDP brute-force blocker scans failed **RemoteInteractive** logons (`LogonType` 10) and blocks sources that meet the configured threshold. The default threshold is `7`, which means more than 6 failed attempts in the lookback window. Block messages include IP address, fail count, logon type(s), and the targeted username(s) exactly as recorded in the event, so a renamed built-in Administrator account is reported under its real name.
+
+**Network Level Authentication changes which events an attack produces, and this matters.** NLA is the default on current Windows and Windows Server. Because NLA authenticates *before* any interactive session exists, a failed RDP sign-in is written to Security event 4625 as `LogonType` **3** (Network), not `LogonType` 10. A blocker that matches only `LogonType` 10 therefore misses the ordinary attack completely.
+
+`LogonType` 3 on its own is ambiguous — SMB and other network logons produce it too — so counting every type 3 failure would cause false positives. The blocker resolves this with RDP-specific evidence: it reads `Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational` events **140** (failed RDP authentication) and **131** (accepted RDP connection), both of which carry the client address. A `LogonType` 3 failure is counted only when that same address is confirmed to have spoken RDP to this host inside the lookback window. Every block records the evidence class (`RemoteInteractive`, `Network+RdpChannel`, or `Network(opt-in)`) so you can see why an address was counted.
+
+If that channel is unavailable or disabled, the blocker logs a warning and falls back to `LogonType` 10 only — meaning NLA-mode attacks will be invisible until you enable the channel or set `rdpBruteforceBlocker.includeNetworkLogonType3`. That opt-in counts **all** network-logon failures regardless of RDP attribution; it is broader and more prone to false positives, so prefer the channel.
+
+Known limitation: RdpCoreTS event 140 is not written when the attempted username actually exists on the host, which is why event 131 (connection attempts) is read as well.
+
+Blocks are scoped to the configured RDP TCP port, not to all inbound traffic from the address, unless `rdpBruteforceBlocker.blockAllInbound` is explicitly enabled. Managed rules expire after `ruleRetentionDays` unless `permanentBlock` is set, so the rule set cannot grow without bound. Only explicit `whitelistCIDRs` entries bypass blocking. The blocker is IPv4-only: IPv6 sources and IPv6 CIDR whitelist entries are rejected by configuration validation rather than silently ignored.
+
+### Security-sensitive defaults
+
+These defaults are deliberately conservative. Each is opt-in because enabling it weakens the machine or trusts a third party:
+
+| Setting | Default | Why |
+| --- | --- | --- |
+| `activation.enabled`, `activation.productKey`, `activation.kmsServer` | disabled / empty | No third-party KMS server is shipped enabled. Activate only where you hold the legal right; put keys in the git-ignored `WinServerSetup.config.local.json`, never in the tracked config. |
+| `runtimes.includeUnsupportedDotNetVersions` | `false` | Out-of-support runtimes receive no security fixes. |
+| `customFolders.excludeCompressedFromDefender` | `false` | A Defender exclusion on a user-writable Downloads subfolder is a malware-staging path. |
+| `emptyStandbyList.enabled` | `false` | The upstream binary is fetched from a branch, not a pinned release, and would run as `SYSTEM`. |
+| `rdpBruteforceBlocker.includeNetworkLogonType3` | `false` | `LogonType` 3 is not RDP-specific and causes false positives. |
+| `rdpBruteforceBlocker.blockAllInbound` | `false` | Host-wide blocks are far broader than the threat. |
+| `administratorAccount.enabled` | `false` | Renaming the built-in account is an explicit, interactive decision. |
+| `accountLockout.disableLocalAccountLockout` | `false` | Machine-wide: it removes lockout for **every** local account, trading login-flood resistance for unlimited password guessing. Only pair it with a strong password plus RDP allowlisting or VPN. |
+
+Direct installers require a valid Authenticode signature from an expected publisher (`requireValidSignature`, `allowedSignerSubjects`) and are constrained to `allowedDownloadHosts`. Downloads reject non-HTTPS URLs and validate the final URI after redirects.
 
 ## Troubleshooting
 
@@ -286,7 +313,61 @@ Check all network layers, not only Windows Firewall. The new port must be allowe
 
 ### Post-reboot SFC did not run
 
-Check Task Scheduler for `WinServerSetup Post-Reboot SFC` and review `logs\sfc-result.log`. The task unregisters itself after it runs.
+Check Task Scheduler for `WinServerSetup Post-Reboot SFC` and review the newest `logs\Run-PostRebootSfc_<timestamp>_UTC.log`. Each execution writes its own timestamped log instead of overwriting a single file, so earlier attempts stay available.
+
+The task unregisters itself **only after a successful run**. If SFC fails, the task stays registered and retries on the next startup, up to its bounded retry count. If it never succeeds, run `sfc /scannow` manually and remove the task once the machine is healthy:
+
+```powershell
+Unregister-ScheduledTask -TaskName "WinServerSetup Post-Reboot SFC" -Confirm:$false
+```
+
+## Recovery Procedures
+
+### Roll back the RDP port
+
+The port change is verified before the old port is closed, and a failed change is rolled back automatically. To reverse a completed change manually, set the registry value back and restart the service:
+
+```powershell
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name PortNumber -Value 3389 -Type DWord
+Restart-Service TermService -Force
+Get-NetTCPConnection -LocalPort 3389 -State Listen
+```
+
+Confirm the listener belongs to Remote Desktop Services, then allow the restored port in Windows Firewall **and** at every other layer (VPS provider firewall, NAT rule, cloud security group).
+
+### Undo an accidental firewall block
+
+Blocker rules are named `<rulePrefix> <ip>` and tagged `ManagedBy=WinServerSetup` in their description. Inspect and remove a specific block:
+
+```powershell
+Get-NetFirewallRule -DisplayName "WinServerSetup RDP Block *" | Select-Object DisplayName, Enabled, Action, Description
+Remove-NetFirewallRule -DisplayName "WinServerSetup RDP Block 203.0.113.10"
+```
+
+To stop the blocker entirely while you investigate, disable its scheduled task; to clear its rolling counters, delete the state file:
+
+```powershell
+Disable-ScheduledTask -TaskName "WinServerSetup RDP Bruteforce Blocker"
+Remove-Item .\state\rdp-blocker-state.json -ErrorAction SilentlyContinue
+```
+
+### Whitelist your own address before locking yourself out
+
+Add your source network to `rdpBruteforceBlocker.whitelistCIDRs` **before** enabling the blocker on a remote machine. Only these entries bypass blocking; an established RDP session is not trusted on its own.
+
+```jsonc
+"whitelistCIDRs": [ "127.0.0.1/32", "203.0.113.0/24" ]
+```
+
+Entries must be valid IPv4 addresses or IPv4 CIDR ranges; anything else fails configuration validation at startup.
+
+### Failed self-relocation
+
+The relocated copy must publish a readiness marker containing this run's token and the expected target path before the original directory is ever removed. If the handshake times out or the child fails, **the original is preserved** — nothing is deleted. Verify the copy under `targetProjectRoot`, review the newest launcher and relocation logs, and delete the old directory by hand only after confirming the new location runs. Set `selfRelocate.enabled` to `false` to run in place.
+
+### Restore account-security changes
+
+Both account-security operations write a secret-free recovery record under `backups\` (git-ignored). Passwords are never written to any record, log, or config. Use the paired restore functions to revert the built-in account name or the local lockout policy from the newest record.
 
 ## Public Release Hygiene
 

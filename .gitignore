@@ -100,6 +100,9 @@ apps/portable/
 # Runtime backups
 backups/
 
+# Runtime state (RDP blocker rolling counters and event bookmark)
+state/
+
 # Editor and IDE folders
 .vscode/
 .idea/
@@ -137,3 +140,24 @@ venv/
 target/
 bin/
 obj/
+
+# Local, private and tooling-generated files (auto-managed)
+/.ai/
+/secrets.md
+/explain-AI.md
+/reference.md
+/CLAUDE.md
+/AGENTS.md
+/.agents/
+/.claude/
+/.kiro/
+/.codex/
+/.cursor/
+/.cline/
+/graphify-out/
+/.env
+/.env.*
+!/.env.example
+!/.env.sample
+!/.env.template
+!/.env.dist

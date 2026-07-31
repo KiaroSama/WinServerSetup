@@ -33,6 +33,53 @@ function Assert-Tool {
     }
 }
 
+function Invoke-GitChecked {
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [switch]$CaptureOutput
+    )
+    # Windows PowerShell 5.1 turns the FIRST native stderr line captured by 2>&1 into a
+    # terminating RemoteException while 'Stop' is in effect - even when the process exits 0.
+    # `git push` writes its progress ("Enumerating objects...", "To https://...") to stderr on
+    # SUCCESS, so that combination reported every successful publish as a failure and skipped
+    # the exit-code check entirely. This assignment is function-scoped and reverts on return;
+    # the exit code stays the only success signal.
+    $ErrorActionPreference = 'Continue'
+    $output = @(& git @Arguments 2>&1)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        $detail = ($output | ForEach-Object { [string]$_ }) -join "`n"
+        throw "git $($Arguments[0]) failed with exit code $exitCode. $detail"
+    }
+    if ($CaptureOutput) { return $output }
+    if ($output.Count -gt 0) { $output | Out-Host }
+}
+
+# Scans the git INDEX - what a push actually publishes - rather than the working tree.
+# `git add --all` can stage a config the working-tree check never looked at (a differently
+# named copy, a subfolder, or a local override that escaped .gitignore). -Force is deliberately
+# not consulted here: no flag may bypass an activation-key rejection.
+function Assert-NoStagedSecrets {
+    $staged = @(Invoke-GitChecked -Arguments @("ls-files", "--cached") -CaptureOutput |
+        ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    foreach ($path in $staged) {
+        $leaf = Split-Path -Leaf $path
+        if ($leaf -like "WinServerSetup.config.local.json") {
+            throw "The local override '$path' is staged. It is meant to stay untracked - run 'git rm --cached -- $path' before publishing."
+        }
+        if ($leaf -notlike "WinServerSetup.config*.json") { continue }
+        $blob = ((Invoke-GitChecked -Arguments @("show", ":$path") -CaptureOutput) | ForEach-Object { [string]$_ }) -join "`n"
+        try {
+            $stagedConfig = $blob | ConvertFrom-Json
+        } catch {
+            throw "Config JSON validation failed before publishing: staged '$path' is not valid JSON. $($_.Exception.Message)"
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$stagedConfig.activation.productKey)) {
+            throw "Staged file '$path' contains a non-empty activation.productKey. Move it to the ignored local override and unstage the file before publishing."
+        }
+    }
+}
+
 function Get-ProjectRoot {
     if ($PSScriptRoot) { return $PSScriptRoot }
     return (Get-Location).Path
@@ -69,36 +116,34 @@ try {
     if (Test-Path ".\WinServerSetup.config.json") {
         try {
             $cfg = Get-Content ".\WinServerSetup.config.json" -Raw -Encoding UTF8 | ConvertFrom-Json
-            $key = [string]$cfg.activation.productKey
-            if (-not [string]::IsNullOrWhiteSpace($key) -and -not $Force) {
-                throw "WinServerSetup.config.json contains a non-empty activation.productKey. Clear it before publishing, or re-run with -Force."
-            }
         } catch {
-            Write-Warn2 "Could not validate config.json before publishing: $($_.Exception.Message)"
+            throw "Config JSON validation failed before publishing: $($_.Exception.Message)"
+        }
+        $key = [string]$cfg.activation.productKey
+        if (-not [string]::IsNullOrWhiteSpace($key)) {
+            throw "WinServerSetup.config.json contains a non-empty activation.productKey. Move it to the ignored local override before publishing."
         }
     }
 
     # 1. Initialize repository if needed.
     if (-not (Test-Path ".\.git")) {
         Write-Step "Initializing new git repository on branch '$Branch'."
-        git init -b $Branch | Out-Null
+        Invoke-GitChecked -Arguments @("init", "-b", $Branch) | Out-Null
     } else {
         Write-Step "Git repository already exists. Reusing it."
     }
 
-    # 2. Configure default branch name (idempotent).
-    git symbolic-ref HEAD "refs/heads/$Branch" 2>$null | Out-Null
-
-    # 3. Stage and commit.
+    # 2. Stage and commit without rewriting the current branch of an existing repository.
     Write-Step "Staging files."
-    git add --all
-    $pendingChanges = (git status --porcelain).Trim()
+    Invoke-GitChecked -Arguments @("add", "--all") | Out-Null
+    Assert-NoStagedSecrets
+    $pendingChanges = ((Invoke-GitChecked -Arguments @("status", "--porcelain") -CaptureOutput) -join "`n").Trim()
 
     if ([string]::IsNullOrEmpty($pendingChanges)) {
         Write-Warn2 "No changes to commit. Skipping commit step."
     } else {
         Write-Step "Creating commit: $CommitMessage"
-        git commit -m $CommitMessage | Out-Null
+        Invoke-GitChecked -Arguments @("commit", "-m", $CommitMessage) | Out-Null
         Write-Ok "Commit created."
     }
 
@@ -127,29 +172,26 @@ try {
         throw "RepoUrl is not a GitHub remote. Pass -Force only if you intentionally want to push elsewhere: $RepoUrl"
     }
 
-    $remotes = (git remote) 2>$null
+    $remotes = @(Invoke-GitChecked -Arguments @("remote") -CaptureOutput)
     if ($remotes -contains "origin") {
-        $currentOrigin = (git remote get-url origin) 2>$null
+        $currentOrigin = ((Invoke-GitChecked -Arguments @("remote", "get-url", "origin") -CaptureOutput) -join "").Trim()
         if ($currentOrigin -and -not (Test-GitHubRemoteUrl -Url $currentOrigin) -and -not $Force) {
             throw "Existing origin is not a GitHub remote. Pass -Force to overwrite it intentionally: $currentOrigin"
         }
         if ($Force) {
             Write-Step "Updating existing 'origin' remote to $RepoUrl."
-            git remote set-url origin $RepoUrl
+            Invoke-GitChecked -Arguments @("remote", "set-url", "origin", $RepoUrl) | Out-Null
         } else {
             Write-Warn2 "Remote 'origin' already exists. Pass -Force to overwrite its URL."
         }
     } else {
         Write-Step "Adding 'origin' remote -> $RepoUrl"
-        git remote add origin $RepoUrl
+        Invoke-GitChecked -Arguments @("remote", "add", "origin", $RepoUrl) | Out-Null
     }
 
     # 6. Push.
     Write-Step "Pushing '$Branch' to origin."
-    git push -u origin $Branch
-    if ($LASTEXITCODE -ne 0) {
-        throw "git push failed with exit code $LASTEXITCODE."
-    }
+    Invoke-GitChecked -Arguments @("push", "-u", "origin", $Branch)
 
     Write-Ok "Published. Open the repository on GitHub to verify."
 }

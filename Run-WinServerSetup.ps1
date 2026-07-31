@@ -210,10 +210,25 @@ function Join-CommandLineArgument {
     param([AllowEmptyString()][string]$Value)
 
     if ($null -eq $Value) { return '""' }
-    if ($Value -notmatch '[\s"]') { return $Value }
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
 
-    $escaped = $Value.Replace('"', '\"')
-    return '"' + $escaped + '"'
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    $backslashCount = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') { $backslashCount++; continue }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * (($backslashCount * 2) + 1)))
+            [void]$builder.Append('"')
+        } else {
+            if ($backslashCount -gt 0) { [void]$builder.Append(('\' * $backslashCount)) }
+            [void]$builder.Append($character)
+        }
+        $backslashCount = 0
+    }
+    if ($backslashCount -gt 0) { [void]$builder.Append(('\' * ($backslashCount * 2))) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
 }
 
 function Join-PowerShellLiteral {
@@ -229,7 +244,63 @@ function Get-SafeProcessArgumentSummary {
     return ($Arguments -join " ")
 }
 
+function Wait-LauncherResult {
+    # The elevated wrapper creates the result file and then writes the exit code into it, so
+    # Test-Path can win the race against that write. An absent, empty, locked or half-written
+    # file therefore means "not ready yet" and must keep the poll going, never fail the run.
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        $Process,
+        [int]$TimeoutSeconds = 14400,
+        [int]$ExitGraceSeconds = 5
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $exitDeadline = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $Path) {
+            $text = ""
+            try {
+                # -Raw emits nothing at all for a zero-byte file, and casting that empty
+                # pipeline yields $null rather than an empty string, so test before using it.
+                $raw = Get-Content -LiteralPath $Path -Raw -Encoding ASCII
+                if ($null -ne $raw) { $text = [string]$raw }
+            } catch {
+                Write-LauncherLog -Level "DEBUG" -Message ("Delegated result file is not readable yet: {0}" -f $_.Exception.Message)
+            }
+            $exitCode = 0
+            if ([int]::TryParse($text.Trim(), [ref]$exitCode)) { return $exitCode }
+        }
+
+        # A child that died without leaving a result must fail fast instead of polling for hours.
+        # Only a non-zero exit proves failure here: the Windows Terminal client exits 0 as soon as
+        # it hands the tab to an existing window, while the setup keeps running inside that tab.
+        if ($null -ne $Process) {
+            $failedExitCode = $null
+            try {
+                if ($Process.HasExited -and $Process.ExitCode -ne 0) { $failedExitCode = [int]$Process.ExitCode }
+            } catch {
+                Write-LauncherLog -Level "DEBUG" -Message ("Could not query the delegated child state: {0}" -f $_.Exception.Message)
+            }
+            if ($null -eq $failedExitCode) {
+                $exitDeadline = $null
+            } elseif ($null -eq $exitDeadline) {
+                $exitDeadline = [DateTime]::UtcNow.AddSeconds($ExitGraceSeconds)
+            } elseif ([DateTime]::UtcNow -ge $exitDeadline) {
+                Write-LauncherLog -Level "ERROR" -Message ("Delegated child exited with code {0} without writing its result file: {1}" -f $failedExitCode, $Path)
+                Write-Host ("The elevated WinServerSetup child exited with code {0} before reporting a result." -f $failedExitCode) -ForegroundColor Red
+                return $failedExitCode
+            }
+        }
+
+        Start-Sleep -Milliseconds 200
+    }
+
+    throw "Timed out waiting for the delegated WinServerSetup result after $TimeoutSeconds seconds."
+}
+
 Initialize-LauncherLog
+$launcherResultPath = $null
 
 try {
     Write-LauncherLog -Level "INFO" -Message ("Launcher started. executionId={0}" -f $executionId)
@@ -285,6 +356,22 @@ try {
     Write-LauncherLog -Level "INFO" -Message ("isElevated={0}" -f $isElevated)
     Write-LauncherLog -Level "INFO" -Message ("isWindowsTerminalSession={0} launcherRoute={1}" -f $isWindowsTerminalSession, $launcherRoute)
 
+    # wt.exe splits its own command line on unescaped semicolons before the delegated shell ever
+    # sees it, so a single ';' in any forwarded path would silently truncate the command. Escaping
+    # is version-dependent; dropping Windows Terminal for this run is the reliable answer.
+    if ($launcherRoute -eq "WindowsTerminal") {
+        $semicolonPaths = @(@($scriptRoot, $mainScriptPath, $powerShellExe, $env:TEMP) | Where-Object { $_ -and $_.Contains(";") })
+        if ($semicolonPaths.Count -gt 0) {
+            Write-LauncherLog -Level "WARNING" -Message ("Windows Terminal was skipped because a required path contains a semicolon: {0}" -f ($semicolonPaths -join " | "))
+            Write-Host "A project or temp path contains ';', which Windows Terminal cannot receive; using PowerShell directly." -ForegroundColor Yellow
+            $launcherRoute = Get-LauncherRoute `
+                -WindowsTerminalAvailable $false `
+                -IsWindowsTerminalSession $isWindowsTerminalSession `
+                -IsElevated $isElevated
+            Write-LauncherLog -Level "INFO" -Message ("launcherRoute downgraded to {0}" -f $launcherRoute)
+        }
+    }
+
     if ($launcherRoute -eq "CurrentConsole") {
         Write-LauncherLog -Level "INFO" -Message "Using the current elevated Windows Terminal session, or the current console because Windows Terminal is unavailable."
         try {
@@ -311,8 +398,11 @@ try {
     }
 
     $switchInvocation = if ($forwardedSwitches.Count -gt 0) { " " + ($forwardedSwitches -join " ") } else { "" }
+    $launcherResultPath = Join-Path $env:TEMP ("WinServerSetup-launcher-result-{0}.txt" -f ([guid]::NewGuid().ToString('N')))
     $wrapperCommand = @"
 `$ErrorActionPreference = 'Stop'
+`$resultPath = $(Join-PowerShellLiteral -Value $launcherResultPath)
+`$exitCode = 1
 Set-Location -LiteralPath $(Join-PowerShellLiteral -Value $scriptRoot)
 try {
     & $(Join-PowerShellLiteral -Value $mainScriptPath)$switchInvocation
@@ -321,14 +411,16 @@ try {
         Write-Host ('WinServerSetup exited with code {0}.' -f `$exitCode) -ForegroundColor Red
         Read-Host 'Press Enter to close this launcher' | Out-Null
     }
-    exit `$exitCode
 } catch {
     Write-Host 'WinServerSetup failed before it could continue.' -ForegroundColor Red
     Write-Host `$_.Exception.Message -ForegroundColor Red
     if (`$_.InvocationInfo) { Write-Host `$_.InvocationInfo.PositionMessage -ForegroundColor DarkYellow }
     Read-Host 'Press Enter to close this launcher' | Out-Null
-    exit 1
+    `$exitCode = 1
+} finally {
+    Set-Content -LiteralPath `$resultPath -Value `$exitCode -Encoding ASCII -Force
 }
+exit `$exitCode
 "@
     $elevatedArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $wrapperCommand)
     $elevatedArgumentLine = ($elevatedArgs | ForEach-Object { Join-CommandLineArgument -Value $_ }) -join " "
@@ -342,10 +434,12 @@ try {
         Write-LauncherLog -Level "DEBUG" -Message ("terminalArgumentLine={0}" -f $terminalArgumentLine)
 
         try {
-            $terminal = Start-Process $windowsTerminalExe -ArgumentList $terminalArgumentLine -WorkingDirectory $scriptRoot -Verb RunAs -Wait -PassThru
-            $terminalExitCode = if ($null -ne $terminal.ExitCode) { $terminal.ExitCode } else { 0 }
-            Write-LauncherLog -Level "INFO" -Message ("Windows Terminal launch completed. processId={0} exitCode={1}" -f $terminal.Id, $terminalExitCode)
-            exit $terminalExitCode
+            $terminal = Start-Process $windowsTerminalExe -ArgumentList $terminalArgumentLine -WorkingDirectory $scriptRoot -Verb RunAs -PassThru
+            $terminalExitCode = if ($terminal.HasExited) { $terminal.ExitCode } else { '<delegated>' }
+            Write-LauncherLog -Level "INFO" -Message ("Windows Terminal delegation started. processId={0} clientExitCode={1}" -f $terminal.Id, $terminalExitCode)
+            $exitCode = Wait-LauncherResult -Path $launcherResultPath -Process $terminal
+            Write-LauncherLog -Level "INFO" -Message ("Delegated WinServerSetup completed. exitCode={0}" -f $exitCode)
+            exit $exitCode
         } catch {
             Write-LauncherException -Level "CRITICAL" -ErrorRecord $_ -Context "Failed to start elevated Windows Terminal child"
             Write-Host "Failed to elevate through Windows Terminal." -ForegroundColor Red
@@ -356,8 +450,8 @@ try {
         }
     } else {
         try {
-            $elevated = Start-Process $powerShellExe -ArgumentList $elevatedArgumentLine -WorkingDirectory $scriptRoot -Verb RunAs -Wait -PassThru
-            $exitCode = if ($null -ne $elevated.ExitCode) { $elevated.ExitCode } else { 0 }
+            $elevated = Start-Process $powerShellExe -ArgumentList $elevatedArgumentLine -WorkingDirectory $scriptRoot -Verb RunAs -PassThru
+            $exitCode = Wait-LauncherResult -Path $launcherResultPath -Process $elevated
             Write-LauncherLog -Level "INFO" -Message ("Elevated child completed. processId={0} exitCode={1}" -f $elevated.Id, $exitCode)
             exit $exitCode
         } catch {
@@ -370,6 +464,7 @@ try {
         }
     }
 } finally {
+    if ($launcherResultPath) { Remove-Item -LiteralPath $launcherResultPath -Force -ErrorAction SilentlyContinue }
     $duration = [DateTime]::UtcNow - $launcherStartedUtc
     Write-LauncherLog -Level "INFO" -Message ("Launcher finished. executionId={0} durationSeconds={1:N2}" -f $executionId, $duration.TotalSeconds)
 }

@@ -1,3 +1,5 @@
+# Console stubs mirror the real signatures so the extracted functions bind as in production.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Stub signatures mirror production collaborators so parameter binding matches.')]
 param()
 
 $ErrorActionPreference = "Stop"
