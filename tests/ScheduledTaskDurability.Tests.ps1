@@ -19,7 +19,13 @@ param([string]$SfcScript = "")
 
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$main = Get-Content -LiteralPath (Join-Path $projectRoot "WinServerSetup.ps1") -Raw -Encoding UTF8
+# WinServerSetup.ps1 dot-sources its function library from scripts\; the source assertions
+# below cover that whole partition.
+$main = (@('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance' |
+        ForEach-Object { "scripts\{0}.ps1" -f $_ }) |
+    ForEach-Object { Join-Path $projectRoot $_ } |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    ForEach-Object { Get-Content -LiteralPath $_ -Raw -Encoding UTF8 }) -join "`r`n"
 $sfcScript = if ([string]::IsNullOrWhiteSpace($SfcScript)) { Join-Path $projectRoot "scripts\Run-PostRebootSfc.ps1" } else { $SfcScript }
 $sfc = Get-Content -LiteralPath $sfcScript -Raw -Encoding UTF8
 
