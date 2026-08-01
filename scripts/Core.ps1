@@ -96,6 +96,12 @@ function Get-DownloadCachePath {
         if ([string]::IsNullOrWhiteSpace($base)) { $base = Join-Path $env:SystemDrive 'ProgramData' }
         $cfgValue = Join-Path $base 'WinServerSetup\cache'
     }
+    # H-03: mark it as ours BEFORE hardening. Cleanup refuses to delete the contents of any
+    # directory that does not carry this sentinel, so a mistyped downloadRoot cannot aim a
+    # recursive delete at an unrelated folder. The sentinel is written first because once the
+    # DACL is locked to SYSTEM + Administrators only an elevated caller could still write it.
+    if (-not (Test-Path -LiteralPath $cfgValue)) { New-Item -ItemType Directory -Path $cfgValue -Force | Out-Null }
+    Initialize-CacheSentinel -Path $cfgValue | Out-Null
     return (Initialize-TrustedDirectory -Path $cfgValue)
 }
 

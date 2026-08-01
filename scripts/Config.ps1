@@ -47,6 +47,12 @@ function Assert-WinServerSetupConfig {
     foreach ($requiredObject in @('selfRelocate', 'parallel', 'activation', 'windowsUpdate', 'rdp', 'rdpBruteforceBlocker', 'administratorAccount', 'accountLockout', 'cleanup')) {
         if (-not (Test-ConfigObject $Config.$requiredObject)) { throw "$requiredObject must be a JSON object (actual: $($Config.$requiredObject.GetType().FullName))." }
     }
+    # H-03: reject a dangerous downloadRoot before full setup begins rather than at cleanup
+    # time. Guarded because Config.ps1 is also dot-sourced standalone by its own test suite,
+    # where the Maintenance module is not loaded.
+    if (Get-Command Assert-DownloadRootAllowed -ErrorAction SilentlyContinue) {
+        Assert-DownloadRootAllowed -Path ([string]$Config.downloadRoot) | Out-Null
+    }
     Assert-PortNumber $Config.rdp.newPort 'rdp.newPort'
     Assert-PortNumber $Config.rdp.oldPort 'rdp.oldPort'
     if ([int]$Config.parallel.maxParallel -lt 1 -or [int]$Config.parallel.maxParallel -gt 16) { throw "parallel.maxParallel must be between 1 and 16." }
