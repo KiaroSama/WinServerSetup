@@ -277,6 +277,18 @@ The Persian keyboard layout is appended to the current user's language list. Exi
 
 Default app association XML imports through DISM apply to new user profiles. Current-user defaults are also attempted where the project has safe per-user logic, but Windows may still require manual selection in Settings for protected defaults.
 
+#### What this blocker is, and what it is not
+
+**It mitigates RDP brute force. It is not DDoS protection.** The distinction is not pedantic — relying on it as if it were network-layer protection leaves the machine exposed:
+
+- It reacts to **authentication attempts that Windows already recorded in the Event Log**. Anything that saturates the link, the NIC, or the TCP stack never reaches that point, so the blocker cannot see it, let alone stop it.
+- **Volumetric and protocol attacks — floods, SYN floods, reflection/amplification — must be mitigated upstream**, before traffic reaches Windows: at the datacenter, the cloud or provider firewall, or a scrubbing service. A host-side per-IP rule cannot help once the pipe or the stack is the bottleneck.
+- **For public RDP, a network allowlist, a VPN, or an RDP Gateway takes precedence over host-side per-IP blocking.** Use this blocker as a complementary layer behind one of those, not instead of one.
+- It is **IPv4-only**. IPv6 sources are not evaluated, and IPv6 CIDR whitelist entries are rejected by configuration validation rather than silently ignored.
+- It is **per-source-address and threshold-based**, so it is weak against a genuinely distributed attack: many addresses each staying under the threshold are not blocked. Attempts from such sources are still recorded, but no rule is created for them.
+
+With those limits understood, the blocker is effective at what it targets: repeated failed sign-ins from a single address against an exposed RDP port.
+
 The RDP brute-force blocker scans failed **RemoteInteractive** logons (`LogonType` 10) and blocks sources that meet the configured threshold. The default threshold is `7`, which means more than 6 failed attempts in the lookback window. Block messages include IP address, fail count, logon type(s), and the targeted username(s) exactly as recorded in the event, so a renamed built-in Administrator account is reported under its real name.
 
 **Network Level Authentication changes which events an attack produces, and this matters.** NLA is the default on current Windows and Windows Server. Because NLA authenticates *before* any interactive session exists, a failed RDP sign-in is written to Security event 4625 as `LogonType` **3** (Network), not `LogonType` 10. A blocker that matches only `LogonType` 10 therefore misses the ordinary attack completely.
@@ -301,6 +313,8 @@ These defaults are deliberately conservative. Each is opt-in because enabling it
 | `emptyStandbyList.enabled` | `false` | The upstream binary is unsigned and runs as `SYSTEM`. Enabling it also requires an integrity anchor: either `apps\installers\EmptyStandbyList.exe` locally, or a pinned `emptyStandbyList.expectedSha256`. With neither, the download is refused. |
 | `rdpBruteforceBlocker.includeNetworkLogonType3` | `false` | `LogonType` 3 is not RDP-specific and causes false positives. |
 | `rdpBruteforceBlocker.blockAllInbound` | `false` | Host-wide blocks are far broader than the threat. |
+| `rdpBruteforceBlocker.attributionWindowSeconds` | `120` | A `LogonType` 3 failure counts as RDP only when RDP evidence for that exact address exists within this many seconds. Widening it lets a NAT gateway's unrelated RDP session donate attribution to SMB failures from the same address. |
+| `rdpBruteforceBlocker.maxEventsPerRun`, `maxOffendersPerRun`, `maxManagedRules`, `maxStateBytes`, `maxRunSeconds` | bounded | Hard ceilings on events processed, offenders acted on, managed rules retained, state file size and total run time. Reaching a ceiling is logged and surfaced as a status rather than crashing or being silently dropped, and a whitelisted address is never blocked or evicted because of one. |
 | `administratorAccount.enabled` | `false` | Renaming the built-in account is an explicit, interactive decision. |
 | `accountLockout.disableLocalAccountLockout` | `false` | Machine-wide: it removes lockout for **every** local account, trading login-flood resistance for unlimited password guessing. Only pair it with a strong password plus RDP allowlisting or VPN. |
 
