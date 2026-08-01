@@ -167,9 +167,16 @@ Before winget installation, the script removes the `msstore` winget source when 
 
 | File or folder | Purpose |
 | --- | --- |
-| `WinServerSetup.ps1` | Main provisioning script and menu. |
+| `WinServerSetup.ps1` | Entry point: globals, the dot-source list, the main menu, and full-setup orchestration. The function library lives in `scripts\` and is dot-sourced from here, in order, after the globals are initialised. |
 | `Run-WinServerSetup.ps1` | Auto-elevating launcher. |
 | `WinServerSetup.config.json` | Main configuration file. |
+| `scripts\Console.ps1` | Console output, the themed banner and menu, structured logging, and the active timer. |
+| `scripts\Core.ps1` | Config access, registry and filesystem helpers, download trust (host allowlist, publisher pinning), reboot handling, and self-relocation. |
+| `scripts\Download.ps1` | File download with retry and integrity verification, logged process execution, and winget resolution. |
+| `scripts\Rdp.ps1` | RDP port migration, firewall rules, and brute-force blocker installation. |
+| `scripts\Install.ps1` | winget packages, direct installers, v2rayN, PowerShell 7, Windows Terminal, browser and default-app configuration, and runtimes. |
+| `scripts\SystemSettings.ps1` | Explorer and appearance settings, optimisation, cleanup, Quick Access, and taskbar pins. |
+| `scripts\Maintenance.ps1` | Windows Update, activation, post-reboot SFC, health check, and the final summary. |
 | `scripts\Config.ps1` | Strict configuration import, git-ignored local-override merge, and validation. Rejects an activation product key in the tracked config. |
 | `scripts\AccountSecurity.ps1` | Built-in Administrator rename and local account-lockout policy, with secret-free recovery records under `backups\`. |
 | `scripts\Prefetch-AppDownloads.ps1` | Background app download prefetch helper. |
