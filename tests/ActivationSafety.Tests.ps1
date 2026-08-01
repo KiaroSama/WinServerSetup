@@ -19,7 +19,6 @@ param([string]$MainScript = "")
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $mainScript = if ([string]::IsNullOrWhiteSpace($MainScript)) { Join-Path $projectRoot "WinServerSetup.ps1" } else { $MainScript }
-$source = Get-Content -LiteralPath $mainScript -Raw -Encoding UTF8
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -31,19 +30,36 @@ function Assert-Equal {
 }
 
 # ---- Import only the functions under test; the main script self-executes if dot-sourced. ----
-$tokens = $null
-$parseErrors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($mainScript, [ref]$tokens, [ref]$parseErrors)
-Assert-True ($parseErrors.Count -eq 0) "WinServerSetup.ps1 must parse before its activation path can be tested."
+# WinServerSetup.ps1 dot-sources its function library from scripts\; search that whole
+# partition so extraction by name keeps working wherever a function lives. $mainScript is
+# searched first, so a -MainScript copy still shadows the on-disk original when replaying
+# against a deliberately defective build.
+$setupSourceNames = @('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance' |
+        ForEach-Object { "scripts\{0}.ps1" -f $_ })
+$setupSourceFiles = @(@($mainScript) + @($setupSourceNames | ForEach-Object { Join-Path $projectRoot $_ })) |
+    Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique
+
+# The retained source greps cover the same partition.
+$source = ($setupSourceFiles | ForEach-Object { Get-Content -LiteralPath $_ -Raw -Encoding UTF8 }) -join "`r`n"
+
+$setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
+        $tokens = $null
+        $parseErrors = $null
+        $fileAst = [System.Management.Automation.Language.Parser]::ParseFile($setupFile, [ref]$tokens, [ref]$parseErrors)
+        Assert-True ($parseErrors.Count -eq 0) "$setupFile must parse before its activation path can be tested."
+        $fileAst
+    })
 
 function Import-FunctionUnderTest {
     param([string]$Name)
-    $definition = $ast.FindAll({
-            param($node)
-            ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($node.Name -eq $Name)
-        }, $true) | Select-Object -First 1
-    if ($null -eq $definition) { throw "WinServerSetup.ps1 must define $Name." }
-    return $definition.Extent.Text
+    foreach ($fileAst in $setupAsts) {
+        $definition = $fileAst.FindAll({
+                param($node)
+                ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($node.Name -eq $Name)
+            }, $true) | Select-Object -First 1
+        if ($null -ne $definition) { return $definition.Extent.Text }
+    }
+    throw "WinServerSetup.ps1 or its scripts\ modules must define $Name."
 }
 
 foreach ($name in @('Invoke-SlmgrChecked', 'Invoke-ActivationIfConfigured')) {

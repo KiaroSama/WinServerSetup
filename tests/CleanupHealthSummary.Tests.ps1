@@ -23,7 +23,6 @@ param([string]$MainScript = "")
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $mainScript = if ([string]::IsNullOrWhiteSpace($MainScript)) { Join-Path $projectRoot "WinServerSetup.ps1" } else { $MainScript }
-$source = Get-Content -LiteralPath $mainScript -Raw -Encoding UTF8
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -43,6 +42,9 @@ $setupSourceNames = @('WinServerSetup.ps1') + @('Console', 'Core', 'Download', '
         ForEach-Object { "scripts\{0}.ps1" -f $_ })
 $setupSourceFiles = @(@($mainScript) + @($setupSourceNames | ForEach-Object { Join-Path $projectRoot $_ })) |
     Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique
+
+# The retained source greps at the bottom cover the same partition.
+$source = ($setupSourceFiles | ForEach-Object { Get-Content -LiteralPath $_ -Raw -Encoding UTF8 }) -join "`r`n"
 
 $setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
         $tokens = $null
