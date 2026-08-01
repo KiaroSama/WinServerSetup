@@ -121,7 +121,7 @@ function Reset-TestState {
         rdpBruteforceBlocker = [pscustomobject]@{
             enabled = $true; threshold = $Threshold; lookbackMinutes = $LookbackMinutes
             taskIntervalMinutes = 1; rulePrefix = "RuntimeTest RDP Block"; whitelistCIDRs = @()
-            includeNetworkLogonType3 = $false; blockAllInbound = $false; permanentBlock = $false
+            includeNetworkLogonType3 = $false; attributionWindowSeconds = 120; blockAllInbound = $false; permanentBlock = $false
             ruleRetentionDays = 30; logMaxBytes = 65536; logRetentionFiles = 2; statePath = $statePath
         }
     }

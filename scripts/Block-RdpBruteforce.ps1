@@ -106,6 +106,9 @@ function Assert-RdpBlockerSettings {
     if ([int]$settings.ruleRetentionDays -lt 1) { throw "rdpBruteforceBlocker.ruleRetentionDays must be at least 1." }
     if ([long]$settings.logMaxBytes -lt 1024) { throw "rdpBruteforceBlocker.logMaxBytes must be at least 1024." }
     if ([int]$settings.logRetentionFiles -lt 1 -or [int]$settings.logRetentionFiles -gt 20) { throw "rdpBruteforceBlocker.logRetentionFiles must be between 1 and 20." }
+    # M-05: the LogonType 3 correlation window. Too wide and a NAT gateway's old RDP session
+    # attributes unrelated SMB failures; too narrow and genuine NLA attempts are missed.
+    if ([int]$settings.attributionWindowSeconds -lt 1 -or [int]$settings.attributionWindowSeconds -gt 3600) { throw "rdpBruteforceBlocker.attributionWindowSeconds must be between 1 and 3600." }
     foreach ($cidr in @($settings.whitelistCIDRs)) {
         if ([string]::IsNullOrWhiteSpace([string]$cidr) -or -not (Test-ValidIPv4Cidr ([string]$cidr))) {
             throw "Invalid IPv4 whitelist entry: $cidr"
@@ -138,7 +141,7 @@ function Invoke-SecurityLogQuery {
 
 $script:RdpChannel = 'Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational'
 
-function Get-RdpAttributedAddresses {
+function Get-RdpAttributedEvidence {
     <#
         Returns the set of client IPv4 addresses that Remote Desktop itself reports contacting
         this host inside the lookback window.
@@ -157,10 +160,24 @@ function Get-RdpAttributedAddresses {
 
         Field names differ across builds, so every EventData value is scanned for an IPv4
         literal instead of depending on one property name.
-    #>
-    param([int]$LookbackMinutes)
 
-    $addresses = New-Object 'System.Collections.Generic.HashSet[string]'
+        M-02: this used to be a HashSet returned bare. PowerShell ENUMERATES a HashSet on
+        output, so a set holding exactly ONE address collapsed to a [string] - and the
+        caller's `.Contains($ip)` silently became String.Contains, a SUBSTRING test. With
+        one attributed client 120.3.4.5 on record, `.Contains('20.3.4.5')` returned $true
+        and an innocent address was firewall-blocked. Verified on both 5.1 and 7.
+
+        The fix is the TYPE: PowerShell passes an IDictionary through as a single object
+        instead of enumerating it, so the contract is identical at 0, 1 and n entries, and
+        `ContainsKey` is an exact lookup rather than a substring test. The unary comma on
+        each `return` below is belt-and-braces only - it is not what closes this finding.
+    #>
+    param([int]$LookbackMinutes, [int]$MaxEvents = 20000)
+
+    # M-05: keep a UTC timestamp per address, not just the address. Attribution then requires
+    # RDP evidence NEAR the failed logon in time, instead of the address having appeared
+    # anywhere in the whole lookback window.
+    $addresses = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[datetime]]'
     $events = @()
     try {
         $events = Invoke-SecurityLogQuery @{
@@ -169,35 +186,72 @@ function Get-RdpAttributedAddresses {
                 Id        = @(131, 140)
                 StartTime = (Get-Date).AddMinutes(-$LookbackMinutes)
             }
+            MaxEvents = $MaxEvents
         }
     } catch {
         # The channel can be absent or disabled. That is not fatal: fall back to LogonType 10
         # only, and say so, because the NLA case will be invisible until it is enabled.
         Write-LogLine ("RDP-specific channel unavailable ({0}); Logon Type 3 attribution is disabled. Enable '{1}' or set includeNetworkLogonType3 to catch NLA-mode attacks." -f $_.Exception.Message, $script:RdpChannel) "WARNING"
-        return $addresses
+        return ,$addresses
     }
 
     foreach ($rdpEvent in $events) {
         try {
+            $whenUtc = $rdpEvent.TimeCreated.ToUniversalTime()
             [xml]$xml = $rdpEvent.ToXml()
             foreach ($node in $xml.Event.EventData.Data) {
                 $text = [string]$node.'#text'
                 if ([string]::IsNullOrWhiteSpace($text)) { continue }
                 foreach ($match in [regex]::Matches($text, '\b\d{1,3}(?:\.\d{1,3}){3}\b')) {
                     $candidate = $match.Value
-                    if ((Test-ValidIPv4 $candidate) -and $candidate -ne '127.0.0.1') { $null = $addresses.Add($candidate) }
+                    if (-not (Test-ValidIPv4 $candidate) -or $candidate -eq '127.0.0.1') { continue }
+                    if (-not $addresses.ContainsKey($candidate)) {
+                        $addresses[$candidate] = New-Object 'System.Collections.Generic.List[datetime]'
+                    }
+                    $addresses[$candidate].Add($whenUtc)
                 }
             }
         } catch { $null = $_ }
     }
-    return $addresses
+    return ,$addresses
+}
+
+function Test-RdpTimeCorrelated {
+    <#
+        M-05: does RDP itself have evidence for THIS EXACT address close in time to this
+        failed logon?
+
+        Two separate defects are closed here. Lookup is `ContainsKey` on a Dictionary, which
+        is exact - the old code called `.Contains()` on a value that could arrive as a bare
+        [string], making it a substring test (M-02). And correlation is bounded by a window
+        rather than "the address appeared somewhere in the lookback", so a NAT gateway that
+        legitimately used RDP an hour ago no longer donates RDP attribution to unrelated SMB
+        failures from the same address.
+    #>
+    param(
+        $Evidence,
+        [Parameter(Mandatory)][string]$IpAddress,
+        [Parameter(Mandatory)][datetime]$WhenUtc,
+        [Parameter(Mandatory)][int]$WindowSeconds
+    )
+    if ($null -eq $Evidence) { return $false }
+    if (-not ($Evidence -is [System.Collections.IDictionary]) -and $Evidence.GetType().Name -notlike 'Dictionary*') { return $false }
+    if (-not $Evidence.ContainsKey($IpAddress)) { return $false }
+    $windowTicks = [timespan]::FromSeconds($WindowSeconds).Ticks
+    foreach ($stamp in $Evidence[$IpAddress]) {
+        # Absolute difference: RdpCoreTS and Security are written by different providers, so
+        # the RDP evidence can land either side of the 4625 for the same attempt.
+        if ([math]::Abs(($WhenUtc - $stamp).Ticks) -le $windowTicks) { return $true }
+    }
+    return $false
 }
 
 function Convert-FailedLogonEvent {
     param(
         [Parameter(Mandatory)]$LogEvent,
         [bool]$IncludeNetworkLogonType3,
-        $RdpAttributedAddresses = $null
+        $RdpEvidence = $null,
+        [int]$AttributionWindowSeconds = 120
     )
 
     [xml]$xml = $LogEvent.ToXml()
@@ -210,10 +264,12 @@ function Convert-FailedLogonEvent {
     if (-not (Test-ValidIPv4 $ip) -or $ip -eq '127.0.0.1') { return $null }
 
     # LogonType 10 is unambiguously RDP. LogonType 3 counts when RDP itself reported this client
-    # (the NLA case), or when the operator has explicitly opted into counting all network logons.
+    # close in time (the NLA case), or when the operator has explicitly opted into counting all
+    # network logons.
+    $whenUtc = $LogEvent.TimeCreated.ToUniversalTime()
     $attributed = $false
-    if ($logonType -eq '3' -and $null -ne $RdpAttributedAddresses) {
-        $attributed = $RdpAttributedAddresses.Contains($ip)
+    if ($logonType -eq '3' -and $null -ne $RdpEvidence) {
+        $attributed = Test-RdpTimeCorrelated -Evidence $RdpEvidence -IpAddress $ip -WhenUtc $whenUtc -WindowSeconds $AttributionWindowSeconds
     }
     if ($logonType -ne '10' -and -not $attributed -and -not ($IncludeNetworkLogonType3 -and $logonType -eq '3')) { return $null }
 
@@ -386,14 +442,16 @@ function Invoke-RdpBruteforceBlocker {
         $state = Read-BlockerState $statePath
         $newEvents = @(Get-NewFailedLogonEvents -LastRecordId $state.LastRecordId -LookbackMinutes ([int]$settings.lookbackMinutes))
 
-        # Resolve which clients Remote Desktop itself saw, so NLA-mode failures (recorded as
-        # LogonType 3) can be attributed to RDP without counting unrelated network logons.
-        $rdpAddresses = Get-RdpAttributedAddresses -LookbackMinutes ([int]$settings.lookbackMinutes)
+        # Resolve which clients Remote Desktop itself saw and WHEN, so NLA-mode failures
+        # (recorded as LogonType 3) can be attributed to RDP without counting unrelated
+        # network logons that merely share an address.
+        $rdpEvidence = Get-RdpAttributedEvidence -LookbackMinutes ([int]$settings.lookbackMinutes)
+        $attributionWindowSeconds = [int]$settings.attributionWindowSeconds
 
         $parsed = New-Object System.Collections.Generic.List[object]
         foreach ($securityEvent in $newEvents) {
             try {
-                $item = Convert-FailedLogonEvent $securityEvent ([bool]$settings.includeNetworkLogonType3) $rdpAddresses
+                $item = Convert-FailedLogonEvent $securityEvent ([bool]$settings.includeNetworkLogonType3) $rdpEvidence $attributionWindowSeconds
                 if ($null -ne $item) { $parsed.Add($item) }
             } catch {
                 Write-LogLine "Could not parse failed-logon event RecordId=$($securityEvent.RecordId): $($_.Exception.Message)" "WARNING"

@@ -158,6 +158,7 @@ function New-TestConfig {
             rulePrefix = "UnitTest RDP Block"
             whitelistCIDRs = @($Whitelist)
             includeNetworkLogonType3 = $false
+            attributionWindowSeconds = 120
             blockAllInbound = $false
             permanentBlock = $false
             ruleRetentionDays = 30
