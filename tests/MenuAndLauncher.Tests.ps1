@@ -55,7 +55,7 @@ function Assert-Equal {
 
 Assert-Contains `
     -Text $main `
-    -Pattern 'Read-HostUntimed\s+-Prompt\s+"Select"\s+-DefaultValue\s+"1"' `
+    -Pattern 'Read-HostThemed\s+-Prompt\s+"Select"\s+-DefaultValue\s+"1"' `
     -Message "Main menu must show Select with default [1] and submit option 1 when Enter is pressed."
 
 $menuBlockMatch = [regex]::Match(

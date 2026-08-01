@@ -24,10 +24,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $publishPath = if ([string]::IsNullOrWhiteSpace($PublishScript)) { Join-Path $projectRoot "Publish-ToGitHub.ps1" } else { $PublishScript }
 
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 # ---- Import only the functions under test; the script self-executes if dot-sourced. ----
 $tokens = $null
@@ -46,7 +43,7 @@ function Import-FunctionUnderTest {
 }
 
 foreach ($name in @('Invoke-GitChecked', 'Assert-NoStagedSecrets')) {
-    . ([scriptblock]::Create((Import-FunctionUnderTest $name)))
+    . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
 }
 
 $source = Get-Content -LiteralPath $publishPath -Raw -Encoding UTF8

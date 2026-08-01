@@ -5,10 +5,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $configPath = Join-Path $projectRoot "WinServerSetup.config.json"
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 Assert-True (-not [bool]$config.activation.enabled) "Tracked activation.enabled must default to false."
 Assert-True ([string]::IsNullOrWhiteSpace([string]$config.activation.productKey)) "Tracked activation.productKey must be empty."

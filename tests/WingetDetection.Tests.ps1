@@ -27,14 +27,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $mainScript = if ([string]::IsNullOrWhiteSpace($MainScript)) { Join-Path $projectRoot "WinServerSetup.ps1" } else { $MainScript }
 
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
-function Assert-Equal {
-    param($Expected, $Actual, [string]$Message)
-    if ($Expected -ne $Actual) { throw ("{0} Expected={1}; Actual={2}" -f $Message, $Expected, $Actual) }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 # ---- Import only the functions under test; the main script self-executes if dot-sourced. ----
 # WinServerSetup.ps1 dot-sources its function library from scripts\; search that whole
@@ -54,21 +47,9 @@ $setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
         $fileAst
     })
 
-function Import-FunctionUnderTest {
-    param([string]$Name)
-    foreach ($fileAst in $setupAsts) {
-        $definition = $fileAst.FindAll({
-                param($node)
-                ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($node.Name -eq $Name)
-            }, $true) | Select-Object -First 1
-        if ($null -ne $definition) { return $definition.Extent.Text }
-    }
-    throw "WinServerSetup.ps1 or its scripts\ modules must define $Name."
-}
-
-$detectionSource = Import-FunctionUnderTest 'Test-WingetPackageInstalled'
+$detectionSource = Import-FunctionUnderTest 'Test-WingetPackageInstalled' $setupAsts
 foreach ($name in @('Test-WingetUpgradeExitCode', 'Test-WingetPackageInstalled', 'Resolve-WingetExecutable', 'Get-WingetExecutable')) {
-    . ([scriptblock]::Create((Import-FunctionUnderTest $name)))
+    . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
 }
 
 # ---- Mock state. ----
@@ -269,4 +250,38 @@ Assert-Equal 'C:\Windows\System32\winget.exe' (Get-WingetExecutable) "Second cal
 Assert-Equal $callsAfterFirst $script:GetCommandCalls "A cached path must not be re-resolved."
 $Global:WingetExecutable = $null
 
-Write-Host "PASS winget detection: exit-code classification, unpinned source query, registry fallback state, executable resolution order."
+# ---- 9. The CALLER must route the upgrade exit code through Test-WingetUpgradeExitCode. ----
+# Classifying the code correctly is useless if the one caller open-codes -ne 0, which it did:
+# every already-current package produced a spurious "exited with code -1978335189" warning.
+# These stubs are defined last so the real functions above are unaffected.
+Reset-WingetState
+$script:Warnings = New-Object System.Collections.Generic.List[string]
+function Ensure-Winget { return $true }
+function Test-WingetPackageInstalled { param([string]$Id) return $true }
+function Write-Info { param($Message) }
+function Write-Ok { param($Message) }
+function Write-Warn { param($Message) $script:Warnings.Add([string]$Message) | Out-Null }
+. ([scriptblock]::Create((Import-FunctionUnderTest 'Install-WingetPackages' $setupAsts)))
+
+$Global:Config = [pscustomobject]@{ winget = [pscustomobject]@{
+            interactiveInstallers   = $false
+            upgradeExistingPackages = $true
+            packages                = @([pscustomobject]@{ enabled = $true; name = 'Seven Zip'; id = '7zip.7zip' })
+        }
+}
+$Global:RunStats = [pscustomobject]@{ InstalledApps = (New-Object System.Collections.Generic.List[string]) }
+
+# 0x8A15002B - already current. This is the regression: it must not warn.
+$script:WingetExitCode = -1978335189
+Install-WingetPackages
+Assert-Equal 0 $script:Warnings.Count `
+    "An already-current package must not warn. Got: $($script:Warnings -join ' | ')"
+
+# A genuine failure must still warn, so the fix cannot have swallowed real errors.
+$script:Warnings.Clear()
+$script:WingetExitCode = 1
+Install-WingetPackages
+Assert-Equal 1 $script:Warnings.Count "A real upgrade failure must still be reported."
+Assert-True ($script:Warnings[0] -match 'exited with code 1') "The warning must name the failing exit code."
+
+Write-Host "PASS winget detection: exit-code classification, unpinned source query, registry fallback state, executable resolution order, and the upgrade caller routing through the classifier."

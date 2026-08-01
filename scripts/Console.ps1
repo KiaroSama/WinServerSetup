@@ -368,14 +368,6 @@ function Read-HostThemed {
     }
 }
 
-function Read-HostUntimed {
-    param(
-        [string]$Prompt,
-        [string]$DefaultValue = ""
-    )
-    Read-HostThemed -Prompt $Prompt -DefaultValue $DefaultValue
-}
-
 function Pause-IfNeeded {
     if (-not $Global:NoPause) {
         Write-Host ""

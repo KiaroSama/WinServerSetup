@@ -4,10 +4,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $projectRoot "scripts\Block-RdpBruteforce.ps1")
 
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 Assert-True (Test-IPv4InCidr "192.0.2.42" "192.0.2.0/24") "Expected IPv4 address to match its /24 network."
 Assert-True (-not (Test-IPv4InCidr "192.0.3.42" "192.0.2.0/24")) "Unexpected IPv4 CIDR match."

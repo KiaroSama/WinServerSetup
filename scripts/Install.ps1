@@ -24,7 +24,9 @@ function Install-WingetPackages {
             if ($Global:Config.winget.upgradeExistingPackages) {
                 try {
                     $upgradeResult = Invoke-LoggedCommand -FilePath (Get-WingetExecutable) -Arguments @("upgrade", "--id", $id, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget", "--silent") -DisplayName "winget upgrade $name"
-                    if ($upgradeResult.ExitCode -ne 0) { Write-Warn "Upgrade check for $name exited with code $($upgradeResult.ExitCode)." }
+                    # Not a bare -ne 0: "no applicable upgrade found" is the normal result for an
+                    # already-current package and must not be reported as a failure.
+                    if (-not (Test-WingetUpgradeExitCode -ExitCode $upgradeResult.ExitCode)) { Write-Warn "Upgrade check for $name exited with code $($upgradeResult.ExitCode)." }
                 } catch { Write-Warn "Upgrade failed for $name : $($_.Exception.Message)" }
             }
             $null = $Global:RunStats.InstalledApps.Add($name)

@@ -28,14 +28,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $prefetchPath = Join-Path $projectRoot "scripts\Prefetch-AppDownloads.ps1"
 $source = Get-Content -LiteralPath $prefetchPath -Raw -Encoding UTF8
 
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
-function Assert-Equal {
-    param($Expected, $Actual, [string]$Message)
-    if ($Expected -ne $Actual) { throw ("{0} Expected={1}; Actual={2}" -f $Message, $Expected, $Actual) }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 # ---- Import only the functions under test; the script self-executes if dot-sourced. ----
 $tokens = $null
@@ -53,9 +46,9 @@ function Import-FunctionUnderTest {
     return $definition.Extent.Text
 }
 
-$writeLogText = Import-FunctionUnderTest 'Write-PrefetchLog'
+$writeLogText = Import-FunctionUnderTest 'Write-PrefetchLog' $setupAsts
 . ([scriptblock]::Create($writeLogText))
-. ([scriptblock]::Create((Import-FunctionUnderTest 'Write-JobDiagnostics')))
+. ([scriptblock]::Create((Import-FunctionUnderTest 'Write-JobDiagnostics' $setupAsts)))
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isElevated = (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)

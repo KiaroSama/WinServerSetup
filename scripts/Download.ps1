@@ -46,18 +46,32 @@ function Start-ApplicationDownloadPrefetch {
     }
 }
 
+function Wait-ProcessWithStatus {
+    # Spins an in-place status line while $Process runs. $StatusFormat receives the elapsed
+    # TimeSpan and returns the line to show.
+    # A Refresh() failure breaks the loop rather than being swallowed: the handle is gone, so
+    # continuing would poll a dead object every 2s forever.
+    param(
+        [Parameter(Mandatory)][object]$Process,
+        [Parameter(Mandatory)][datetime]$Started,
+        [Parameter(Mandatory)][scriptblock]$StatusFormat
+    )
+    while (-not $Process.HasExited) {
+        Write-StatusInPlace (& $StatusFormat ((Get-Date) - $Started))
+        Start-Sleep -Seconds 2
+        try { $Process.Refresh() } catch { break }
+    }
+    Clear-StatusInPlace
+}
+
 function Wait-ApplicationDownloadPrefetch {
     param([object]$Prefetch)
     if (-not $Prefetch -or -not $Prefetch.Process) { return }
     $proc = $Prefetch.Process
     Write-Info "Waiting for application prefetch to finish before sequential installs..."
-    while (-not $proc.HasExited) {
-        $elapsed = (Get-Date) - $Prefetch.Started
-        Write-StatusInPlace ("Application downloads still running... elapsed {0:hh\:mm\:ss}" -f $elapsed)
-        Start-Sleep -Seconds 2
-        try { $proc.Refresh() } catch { break }
+    Wait-ProcessWithStatus -Process $proc -Started $Prefetch.Started -StatusFormat {
+        param($elapsed) "Application downloads still running... elapsed {0:hh\:mm\:ss}" -f $elapsed
     }
-    Clear-StatusInPlace
     try { $proc.Refresh() } catch { $null = $_ }
     if ($proc.ExitCode -eq 0) {
         Write-Ok "Application download prefetch completed."
@@ -260,13 +274,9 @@ function Invoke-LoggedProcessWithProgress {
         Write-StructuredLog -Level COMMAND -Message ("{0} {1}" -f $FilePath, ($Arguments -join ' '))
         $proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -RedirectStandardOutput $outFile -RedirectStandardError $errFile -WindowStyle Hidden -PassThru
         $start = Get-Date
-        while (-not $proc.HasExited) {
-            $elapsed = (Get-Date) - $start
-            Write-StatusInPlace ("{0} [{1:hh\:mm\:ss}]" -f $status, $elapsed)
-            Start-Sleep -Seconds 2
-            try { $proc.Refresh() } catch { $null = $_ }
+        Wait-ProcessWithStatus -Process $proc -Started $start -StatusFormat {
+            param($elapsed) "{0} [{1:hh\:mm\:ss}]" -f $status, $elapsed
         }
-        Clear-StatusInPlace
 
         $output = @()
         foreach ($path in @($outFile, $errFile)) {

@@ -25,14 +25,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $mainScript = if ([string]::IsNullOrWhiteSpace($MainScript)) { Join-Path $projectRoot "WinServerSetup.ps1" } else { $MainScript }
 
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
-function Assert-Equal {
-    param($Expected, $Actual, [string]$Message)
-    if ($Expected -ne $Actual) { throw ("{0} Expected={1}; Actual={2}" -f $Message, $Expected, $Actual) }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 # ---- Import only the functions under test; the main script self-executes if dot-sourced. ----
 # WinServerSetup.ps1 dot-sources its function library from scripts\; search that whole
@@ -52,20 +45,8 @@ $setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
         $fileAst
     })
 
-function Import-FunctionUnderTest {
-    param([string]$Name)
-    foreach ($fileAst in $setupAsts) {
-        $definition = $fileAst.FindAll({
-                param($node)
-                ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($node.Name -eq $Name)
-            }, $true) | Select-Object -First 1
-        if ($null -ne $definition) { return $definition.Extent.Text }
-    }
-    throw "WinServerSetup.ps1 or its scripts\ modules must define $Name."
-}
-
 foreach ($name in @('Get-WebResponseFinalUri', 'Test-DownloadHostAllowed', 'Test-SignerSubjectAllowed', 'Test-FileSha256', 'Invoke-DownloadFile')) {
-    . ([scriptblock]::Create((Import-FunctionUnderTest $name)))
+    . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
 }
 
 # ---- Console/logging collaborators the download path calls into. ----
@@ -175,7 +156,30 @@ try {
     Assert-True ($postRequestChecks.Count -gt 0) `
         ("The post-download host check must see the final redirected URI. Saw: {0}" -f ($script:CheckedUris -join ', '))
 
-    Write-Host "PASS download path completes over a real transport and validates the final redirected URI on this host."
+    # ---- 4. Wait-ProcessWithStatus must stop when the process handle dies. ----
+    # Both spinner call sites were merged into this one helper. The one that used to swallow a
+    # Refresh() failure would poll a dead object every 2s forever; the merged helper breaks out.
+    # A fake process is used deliberately: a real one cannot be made to fail Refresh() on demand.
+    . ([scriptblock]::Create((Import-FunctionUnderTest 'Wait-ProcessWithStatus' $setupAsts)))
+    $script:StatusLines = New-Object System.Collections.Generic.List[string]
+    function Write-StatusInPlace { param($Message) $script:StatusLines.Add([string]$Message) | Out-Null }
+    function Clear-StatusInPlace { }
+
+    $doomed = [pscustomobject]@{ HasExited = $false }
+    $doomed | Add-Member -MemberType ScriptMethod -Name Refresh -Value { throw "handle is gone" }
+    $elapsedSeen = $null
+    $spin = [Diagnostics.Stopwatch]::StartNew()
+    Wait-ProcessWithStatus -Process $doomed -Started (Get-Date) -StatusFormat {
+        param($elapsed) $script:Elapsed = $elapsed; "working [{0:hh\:mm\:ss}]" -f $elapsed
+    }
+    $spin.Stop()
+    $elapsedSeen = $script:Elapsed
+    Assert-True ($spin.Elapsed.TotalSeconds -lt 15) `
+        ("A dead handle must end the wait, not spin forever. Took {0:n1}s." -f $spin.Elapsed.TotalSeconds)
+    Assert-Equal 1 $script:StatusLines.Count "The status line must be written once before the handle failure ends the wait."
+    Assert-True ($null -ne $elapsedSeen) "The status formatter must receive the elapsed TimeSpan."
+
+    Write-Host "PASS download path completes over a real transport, validates the final redirected URI on this host, and ends the status wait on a dead process handle."
 } finally {
     # Stopping the listener aborts the pending GetContext, so the worker loop exits at once.
     try { $listener.Stop() } catch { $null = $_ }

@@ -1,7 +1,5 @@
 {
-  "projectName": "WinServerSetup",
   "portableRoot": "C:\\portable",
-  "scriptsRoot": "C:\\portable\\Scripts",
   "targetProjectRoot": "C:\\portable\\Scripts\\WinServerSetup",
   "downloadRoot": "",
   "logRoot": "logs",
@@ -12,7 +10,6 @@
     "enabled": true,
     "maxParallel": 4
   },
-  "interactiveAnyKey": true,
   "autoReboot": {
     "enabled": true,
     "countdownSeconds": 30,

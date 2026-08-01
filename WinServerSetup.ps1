@@ -246,7 +246,7 @@ function Show-MainMenu {
         Write-Option -Number "0"  -Label "Back / Exit"
         Write-Host ""
 
-        $choice = Read-HostUntimed -Prompt "Select" -DefaultValue "1"
+        $choice = Read-HostThemed -Prompt "Select" -DefaultValue "1"
         try {
             switch ($choice) {
                 "1"  { Invoke-FullSetupWithActiveTimer | Out-Null;                                                               Pause-IfNeeded }

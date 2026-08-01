@@ -29,14 +29,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $scriptPath = if ([string]::IsNullOrWhiteSpace($ScriptPath)) { Join-Path $projectRoot "scripts\Block-RdpBruteforce.ps1" } else { $ScriptPath }
 . $scriptPath
 
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
-function Assert-Equal {
-    param($Expected, $Actual, [string]$Message)
-    if ($Expected -ne $Actual) { throw ("{0} Expected={1}; Actual={2}" -f $Message, $Expected, $Actual) }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 $testRoot = Join-Path $env:TEMP ("WinServerSetup-RdpRuntime-{0}" -f ([guid]::NewGuid().ToString("N")))
 New-Item -ItemType Directory -Path $testRoot -Force | Out-Null

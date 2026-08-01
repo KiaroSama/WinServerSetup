@@ -15,15 +15,7 @@ $accountScript = if ([string]::IsNullOrWhiteSpace($ScriptPath)) { Join-Path $pro
 if (-not (Test-Path -LiteralPath $accountScript)) { throw "Missing account security implementation: $accountScript" }
 $source = Get-Content -LiteralPath $accountScript -Raw -Encoding UTF8
 
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
-
-function Assert-Equal {
-    param($Expected, $Actual, [string]$Message)
-    if ($Expected -ne $Actual) { throw ("{0} Expected={1}; Actual={2}" -f $Message, $Expected, $Actual) }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 function Assert-Throws {
     param([scriptblock]$Action, [string]$Message)

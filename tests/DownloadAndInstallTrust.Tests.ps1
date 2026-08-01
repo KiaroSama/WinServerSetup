@@ -23,10 +23,7 @@ $mainScript = if ([string]::IsNullOrWhiteSpace($MainScript)) { Join-Path $projec
 $config = Get-Content -LiteralPath (Join-Path $projectRoot "WinServerSetup.config.json") -Raw -Encoding UTF8 | ConvertFrom-Json
 
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
-function Assert-Equal {
-    param($Expected, $Actual, [string]$Message)
-    if ($Expected -ne $Actual) { throw ("{0} Expected={1}; Actual={2}" -f $Message, $Expected, $Actual) }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 # ---- Import only the functions under test; the main script self-executes if dot-sourced. ----
 # WinServerSetup.ps1 dot-sources its function library from scripts\; search that whole
@@ -49,20 +46,8 @@ $setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
         $fileAst
     })
 
-function Import-FunctionUnderTest {
-    param([string]$Name)
-    foreach ($fileAst in $setupAsts) {
-        $definition = $fileAst.FindAll({
-                param($node)
-                ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($node.Name -eq $Name)
-            }, $true) | Select-Object -First 1
-        if ($null -ne $definition) { return $definition.Extent.Text }
-    }
-    throw "WinServerSetup.ps1 or its scripts\ modules must define $Name."
-}
-
 foreach ($name in @('Resolve-InstallerExitCode', 'Test-DirectInstallerInstalled', 'Install-DirectInstaller')) {
-    . ([scriptblock]::Create((Import-FunctionUnderTest $name)))
+    . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
 }
 
 # ---- 1. The installer exit-code rule, in one place. ----

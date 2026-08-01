@@ -11,15 +11,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $scriptPath = Join-Path $projectRoot "scripts\Block-RdpBruteforce.ps1"
 $source = Get-Content -LiteralPath $scriptPath -Raw -Encoding UTF8
 
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
-
-function Assert-Equal {
-    param($Expected, $Actual, [string]$Message)
-    if ($Expected -ne $Actual) { throw ("{0} Expected={1}; Actual={2}" -f $Message, $Expected, $Actual) }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 Assert-True ($source -notmatch 'function\s+Get-CurrentRdpClientIPs') "Established TCP connections must never bypass the RDP blocker."
 Assert-True ($source -match 'function\s+Invoke-RdpBruteforceBlocker') "The blocker needs a callable entry point for mocked behavioral tests."

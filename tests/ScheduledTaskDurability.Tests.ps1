@@ -29,14 +29,7 @@ $main = (@('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'Inst
 $sfcScript = if ([string]::IsNullOrWhiteSpace($SfcScript)) { Join-Path $projectRoot "scripts\Run-PostRebootSfc.ps1" } else { $SfcScript }
 $sfc = Get-Content -LiteralPath $sfcScript -Raw -Encoding UTF8
 
-function Assert-True {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
-}
-function Assert-Equal {
-    param($Expected, $Actual, [string]$Message)
-    if ($Expected -ne $Actual) { throw ("{0} Expected={1}; Actual={2}" -f $Message, $Expected, $Actual) }
-}
+. (Join-Path $PSScriptRoot '_Common.ps1')
 
 # The script under test must still be a bounded, retryable, self-unregistering contract before any
 # of the behavioral cases below mean anything.
