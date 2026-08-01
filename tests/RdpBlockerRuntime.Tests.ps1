@@ -41,6 +41,9 @@ $script:Queries = New-Object System.Collections.Generic.List[string]
 $script:ThrowNoMatchingEvents = $false
 $script:FirewallRules = New-Object System.Collections.Generic.List[object]
 $script:LogLines = New-Object System.Collections.Generic.List[string]
+$script:RegistryPort = 5801
+$script:TermServicePid = 4321
+$script:ListenerOwnerByPort = @{ 5801 = 4321 }
 
 function Read-JsonFile { param([string]$Path) return $script:Config }
 function Write-LogLine {
@@ -64,7 +67,9 @@ function New-TestEvent {
     return $item
 }
 function Get-WinEvent {
-    param($FilterHashtable, $LogName, $FilterXPath, $MaxEvents, $ErrorAction)
+    # -Oldest is part of the real signature and the blocker now passes it on every Security read
+    # (FU-03), so the mock has to bind it for parameter binding to match production.
+    param($FilterHashtable, $LogName, $FilterXPath, $MaxEvents, [switch]$Oldest, $ErrorAction)
     if ($script:ThrowNoMatchingEvents) {
         $record = New-Object System.Management.Automation.ErrorRecord(
             (New-Object System.Exception "No events were found that match the specified selection criteria."),
@@ -86,6 +91,26 @@ function Get-WinEvent {
     }
     if ($MaxEvents -and [int]$MaxEvents -gt 0) { $source = @($source | Select-Object -First ([int]$MaxEvents)) }
     return $source
+}
+# FU-02: the machine's own view of the RDP port. The blocker verifies these on every run and
+# scopes its rules to the result, so the fixtures agree with the port the cases assert on.
+function Get-ItemProperty {
+    param([string]$Path, [string]$Name, $ErrorAction)
+    return [pscustomobject]@{ PortNumber = $script:RegistryPort }
+}
+function Get-CimInstance {
+    param([string]$ClassName, [string]$Filter, $ErrorAction)
+    return [pscustomobject]@{ Name = 'TermService'; ProcessId = $script:TermServicePid }
+}
+function Get-NetTCPConnection {
+    param($State, $LocalPort, $OwningProcess, $ErrorAction)
+    if (-not $script:ListenerOwnerByPort.ContainsKey([int]$LocalPort)) {
+        throw "No MSFT_NetTCPConnection objects found with property 'LocalPort' equal to '$LocalPort'."
+    }
+    return @([pscustomobject]@{
+            LocalPort = [int]$LocalPort; State = 'Listen'
+            OwningProcess = [int]$script:ListenerOwnerByPort[[int]$LocalPort]
+        })
 }
 function Get-NetFirewallRule {
     param([string]$DisplayName, $ErrorAction)
@@ -137,6 +162,9 @@ function Reset-TestState {
     $script:ThrowNoMatchingEvents = $false
     $script:FirewallRules.Clear()
     $script:LogLines.Clear()
+    $script:RegistryPort = 5801
+    $script:TermServicePid = 4321
+    $script:ListenerOwnerByPort = @{ 5801 = 4321 }
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
 }
 

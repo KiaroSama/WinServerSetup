@@ -58,6 +58,9 @@ $script:RdpChannelDelaySeconds = 0
 $script:FirewallRules = New-Object System.Collections.Generic.List[object]
 $script:NewRuleCalls = New-Object System.Collections.Generic.List[object]
 $script:LogLines = New-Object System.Collections.Generic.List[string]
+$script:RegistryPort = 5801
+$script:TermServicePid = 4321
+$script:ListenerOwnerByPort = @{ 5801 = 4321 }
 
 function Read-JsonFile { param([string]$Path) return $script:Config }
 function Write-LogLine {
@@ -82,7 +85,9 @@ function New-SyntheticEvents {
 }
 
 function Get-WinEvent {
-    param($FilterHashtable, $LogName, $FilterXPath, $MaxEvents, $ErrorAction)
+    # -Oldest is part of the real signature and the blocker now passes it on every Security read
+    # (FU-03), so the mock has to bind it for parameter binding to match production.
+    param($FilterHashtable, $LogName, $FilterXPath, $MaxEvents, [switch]$Oldest, $ErrorAction)
     $channel = if ($FilterHashtable) { [string]$FilterHashtable.LogName } else { [string]$LogName }
     if ($channel -like '*RdpCoreTS*') {
         $script:RdpQueryMaxEvents.Add($MaxEvents) | Out-Null
@@ -113,6 +118,26 @@ function Get-WinEvent {
     return @($source | Select-Object -First ([int]$MaxEvents))
 }
 
+# FU-02: the machine's own view of the RDP port. The blocker verifies these on every run and
+# scopes its rules to the result, so the fixtures agree with the port the cases assert on.
+function Get-ItemProperty {
+    param([string]$Path, [string]$Name, $ErrorAction)
+    return [pscustomobject]@{ PortNumber = $script:RegistryPort }
+}
+function Get-CimInstance {
+    param([string]$ClassName, [string]$Filter, $ErrorAction)
+    return [pscustomobject]@{ Name = 'TermService'; ProcessId = $script:TermServicePid }
+}
+function Get-NetTCPConnection {
+    param($State, $LocalPort, $OwningProcess, $ErrorAction)
+    if (-not $script:ListenerOwnerByPort.ContainsKey([int]$LocalPort)) {
+        throw "No MSFT_NetTCPConnection objects found with property 'LocalPort' equal to '$LocalPort'."
+    }
+    return @([pscustomobject]@{
+            LocalPort = [int]$LocalPort; State = 'Listen'
+            OwningProcess = [int]$script:ListenerOwnerByPort[[int]$LocalPort]
+        })
+}
 function Get-NetFirewallRule {
     param([string]$DisplayName, $ErrorAction)
     if ([string]::IsNullOrWhiteSpace($DisplayName)) { return @($script:FirewallRules) }
@@ -186,6 +211,9 @@ function Reset-TestState {
     $script:FirewallRules.Clear()
     $script:NewRuleCalls.Clear()
     $script:LogLines.Clear()
+    $script:RegistryPort = 5801
+    $script:TermServicePid = 4321
+    $script:ListenerOwnerByPort = @{ 5801 = 4321 }
     Get-ChildItem -LiteralPath $testRoot -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 }
 function Invoke-BlockerRun {
@@ -354,8 +382,11 @@ try {
     $state = Get-WrittenState
     Assert-Equal $true ([bool]$state.Caps.DeadlineExceeded) "H-04: the wall-clock stop must be detectable in the written state."
     Assert-Equal 0 $script:FirewallRules.Count "H-04: a run that stopped on its deadline must not act on a half-processed window."
-    Assert-True ($watch.Elapsed.TotalSeconds -lt 120) `
-        ("H-04: the deadline case must not run away. Elapsed={0}s" -f [math]::Round($watch.Elapsed.TotalSeconds, 1))
+    # This case covers the SOFT budget - the check between synchronous calls - so the run may
+    # overshoot by at most the one 6s delay it is blocked in. The HARD deadline that bounds a
+    # single blocking call is FU-04, proved against a real process in RdpBlockerDeadline.Tests.ps1.
+    Assert-True ($watch.Elapsed.TotalSeconds -lt 30) `
+        ("H-04: the deadline case must stop shortly after the 5s budget, not run away. Elapsed={0}s" -f [math]::Round($watch.Elapsed.TotalSeconds, 1))
 
     # ------------------------------------------------------- H-04 stress: 10,000 unique addresses
     Reset-TestState
