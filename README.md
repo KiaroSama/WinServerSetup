@@ -201,7 +201,7 @@ Important sections:
 | `rdp` | Controls RDP port, old-port blocking, and service restart behavior. |
 | `winget.packages` | Controls winget-installed applications. |
 | `directInstallers` | Controls direct installer downloads. |
-| `v2rayN` | Controls the v2rayN GitHub release install, target folder, shortcuts, and the user data paths preserved across upgrades (part of menu 7). |
+| `v2rayN` | Controls the v2rayN GitHub release install, target folder, shortcuts, and `preserveUserDataPaths` - the only paths kept when an upgrade replaces the application payload, so anything not listed there is removed (part of menu 7). |
 | `windowsTerminal` | Controls Windows Terminal installation, default-terminal registration, and the PowerShell 7 default profile (part of menu 7). |
 | `braveExtensions` | Controls the Brave extension list and whether it is applied through the force-install policy (menu 8). |
 | `runtimes` | Controls .NET and Visual C++ runtime installation. |
