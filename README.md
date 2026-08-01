@@ -301,6 +301,24 @@ Known limitation: RdpCoreTS event 140 is not written when the attempted username
 
 Blocks are scoped to the configured RDP TCP port, not to all inbound traffic from the address, unless `rdpBruteforceBlocker.blockAllInbound` is explicitly enabled. Managed rules expire after `ruleRetentionDays` unless `permanentBlock` is set, so the rule set cannot grow without bound. Only explicit `whitelistCIDRs` entries bypass blocking. The blocker is IPv4-only: IPv6 sources and IPv6 CIDR whitelist entries are rejected by configuration validation rather than silently ignored.
 
+#### The project directory is ACL-hardened once a scheduled task is installed
+
+Installing the RDP brute-force blocker or the post-reboot SFC task hardens the project root to
+**SYSTEM and Administrators FullControl, `BUILTIN\Users` ReadAndExecute, inheritance disabled**.
+
+This is required rather than cosmetic. Both tasks run as `SYSTEM`, so anything that can rewrite the
+script they execute has a direct path to SYSTEM. A directory freshly created under `C:\` inherits
+`Authenticated Users: Modify`, which means the shipped relocation target
+`C:\portable\Scripts\WinServerSetup` is writable by an ordinary user by default.
+
+**Consequence:** a **non-elevated** launcher run can still read and start the tool, but can no longer
+write its diagnostic log under `<project root>\logs\`. The launcher degrades quietly in that case
+rather than failing. Elevated runs — the supported way to use this tool — log normally.
+
+There is deliberately no `Users: Modify` carve-out for `logs\`: a writable subdirectory inside the
+hardened root would reopen the hole the hardening exists to close. If you run the blocker step from a
+working checkout rather than the deployed location, that checkout is hardened too.
+
 ### Security-sensitive defaults
 
 These defaults are deliberately conservative. Each is opt-in because enabling it weakens the machine or trusts a third party:

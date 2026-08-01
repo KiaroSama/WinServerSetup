@@ -218,6 +218,12 @@ function Reset-Run {
     $script:Messages.Clear()
     $script:DownloadSucceeds = $true
     $script:FailPayloadMove = $false
+    # M-08: Install-V2RayN records its outcome in RunStats, because v2rayN is enabled in the
+    # shipped config and a warning-only failure left the whole run exiting 0.
+    $Global:RunStats = [pscustomobject]@{
+        InstalledApps = (New-Object System.Collections.Generic.List[string])
+        FailedApps    = (New-Object System.Collections.Generic.List[string])
+    }
 }
 function Get-Messages { return ($script:Messages -join " | ") }
 
@@ -242,6 +248,8 @@ try {
     Assert-Equal 'new-exe' (Get-Text (Join-Path $finalDir 'v2rayN.exe')) "The installed executable must be the downloaded payload."
     Assert-True (Test-Exists (Join-Path $finalDir 'core.dll')) "The rest of the payload must be installed too."
     Assert-Equal 0 @(Get-StageLeftovers).Count "Staging must be cleaned after a successful install."
+    Assert-Equal 1 $Global:RunStats.InstalledApps.Count "M-08: a verified v2rayN install must be recorded as installed."
+    Assert-Equal 0 $Global:RunStats.FailedApps.Count "M-08: a verified v2rayN install must not be recorded as failed."
 
     # ---- 3. LOAD-BEARING: an upgrade preserves user data and drops obsolete binaries. ----
     Reset-Run
@@ -303,6 +311,9 @@ try {
     Assert-True ((Get-Messages) -match 'download failed') ("A failed download must be reported. Messages: {0}" -f (Get-Messages))
     Assert-Equal 0 @(Get-StageLeftovers).Count "Staging must be cleaned after a failed download."
     Assert-True (-not (Test-Exists (Join-Path $installRoot 'V2rayN\v2rayN.exe'))) "A failed download must not install anything."
+    Assert-Equal 1 $Global:RunStats.FailedApps.Count "M-08: a failed v2rayN download must be recorded as a failed app, not only warned about."
+    Assert-Equal 'v2rayN' $Global:RunStats.FailedApps[0] "M-08: the failed v2rayN update must be recorded under its component name."
+    Assert-Equal 0 $Global:RunStats.InstalledApps.Count "M-08: a failed v2rayN download must not report anything installed."
 
     # ---- 7. An unsafe install target is refused before anything is deleted. ----
     # finalDir resolves to the string 'C:\'. The guard must reject it; no delete may run.

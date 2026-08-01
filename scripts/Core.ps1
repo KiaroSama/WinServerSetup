@@ -451,17 +451,56 @@ function Test-CommandExists {
     return [bool](Get-Command $Command -ErrorAction SilentlyContinue)
 }
 
-function Get-PreferredPowerShellForRelaunch {
-    $candidates = New-Object System.Collections.Generic.List[string]
+function Test-TrustedElevationExecutable {
+    <#
+        L-04. This decides which binary a relaunch starts, and that relaunch inherits the
+        current elevated token, so the binary must live where an unprivileged user cannot
+        replace it. A valid signature alone is not enough: a byte-copy of the real
+        powershell.exe keeps its signature after being dropped into a user-writable directory.
 
+        Run-WinServerSetup.ps1 carries its own copy of this contract on purpose - the launcher
+        runs before this module is dot-sourced and cannot call in here. Fail closed.
+    #>
+    param([string]$Path)
+    # Declared inside the function: the test suites extract a single function by AST, so a
+    # module-level $script: variable would be undefined there. SIDs, never display names.
+    $trustedSids = @(
+        'S-1-5-18',      # LOCAL SYSTEM
+        'S-1-5-32-544',  # BUILTIN\Administrators
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' # NT SERVICE\TrustedInstaller
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    # A bare name would be resolved by Start-Process through PATH, which is this whole finding.
+    if (-not [System.IO.Path]::IsPathRooted($Path)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    if (Test-PathContainsReparsePoint -Path $Path) { return $false }
+    # @() at the call site: Get-UntrustedAclWriter returns a plain array and a single-element
+    # result unwraps to a scalar on Windows PowerShell 5.1, where .Count would be missing.
+    if (@(Get-UntrustedAclWriter -Path $Path).Count -gt 0) { return $false }
     try {
-        $pwshFromPath = Get-Command "pwsh.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($pwshFromPath -and $pwshFromPath.Source) {
-            $candidates.Add($pwshFromPath.Source) | Out-Null
-        }
+        # The owner is a writer too: it can always rewrite the DACL and then replace the file.
+        $ownerSid = (Get-Acl -LiteralPath $Path -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        if ($trustedSids -notcontains $ownerSid) { return $false }
+        return ((Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop).Status -eq 'Valid')
     } catch {
-        Write-StructuredLog -Level DEBUG -Message ("Could not resolve pwsh.exe from PATH: {0}" -f $_.Exception.Message)
+        Write-StructuredLog -Level SIGNATURE -Message ("Rejected an elevation candidate that could not be verified: {0}: {1}" -f $Path, $_.Exception.Message)
+        return $false
     }
+}
+
+function Get-PreferredPowerShellForRelaunch {
+    # L-04. Fixed, administrator-owned locations are asked first and PATH only last, because
+    # prepending a directory to PATH is something an unprivileged user can do and this result
+    # runs with the elevated token this process already holds. Every candidate, PATH included,
+    # still has to pass Test-TrustedElevationExecutable.
+    #
+    # Two policies differ from the launcher's Get-PreferredPowerShellExe on purpose, and the
+    # functions are deliberately not merged: this one prefers the currently running process,
+    # and it degrades instead of throwing so a relocation relaunch is never aborted by a
+    # resolver. The degraded value is the absolute Windows PowerShell path, not the bare name
+    # "powershell.exe" it used to be - Start-Process resolves a bare name through PATH, which
+    # would have left the same hijack open on the one path that skips the trust check.
+    $candidates = New-Object System.Collections.Generic.List[string]
 
     if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
         $candidates.Add((Join-Path $env:ProgramFiles "PowerShell\7\pwsh.exe")) | Out-Null
@@ -489,17 +528,29 @@ function Get-PreferredPowerShellForRelaunch {
         Write-StructuredLog -Level DEBUG -Message ("Could not resolve current PowerShell process path: {0}" -f $_.Exception.Message)
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($env:WINDIR)) {
-        $candidates.Add((Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe")) | Out-Null
+    $systemRoot = if (-not [string]::IsNullOrWhiteSpace($env:WINDIR)) { $env:WINDIR } else { Split-Path -Parent ([Environment]::SystemDirectory) }
+    $windowsPowerShell = Join-Path $systemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $candidates.Add($windowsPowerShell) | Out-Null
+
+    foreach ($name in @("pwsh.exe", "powershell.exe")) {
+        try {
+            $fromPath = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($fromPath -and $fromPath.Source) {
+                $candidates.Add($fromPath.Source) | Out-Null
+            }
+        } catch {
+            Write-StructuredLog -Level DEBUG -Message ("Could not resolve {0} from PATH: {1}" -f $name, $_.Exception.Message)
+        }
     }
 
     foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-        if (Test-Path -LiteralPath $candidate) {
+        if (Test-TrustedElevationExecutable -Path $candidate) {
             return (Get-Item -LiteralPath $candidate).FullName
         }
     }
 
-    return "powershell.exe"
+    Write-StructuredLog -Level SIGNATURE -Message "No trusted PowerShell host could be verified for relaunch; using the absolute Windows PowerShell path."
+    return $windowsPowerShell
 }
 
 # =============================================================================

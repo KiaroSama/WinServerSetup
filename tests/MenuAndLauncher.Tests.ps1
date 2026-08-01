@@ -83,11 +83,17 @@ Assert-Contains `
     -Pattern 'function\s+Get-PreferredPowerShellExe' `
     -Message "Launcher must resolve a preferred PowerShell executable instead of hard-coding Windows PowerShell 5."
 
-$pwshIndex = $launcher.IndexOf('Get-Command "pwsh.exe"')
+# PowerShell 7 must still be preferred over Windows PowerShell 5 - but the ordering is now
+# between two FIXED install locations, because L-04 moved the PATH lookup to a last resort.
+$pwshIndex = $launcher.IndexOf('PowerShell\7\pwsh.exe')
 $winPsIndex = $launcher.IndexOf('WindowsPowerShell\v1.0\powershell.exe')
+$pathLookupIndex = $launcher.IndexOf('Get-Command $name -CommandType Application')
 Assert-True `
     -Condition (($pwshIndex -ge 0) -and ($winPsIndex -gt $pwshIndex)) `
     -Message "Launcher must prefer PowerShell 7 (pwsh.exe) before falling back to Windows PowerShell 5."
+Assert-True `
+    -Condition (($pathLookupIndex -gt $winPsIndex) -and ($winPsIndex -ge 0)) `
+    -Message "L-04: the launcher must consult PATH only after every fixed trusted location has been offered."
 
 Assert-Contains `
     -Text $launcher `

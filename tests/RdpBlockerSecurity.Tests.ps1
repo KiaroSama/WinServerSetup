@@ -84,13 +84,20 @@ function Get-WinEvent {
     $channel = if ($FilterHashtable) { [string]$FilterHashtable.LogName } else { [string]$LogName }
     if ($channel -like '*RdpCoreTS*') { return @($script:RdpEvents) }
     if ($script:EventReadFailure) { throw "Security log access denied" }
+    # The "has the Security log been cleared?" probe is the newest record with no filter at all.
+    # Every other query now carries -MaxEvents as well (H-04), so the probe has to be recognised
+    # by its exact shape rather than by the mere presence of -MaxEvents.
+    if ($MaxEvents -eq 1 -and -not $FilterXPath -and -not $FilterHashtable) {
+        return @($script:Events | Sort-Object RecordId -Descending | Select-Object -First 1)
+    }
     if ($FilterXPath) { $script:EventQueries.Add([string]$FilterXPath) | Out-Null }
-    if ($MaxEvents) { return @($script:Events | Sort-Object RecordId -Descending | Select-Object -First 1) }
+    $source = @($script:Events)
     if ($FilterXPath -and $FilterXPath -match 'EventRecordID\s*&gt;\s*(\d+)|EventRecordID\s*>\s*(\d+)') {
         $last = if ($matches[1]) { [long]$matches[1] } else { [long]$matches[2] }
-        return @($script:Events | Where-Object { $_.RecordId -gt $last })
+        $source = @($source | Where-Object { $_.RecordId -gt $last })
     }
-    return @($script:Events)
+    if ($MaxEvents -and [int]$MaxEvents -gt 0) { $source = @($source | Select-Object -First ([int]$MaxEvents)) }
+    return $source
 }
 function Get-NetFirewallRule {
     param([string]$DisplayName, $ErrorAction)
@@ -182,6 +189,33 @@ function Reset-TestState {
     Remove-Item -LiteralPath (Join-Path $testRoot "state.json") -Force -ErrorAction SilentlyContinue
 }
 
+function Invoke-BlockerRun {
+    <#
+        The blocker is guarded by a machine-wide named mutex, so ANOTHER RDP blocker run on the
+        same machine - a second shell's test pass - makes this one skip. Skipping is a healthy
+        branch (it is asserted deliberately further down, with the mutex held on purpose), but
+        an UNPLANNED skip writes no state and touches no firewall rule, so every assertion here
+        would then fail with a misleading "nothing happened" message. Wait for the guard to be
+        free first (a bounded wait on an explicit signal, no sleeps), then run; if it was skipped
+        anyway, retry a bounded number of times and finally say why.
+    #>
+    param([int]$Attempts = 3)
+    $configArgument = "ignored.json"
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $gate = New-Object System.Threading.Mutex($false, 'Global\WinServerSetup-RdpBlocker')
+        try {
+            $owned = $false
+            try { $owned = $gate.WaitOne(60000) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+            if ($owned) { $gate.ReleaseMutex() }
+        } finally { $gate.Dispose() }
+
+        $marker = $script:LogLines.Count
+        $result = Invoke-RdpBruteforceBlocker -ResolvedConfigPath $configArgument
+        if ((@($script:LogLines | Select-Object -Skip $marker) -join "`n") -notmatch 'already running') { return $result }
+    }
+    throw "Every attempt was skipped because another RDP blocker run held the machine-wide guard."
+}
+
 try {
     Reset-TestState
     $script:Config = New-TestConfig -Whitelist @("203.0.113.30/32")
@@ -194,7 +228,7 @@ try {
         New-TestEvent 6 "203.0.113.30" "10" "whitelisted-user"
     )
 
-    $result = Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json"
+    $result = Invoke-BlockerRun
     Assert-Equal 0 $result ("Valid blocker run must succeed. Logs: {0}" -f ($script:LogLines -join " | "))
     Assert-Equal 0 $script:TcpConnectionCalls "Established TCP sessions must not be consulted."
     Assert-Equal 1 $script:FirewallRules.Count "Only the RemoteInteractive non-whitelisted offender must be blocked."
@@ -211,7 +245,7 @@ try {
         New-TestEvent 7 "203.0.113.21" "3" "network-user"
         New-TestEvent 8 "203.0.113.21" "3" "network-user"
     )
-    Assert-Equal 0 (Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json") "Opt-in Logon Type 3 run failed."
+    Assert-Equal 0 (Invoke-BlockerRun) "Opt-in Logon Type 3 run failed."
     Assert-Equal 1 $script:FirewallRules.Count "Logon Type 3 must be blockable only when explicitly enabled."
 
     # Network Level Authentication is the default on current Windows Server, and it records a
@@ -229,7 +263,7 @@ try {
     # Only the first address actually spoke RDP to this host.
     $script:RdpEvents = @(New-TestRdpEvent 1 "203.0.113.50")
 
-    Assert-Equal 0 (Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json") `
+    Assert-Equal 0 (Invoke-BlockerRun) `
         ("NLA-attributed run failed. Logs: {0}" -f ($script:LogLines -join " | "))
     Assert-Equal 1 $script:FirewallRules.Count `
         "An NLA-mode RDP attacker (LogonType 3 confirmed by the RDP channel) must be blocked, and a plain network logon must not."
@@ -240,13 +274,13 @@ try {
 
     Reset-TestState
     $script:Config.rdpBruteforceBlocker.threshold = 0
-    $result = Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json"
+    $result = Invoke-BlockerRun
     Assert-Equal 1 $result "Invalid threshold must fail the task."
     Assert-Equal 0 $script:FirewallRules.Count "Invalid config must not change firewall state."
 
     Reset-TestState
     $script:EventReadFailure = $true
-    $result = Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json"
+    $result = Invoke-BlockerRun
     Assert-Equal 1 $result "Security log read failure must return nonzero."
     $failureLogs = $script:LogLines -join "`n"
     Assert-True ($failureLogs -match '\[ERROR\].*Security log access denied') "Security log read failure must be logged as an error."
@@ -257,10 +291,10 @@ try {
         New-TestEvent 10 "203.0.113.40" "10" "user-a"
         New-TestEvent 11 "203.0.113.40" "10" "user-a"
     )
-    Assert-Equal 0 (Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json") "Initial stateful run failed."
+    Assert-Equal 0 (Invoke-BlockerRun) "Initial stateful run failed."
     $script:Events += New-TestEvent 12 "203.0.113.41" "10" "user-b"
     $script:Events += New-TestEvent 13 "203.0.113.41" "10" "user-b"
-    $incrementalResult = Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json"
+    $incrementalResult = Invoke-BlockerRun
     Assert-Equal 0 $incrementalResult ("Incremental stateful run failed. Logs: {0}" -f ($script:LogLines -join " | "))
     Assert-True (($script:EventQueries -join "`n") -match 'EventRecordID.*11') "Second run must query after the persisted RecordId instead of reparsing the full window."
 
@@ -290,6 +324,8 @@ try {
     $holderHandle = $mutexHolder.BeginInvoke()
     try {
         Assert-True ($acquiredSignal.Wait(30000)) "The competing thread could not take the blocker mutex; the overlap case never ran."
+        # Deliberately NOT Invoke-BlockerRun: this case exists to exercise the contended path,
+        # so it must call the blocker directly while the competing thread holds the guard.
         $overlapResult = Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json"
         $overlapLogs = $script:LogLines -join "`n"
         Assert-Equal 0 $overlapResult ("A concurrent run must exit 0 so the scheduled task does not record a failure. Logs: {0}" -f ($script:LogLines -join " | "))

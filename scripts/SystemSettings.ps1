@@ -381,9 +381,12 @@ function Configure-WindowsUpdateBandwidthPolicies {
     if ($s.runGpupdate) {
         try {
             Write-Info "Refreshing computer policy with gpupdate..."
-            $gp = Invoke-LoggedProcessWithProgress -FilePath "gpupdate.exe" -Arguments @("/target:computer", "/force") -DisplayName "gpupdate" -StatusMessage "Refreshing computer policy"
-            if ($gp.ExitCode -eq 0) { Write-Ok "Computer policy refreshed." }
-            else { Write-Warn "gpupdate exited with code $($gp.ExitCode)." }
+            # Invoke-BoundedGpupdate (scripts\AccountSecurity.ps1) is the project's only gpupdate
+            # runner. The progress runner used here previously waits on HasExited with no deadline,
+            # so a slow or unreachable domain controller hung the whole setup. A refresh that stalls
+            # or fails is still only a warning: the bandwidth policies themselves are already written.
+            Invoke-BoundedGpupdate
+            Write-Ok "Computer policy refreshed."
         } catch {
             Write-Warn "gpupdate failed: $($_.Exception.Message)"
         }

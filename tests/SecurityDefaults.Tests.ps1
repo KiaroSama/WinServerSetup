@@ -1,8 +1,10 @@
-param()
+# -ConfigPath targets an alternate copy of the tracked config so these assertions can be replayed
+# against a deliberately weakened copy to prove they still fail. CI and local runs use the default.
+param([string]$ConfigPath = "")
 
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$configPath = Join-Path $projectRoot "WinServerSetup.config.json"
+$configPath = if ([string]::IsNullOrWhiteSpace($ConfigPath)) { Join-Path $projectRoot "WinServerSetup.config.json" } else { $ConfigPath }
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 
 . (Join-Path $PSScriptRoot '_Common.ps1')
@@ -21,6 +23,18 @@ Assert-True (-not [bool]$blocker.blockAllInbound) "Firewall blocks must default 
 Assert-True (-not [bool]$blocker.permanentBlock) "Permanent blocker rules must be opt-in."
 Assert-True ([int]$blocker.ruleRetentionDays -ge 1) "Managed blocker rules need finite retention."
 Assert-True ([int64]$blocker.logMaxBytes -ge 65536) "RDP blocker logs need a bounded rotation threshold."
+
+# L-01: rdpBruteforceBlocker.hidden was shipped in the tracked config and read by nothing - the
+# blocker never hid anything, so the key only ever misled operators into thinking it did. It was
+# removed rather than implemented; this assertion is what stops it drifting back in.
+Assert-True ($blocker.PSObject.Properties.Name -notcontains "hidden") `
+    "L-01: rdpBruteforceBlocker.hidden is not read by scripts\Block-RdpBruteforce.ps1 and must not reappear in the tracked config."
+
+# H-04: the per-run resource caps only bound anything if they are actually shipped.
+foreach ($cap in @("maxEventsPerRun", "maxOffendersPerRun", "maxManagedRules", "maxStateBytes", "maxRunSeconds")) {
+    Assert-True ($blocker.PSObject.Properties.Name -contains $cap) "H-04: the tracked config must ship rdpBruteforceBlocker.$cap."
+    Assert-True ([int64]$blocker.$cap -ge 1) "H-04: rdpBruteforceBlocker.$cap must be a positive bound."
+}
 
 Assert-True (-not [bool]$config.administratorAccount.enabled) "Administrator rename must be explicit opt-in."
 Assert-True (-not [bool]$config.administratorAccount.promptDuringFullSetup) "Administrator rename prompts must default off."

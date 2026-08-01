@@ -177,6 +177,11 @@ function Register-PostRebootSfcTask {
         return
     }
     $psExe = Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe"
+    # H-02: this task also runs as SYSTEM at the highest run level, so its executable, its script
+    # and the directories that could be used to replace them get the same validation and the same
+    # deterministic hardening as the blocker's targets.
+    Assert-TrustedTaskTarget -Harden -Path @(
+        $psExe, (ConvertTo-CanonicalPath $Global:ProjectRoot), (Split-Path -Parent $sfcScript), $sfcScript) | Out-Null
     $taskName = "WinServerSetup Post-Reboot SFC"
     $arguments = "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$sfcScript`" -ProjectRoot `"$Global:ProjectRoot`""
 
@@ -554,10 +559,12 @@ function Invoke-HealthCheck {
         @{ Name = "Windows Search"; Enabled = [bool]$Global:Config.indexing.enabled; Test = { (Get-Service -Name WSearch -ErrorAction SilentlyContinue).Status -eq "Running" } },
         @{ Name = "RDP Port matches config"; Enabled = [bool]$Global:Config.rdp.enabled; Test = { (Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name PortNumber).PortNumber -eq [int]$Global:Config.rdp.newPort -and (Test-TermServiceOwnsTcpPort ([int]$Global:Config.rdp.newPort)) } },
         @{ Name = "EmptyStandbyList Task"; Enabled = [bool]$Global:Config.emptyStandbyList.enabled; Test = { Test-ScheduledTaskContract ([string]$Global:Config.emptyStandbyList.taskName) (Join-Path ([string]$Global:Config.emptyStandbyList.installDir) ([string]$Global:Config.emptyStandbyList.exeName)) ([regex]::Escape([string]$Global:Config.emptyStandbyList.argument)) } },
-        # -RequireHealthyLastResult: the blocker is a security control, so "the task exists" is not
-        # good enough. A task whose last run failed, that is disabled, or that has no next run
-        # scheduled is silently protecting nothing.
-        @{ Name = "RDP Blocker Task"; Enabled = [bool]$Global:Config.rdpBruteforceBlocker.enabled; Test = { Test-ScheduledTaskContract -TaskName ([string]$Global:Config.rdpBruteforceBlocker.taskName) -ExpectedExecutable (Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe") -ExpectedArgumentPattern ([regex]::Escape($Global:ConfigPath)) -RequireHealthyLastResult } },
+        # L-02: the blocker is a security control, so "a task with that name exists" is not good
+        # enough - and neither is a regex that merely finds the config path SOMEWHERE in the
+        # argument string. Test-RdpBlockerTaskHealth re-proves the whole contract recorded at
+        # registration: executable, script path, canonical -ConfigPath, principal, run level,
+        # trigger interval, ExecutionTimeLimit, MultipleInstances, target ACL and target hash.
+        @{ Name = "RDP Blocker Task"; Enabled = [bool]$Global:Config.rdpBruteforceBlocker.enabled; Test = { Test-RdpBlockerTaskHealth -TaskName ([string]$Global:Config.rdpBruteforceBlocker.taskName) } },
         @{ Name = "Show File Extensions"; Enabled = [bool]$Global:Config.appearance.showFileExtensions; Test = { (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name HideFileExt -ErrorAction SilentlyContinue).HideFileExt -eq 0 } },
         @{ Name = "Windows Long Paths"; Enabled = [bool]$Global:Config.filesystem.enableLongPaths; Test = { (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled -eq 1 } },
         @{ Name = "Dark Mode"; Enabled = [bool]$Global:Config.appearance.darkMode; Test = { (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name AppsUseLightTheme -ErrorAction SilentlyContinue).AppsUseLightTheme -eq 0 } },
