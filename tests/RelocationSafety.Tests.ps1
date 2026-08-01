@@ -46,7 +46,7 @@ function Import-FunctionUnderTest {
     return $definition.Extent.Text
 }
 
-foreach ($name in @('Write-RelocationReadyMarker', 'Wait-RelocatedChildReady')) {
+foreach ($name in @('ConvertTo-CanonicalPath', 'Write-RelocationReadyMarker', 'Wait-RelocatedChildReady')) {
     . ([scriptblock]::Create((Import-FunctionUnderTest $name)))
 }
 

@@ -852,7 +852,8 @@ function Write-RelocationReadyMarker {
     try {
         [pscustomobject]@{
             Token = $Token
-            TargetPath = (Resolve-Path -LiteralPath $Global:ProjectRoot).Path.TrimEnd('\')
+            # Canonical form, so the parent's comparison cannot be defeated by a short-name spelling.
+            TargetPath = (ConvertTo-CanonicalPath $Global:ProjectRoot)
             ProcessId = $PID
             ReadyUtc = (Get-Date).ToUniversalTime().ToString('o')
         } | ConvertTo-Json | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
@@ -862,15 +863,36 @@ function Write-RelocationReadyMarker {
     }
 }
 
+function ConvertTo-CanonicalPath {
+    <#
+        Both sides of the readiness comparison must be normalised the SAME way.
+
+        These two do NOT agree, which is the trap: [System.IO.Path]::GetFullPath EXPANDS an 8.3
+        short name (C:\...\CANONI~1 -> C:\...\CanonicalLongName) while Resolve-Path PRESERVES
+        whatever spelling it was handed. The marker was written with Resolve-Path and read back
+        through GetFullPath, so whenever the path was reached by its short name the two strings
+        differed, the handshake never matched, it timed out after 30 seconds, and relocation
+        reported failure (fail-safe - the source is preserved - but relocation is broken).
+
+        GetFullPath is used on its own here because it is the one that canonicalises: it maps both
+        spellings of a directory to the same long form, and it does not require the path to exist,
+        which matters because the relocation target may not exist yet.
+    #>
+    param([AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+}
+
 function Wait-RelocatedChildReady {
     param($Process, [string]$Path, [string]$Token, [string]$ExpectedTarget, [int]$TimeoutSeconds = 30)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $expectedCanonical = ConvertTo-CanonicalPath $ExpectedTarget
     while ((Get-Date) -lt $deadline) {
         if (Test-Path -LiteralPath $Path) {
             try {
                 $marker = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-                $actualTarget = [System.IO.Path]::GetFullPath([string]$marker.TargetPath).TrimEnd('\')
-                if ([string]$marker.Token -eq $Token -and [string]::Equals($actualTarget, $ExpectedTarget, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+                $actualTarget = ConvertTo-CanonicalPath ([string]$marker.TargetPath)
+                if ([string]$marker.Token -eq $Token -and [string]::Equals($actualTarget, $expectedCanonical, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
             } catch { $null = $_ }
         }
         if ($Process.HasExited) { throw "Relocated setup exited with code $($Process.ExitCode) before signaling readiness." }
