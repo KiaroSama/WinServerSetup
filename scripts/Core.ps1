@@ -203,6 +203,25 @@ function Test-DownloadedFileSignature {
 # fix: the shipped cache root granted Modify/FullControl to two non-administrative identities and
 # a 4 KB unsigned file was accepted as a valid cache hit.
 
+function Get-Sha256Hex {
+    <#
+        SHA256 without depending on Get-FileHash.
+
+        Get-FileHash lives in Microsoft.PowerShell.Utility and resolves through module
+        autoloading, which is not guaranteed in every host environment: under the guarded test
+        runner on Windows PowerShell 5.1 it raises CommandNotFoundException even though a direct
+        5.1 session resolves it fine. Hashing is on the trust path that decides whether an
+        elevated installer runs, so it must not depend on ambient module resolution.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '') }
+        finally { $stream.Dispose() }
+    } finally { $sha.Dispose() }
+}
+
 function Test-PathContainsReparsePoint {
     <#
         Fail closed on any reparse point in the chain: a junction anywhere between the volume
@@ -323,7 +342,7 @@ function Get-TrustedFileIdentity {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     return [pscustomobject]@{
         Length = [int64]$item.Length
-        Sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+        Sha256 = (Get-Sha256Hex -Path $Path)
     }
 }
 
@@ -387,7 +406,7 @@ function Test-FileSha256 {
     )
     if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) { return $true }
     try {
-        $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+        $actual = Get-Sha256Hex -Path $Path
         if ([string]::Equals($actual, $ExpectedSha256.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
             Write-StructuredLog -Level HASH -Message ("SHA256 verified: {0}" -f $Path)
             return $true

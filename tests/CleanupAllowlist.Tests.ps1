@@ -39,7 +39,7 @@ function Write-Ok { param($Message) }
 function Write-Info { param($Message) }
 function Write-StructuredLog { param($Level, $Message) }
 
-foreach ($name in @('Test-PathContainsReparsePoint', 'Get-UntrustedAclWriter', 'Initialize-TrustedDirectory',
+foreach ($name in @('Get-Sha256Hex', 'Test-PathContainsReparsePoint', 'Get-UntrustedAclWriter', 'Initialize-TrustedDirectory',
         'Get-ProtectedCleanupRoot', 'Test-ProtectedCleanupPath', 'Initialize-CacheSentinel',
         'Test-DedicatedCacheDirectory', 'Assert-DownloadRootAllowed',
         'Remove-DirectoryContentsSafe', 'Remove-CacheContentsSafe', 'Remove-SystemTempContentsSafe')) {
@@ -53,8 +53,11 @@ $script:CacheSentinelName = '.winserversetup-cache'
 # The cache sandbox must NOT sit under %TEMP%: that is a descendant of %USERPROFILE%, which the
 # H-03 rule rejects by design. Production puts the cache under %ProgramData%, so the sandbox goes
 # there too. Falls back to %TEMP% only for the predicate-only cases if ProgramData is not writable.
+$securityModuleAvailable = $false
+try { $securityModuleAvailable = [bool](Get-Command Get-Acl -ErrorAction Stop) } catch { $securityModuleAvailable = $false }
+
 $testRoot = Join-Path $env:ProgramData ("WinServerSetup-H03-{0}" -f ([guid]::NewGuid().ToString("N")))
-$cacheCasesEnabled = $true
+$cacheCasesEnabled = $securityModuleAvailable
 try { New-Item -ItemType Directory -Path $testRoot -Force -ErrorAction Stop | Out-Null }
 catch {
     $cacheCasesEnabled = $false

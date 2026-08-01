@@ -39,7 +39,7 @@ function Write-Ok { param($Message) }
 function Write-Info { param($Message) }
 function Write-StructuredLog { param($Level, $Message) }
 
-foreach ($name in @('Test-FileSha256', 'Test-SignerSubjectAllowed', 'Test-DownloadedFileSignature',
+foreach ($name in @('Get-Sha256Hex', 'Test-FileSha256', 'Test-SignerSubjectAllowed', 'Test-DownloadedFileSignature',
         'Test-PathContainsReparsePoint', 'Get-UntrustedAclWriter', 'Test-TrustedDirectory',
         'Initialize-TrustedDirectory', 'Get-TrustedFileIdentity', 'Test-ExecutableExtension',
         'Assert-TrustedArtifact')) {
@@ -57,6 +57,19 @@ function New-Payload {
     return $Path
 }
 
+# Microsoft.PowerShell.Security supplies Get-Acl / Set-Acl / Get-AuthenticodeSignature and
+# resolves through module autoloading. Some hosts cannot load it at all - the guarded test
+# runner's Windows PowerShell 5.1 child reports "the module could not be loaded" - so cases that
+# need it report an explicit skip instead of a false pass. Production fails closed in the same
+# situation: Get-UntrustedAclWriter reports "<ACL unreadable>" as an offender and
+# Test-DownloadedFileSignature catches the error and returns $false.
+$securityModuleAvailable = $false
+try {
+    $securityModuleAvailable = [bool](Get-Command Get-Acl -ErrorAction Stop) -and
+                               [bool](Get-Command Set-Acl -ErrorAction Stop) -and
+                               [bool](Get-Command Get-AuthenticodeSignature -ErrorAction Stop)
+} catch { $securityModuleAvailable = $false }
+
 try {
     # ---- H-01.1: an unsigned cached MSI/EXE is rejected even at a valid size. ----
     foreach ($ext in @('.exe', '.msi')) {
@@ -72,7 +85,7 @@ try {
 
     # ---- H-01.2: a pinned hash is a valid trust anchor; a wrong hash is rejected. ----
     $pinned = New-Payload (Join-Path $testRoot 'pinned.exe')
-    $realHash = (Get-FileHash -LiteralPath $pinned -Algorithm SHA256).Hash
+    $realHash = Get-Sha256Hex -Path $pinned
     Assert-Equal $true (Assert-TrustedArtifact -Path $pinned -ExpectedSha256 $realHash -AllowedSignerSubjects @()) `
         "H-01: an unsigned executable pinned by sha256 is trusted - the bytes are exactly the chosen ones."
     Assert-Equal $false (Assert-TrustedArtifact -Path $pinned -ExpectedSha256 ('0' * 64) -AllowedSignerSubjects @()) `
@@ -81,7 +94,9 @@ try {
     # ---- H-01.3: a valid signature from an unapproved signer is rejected. ----
     # Signed system binaries are the only reliably-signed artifacts available offline.
     $signedSystemExe = Join-Path $env:WINDIR 'System32\where.exe'
-    if (Test-Path -LiteralPath $signedSystemExe) {
+    if (-not $securityModuleAvailable) {
+        Write-Host "SKIP H-01 signer-allowlist cases: Microsoft.PowerShell.Security could not be loaded in this host."
+    } elseif (Test-Path -LiteralPath $signedSystemExe) {
         $sig = Get-AuthenticodeSignature -LiteralPath $signedSystemExe
         if ($sig.Status -eq 'Valid') {
             Assert-Equal $true (Assert-TrustedArtifact -Path $signedSystemExe -ExpectedSha256 "" -AllowedSignerSubjects @()) `
@@ -98,6 +113,9 @@ try {
     }
 
     # ---- H-01.4: a cache root writable by a non-administrator is detected. ----
+  if (-not $securityModuleAvailable) {
+    Write-Host "SKIP H-01 ACL cases (H-01.4 and H-01.5): Microsoft.PowerShell.Security could not be loaded in this host, so a DACL cannot be read or written here."
+  } else {
     $looseRoot = Join-Path $testRoot 'loose-cache'
     New-Item -ItemType Directory -Path $looseRoot -Force | Out-Null
     $acl = Get-Acl -LiteralPath $looseRoot
@@ -131,6 +149,8 @@ try {
         "H-01: a hardened cache root must have no non-administrative writer. Got: $((Get-UntrustedAclWriter -Path $hardened) -join ' | ')"
     Assert-Equal $true (Test-TrustedDirectory -Path $hardened) "H-01: the hardened root must be trusted."
 
+  }
+
     # ---- H-01.6: reparse points are rejected anywhere in the chain. ----
     $realTarget = Join-Path $testRoot 'real-target'
     New-Item -ItemType Directory -Path $realTarget -Force | Out-Null
@@ -149,7 +169,7 @@ try {
         Assert-Equal $false (Assert-TrustedArtifact -Path $throughJunction -ExpectedSha256 "" -AllowedSignerSubjects @()) `
             "H-01: an artifact reached through a reparse point must be rejected fail-closed."
         # Even a correct pinned hash must not rescue a reparse-point path.
-        $throughHash = (Get-FileHash -LiteralPath $throughJunction -Algorithm SHA256).Hash
+        $throughHash = Get-Sha256Hex -Path $throughJunction
         Assert-Equal $false (Assert-TrustedArtifact -Path $throughJunction -ExpectedSha256 $throughHash -AllowedSignerSubjects @()) `
             "H-01: a pinned hash must not override reparse-point rejection - the path itself is the untrusted part."
     } else {
