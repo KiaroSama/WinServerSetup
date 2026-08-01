@@ -8,7 +8,14 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $mainScript = Join-Path $projectRoot "WinServerSetup.ps1"
 $launcherScript = Join-Path $projectRoot "Run-WinServerSetup.ps1"
 
-$main = Get-Content -LiteralPath $mainScript -Raw -Encoding UTF8
+# WinServerSetup.ps1 dot-sources its function library from scripts\; the assertions below cover
+# that whole partition, so read and parse it as one source text.
+$setupSourceFiles = @($mainScript) + @(
+    @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance') |
+        ForEach-Object { Join-Path $projectRoot ("scripts\{0}.ps1" -f $_) } |
+        Where-Object { Test-Path -LiteralPath $_ }
+)
+$main = ($setupSourceFiles | ForEach-Object { Get-Content -LiteralPath $_ -Raw -Encoding UTF8 }) -join "`r`n"
 $launcher = Get-Content -LiteralPath $launcherScript -Raw -Encoding UTF8
 
 function Assert-Contains {
@@ -211,8 +218,8 @@ foreach ($ansiPattern in @(
 
 $mainTokens = $null
 $mainParseErrors = $null
-$mainAst = [System.Management.Automation.Language.Parser]::ParseFile(
-    $mainScript,
+$mainAst = [System.Management.Automation.Language.Parser]::ParseInput(
+    $main,
     [ref]$mainTokens,
     [ref]$mainParseErrors
 )
