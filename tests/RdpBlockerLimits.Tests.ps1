@@ -412,6 +412,8 @@ try {
     # Grant this identity back before cleaning up: a quarantined state file is hardened down to
     # SYSTEM + Administrators (L-03), which would otherwise leave the fixture directory behind.
     $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    & icacls.exe $testRoot ("/grant:r") ("*{0}:(OI)(CI)(F)" -f $sid) /T /C /Q 2>&1 | Out-Null
+    foreach ($file in @(Get-ChildItem -LiteralPath $testRoot -File -Recurse -Force -ErrorAction SilentlyContinue)) {
+        & icacls.exe $file.FullName '/grant' ("*{0}:(F)" -f $sid) 2>&1 | Out-Null
+    }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

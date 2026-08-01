@@ -143,10 +143,12 @@ function Reset-TestState {
 function Remove-TestRoot {
     # The blocker hardens a quarantined state file down to SYSTEM + Administrators (L-03), which
     # is exactly the point - and which stops a non-elevated test process deleting its own
-    # fixtures. Grant this identity back first, by SID so it does not depend on account name or
-    # locale, then clean up.
+    # fixture. Grant this identity back per file first, by SID so it does not depend on the
+    # account name or locale, then clean up.
     $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    & icacls.exe $testRoot ("/grant:r") ("*{0}:(OI)(CI)(F)" -f $sid) /T /C /Q 2>&1 | Out-Null
+    foreach ($file in @(Get-ChildItem -LiteralPath $testRoot -File -Recurse -Force -ErrorAction SilentlyContinue)) {
+        & icacls.exe $file.FullName '/grant' ("*{0}:(F)" -f $sid) 2>&1 | Out-Null
+    }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 

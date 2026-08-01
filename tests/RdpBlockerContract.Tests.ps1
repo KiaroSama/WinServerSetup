@@ -169,7 +169,9 @@ function Restore-QuarantineAccess {
     # of L-03. A non-elevated test process therefore cannot delete its own fixtures until it
     # grants itself back in. SID form so it does not depend on the account name or locale.
     $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    & icacls.exe $testRoot ("/grant:r") ("*{0}:(OI)(CI)(F)" -f $sid) /T /C /Q 2>&1 | Out-Null
+    foreach ($file in @(Get-ChildItem -LiteralPath $testRoot -File -Recurse -Force -ErrorAction SilentlyContinue)) {
+        & icacls.exe $file.FullName '/grant' ("*{0}:(F)" -f $sid) 2>&1 | Out-Null
+    }
 }
 function Remove-TestRoot {
     Restore-QuarantineAccess
