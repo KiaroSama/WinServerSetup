@@ -118,7 +118,9 @@ function Install-DirectInstaller {
 
     Write-Info "Installing $name silently with args: $silentArgs"
     try {
-        $code = Invoke-SilentExeInstall -Path $exePath -Arguments @($silentArgs)
+        # H-01: hand the same trust anchor to the launcher so it revalidates the exact artifact
+        # immediately before executing it, rather than trusting the download-time result.
+        $code = Invoke-SilentExeInstall -Path $exePath -Arguments @($silentArgs) -ExpectedSha256 $expectedSha256 -AllowedSignerSubjects $allowedSignerSubjects
         $silentResult = Resolve-InstallerExitCode -ExitCode $code
         if ($silentResult.Succeeded) {
             if ($silentResult.RebootPending) { Set-PendingReboot "$name installer returned $code" }

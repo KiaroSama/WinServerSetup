@@ -101,24 +101,29 @@ function Invoke-DownloadFile {
     if ($TimeoutSeconds -lt 5 -or $TimeoutSeconds -gt 1800) { throw "Download timeout must be between 5 and 1800 seconds." }
     $dir = Split-Path -Parent $Destination
     Ensure-Directory $dir
+    # H-01: the cache directory must not be writable by a non-administrator, or an unprivileged
+    # user can plant the artifact this elevated run is about to execute. Fail closed.
+    $untrustedWriters = @(Get-UntrustedAclWriter -Path $dir)
+    if ($untrustedWriters.Count -gt 0) {
+        throw ("Download cache is writable by a non-administrator and cannot be trusted for elevated installs: {0} [{1}]" -f $dir, ($untrustedWriters -join '; '))
+    }
+    if (Test-PathContainsReparsePoint -Path $Destination) {
+        throw "Download destination is reached through a reparse point: $Destination"
+    }
+
     if (Test-Path $Destination) {
         $existing = Get-Item -LiteralPath $Destination -ErrorAction SilentlyContinue
-        if ($existing -and $existing.Length -ge $MinimumBytes) {
-            if (-not (Test-FileSha256 -Path $Destination -ExpectedSha256 $ExpectedSha256)) {
-                Write-Warn ("Cached file failed hash verification; re-downloading: {0}" -f (Split-Path -Leaf $Destination))
-                Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-            } elseif ($RequireValidSignature -and $true -ne (Test-DownloadedFileSignature -Path $Destination -AllowedSignerSubjects $AllowedSignerSubjects)) {
-                Write-Warn ("Cached file failed required signature validation; re-downloading: {0}" -f (Split-Path -Leaf $Destination))
-                Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-            } else {
-                Write-Ok ("Using cached download: {0}" -f (Split-Path -Leaf $Destination))
-                Write-StructuredLog -Level DOWNLOAD -Message ("Cache hit: {0}; bytes={1}" -f $Destination, $existing.Length)
-                return $true
-            }
-        } else {
-            Write-Warn ("Cached file is missing or too small; re-downloading: {0}" -f (Split-Path -Leaf $Destination))
-            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        # H-01: ONE contract for cache hits and fresh downloads. Size alone is never sufficient -
+        # an executable needs a pinned hash or an allowlisted valid signature either way.
+        if ($existing -and $existing.Length -ge $MinimumBytes -and
+            (Assert-TrustedArtifact -Path $Destination -ExpectedSha256 $ExpectedSha256 -AllowedSignerSubjects $AllowedSignerSubjects)) {
+            Write-Ok ("Using cached download: {0}" -f (Split-Path -Leaf $Destination))
+            Write-StructuredLog -Level DOWNLOAD -Message ("Cache hit: {0}; bytes={1}" -f $Destination, $existing.Length)
+            return $true
         }
+        Write-Warn ("Cached file is missing, too small or untrusted; evicting and re-downloading: {0}" -f (Split-Path -Leaf $Destination))
+        Write-StructuredLog -Level DOWNLOAD -Message ("Cache evicted: {0}" -f $Destination)
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
     }
 
     for ($i = 0; $i -le $RetryCount; $i++) {
@@ -138,12 +143,15 @@ function Invoke-DownloadFile {
             }
             Move-Item -LiteralPath $partial -Destination $Destination -Force
             Clear-StatusInPlace
-            if (-not (Test-FileSha256 -Path $Destination -ExpectedSha256 $ExpectedSha256)) {
+            # H-01: same contract as the cache-hit branch above. RequireValidSignature is kept
+            # for callers that want to state the intent explicitly, but it can no longer make
+            # verification optional: an executable without a pinned hash or an allowlisted valid
+            # signature is rejected regardless of how the caller set it.
+            if (-not (Assert-TrustedArtifact -Path $Destination -ExpectedSha256 $ExpectedSha256 -AllowedSignerSubjects $AllowedSignerSubjects)) {
                 Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-                throw "Downloaded file failed SHA256 verification."
+                throw "Downloaded file failed trust validation (pinned hash or allowlisted Authenticode signature required)."
             }
-            $signatureOk = Test-DownloadedFileSignature -Path $Destination -AllowedSignerSubjects $AllowedSignerSubjects
-            if ($RequireValidSignature -and $true -ne $signatureOk) {
+            if ($RequireValidSignature -and $true -ne (Test-DownloadedFileSignature -Path $Destination -AllowedSignerSubjects $AllowedSignerSubjects)) {
                 Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
                 throw "Downloaded file failed required Authenticode signature validation."
             }
@@ -194,10 +202,27 @@ function Invoke-SilentExeInstall {
     param(
         [Parameter(Mandatory)][string]$Path,
         [string[]]$Arguments = @("/S"),
-        [int]$TimeoutSeconds = 600
+        [int]$TimeoutSeconds = 600,
+        [string]$ExpectedSha256 = "",
+        [string[]]$AllowedSignerSubjects = @()
     )
+    # H-01: revalidate immediately before launching. Validation at download time leaves a window
+    # in which the artifact can be swapped; this closes it as far as a user-mode check can, and
+    # the identity snapshot below detects a swap that happens between these two lines.
+    if (-not (Assert-TrustedArtifact -Path $Path -ExpectedSha256 $ExpectedSha256 -AllowedSignerSubjects $AllowedSignerSubjects)) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "Refusing to execute an installer that failed trust revalidation: $Path"
+    }
+    $identityBefore = Get-TrustedFileIdentity -Path $Path
+
     Write-Info ("Running silent installer: {0} {1}" -f (Split-Path -Leaf $Path), ($Arguments -join ' '))
-    Write-StructuredLog -Level COMMAND -Message ("Installer path: {0}" -f $Path)
+    Write-StructuredLog -Level COMMAND -Message ("Installer path: {0}; sha256={1}" -f $Path, $identityBefore.Sha256)
+
+    $identityNow = Get-TrustedFileIdentity -Path $Path
+    if ($identityNow.Sha256 -ne $identityBefore.Sha256 -or $identityNow.Length -ne $identityBefore.Length) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        throw "Installer changed between verification and execution; it was quarantined and not run: $Path"
+    }
     $proc = Start-Process -FilePath $Path -ArgumentList $Arguments -PassThru -WindowStyle Hidden
     if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
         try { $proc.Kill() } catch { $null = $_ }

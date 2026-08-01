@@ -79,15 +79,24 @@ function Ensure-Directory {
 }
 
 function Get-DownloadCachePath {
-    # downloadRoot, if empty, defaults to a per-user temp folder so the script
-    # never silently creates C:\portable\_downloads. Override via config.
+    <#
+        H-01: this cache feeds installers that run ELEVATED, so it must not live anywhere an
+        unprivileged user can write. It used to default to %TEMP%\WinServerSetup-downloads,
+        which on a normal workstation grants the interactive user FullControl - enough to plant
+        an executable under an expected file name and have the elevated run launch it.
+
+        The default is now under %ProgramData%, created and hardened to SYSTEM + Administrators
+        with inheritance disabled. A configured downloadRoot is honoured but gets the same
+        hardening and the same reparse-point rejection.
+    #>
     $cfgValue = ''
     if ($Global:Config) { $cfgValue = [string]$Global:Config.downloadRoot }
     if ([string]::IsNullOrWhiteSpace($cfgValue)) {
-        $cfgValue = Join-Path $env:TEMP "WinServerSetup-downloads"
+        $base = $env:ProgramData
+        if ([string]::IsNullOrWhiteSpace($base)) { $base = Join-Path $env:SystemDrive 'ProgramData' }
+        $cfgValue = Join-Path $base 'WinServerSetup\cache'
     }
-    Ensure-Directory $cfgValue
-    return $cfgValue
+    return (Initialize-TrustedDirectory -Path $cfgValue)
 }
 
 function Get-SafeDownloadCacheFilePath {
@@ -177,6 +186,192 @@ function Test-DownloadedFileSignature {
         Write-Warn ("Could not verify downloaded file signature for {0}: {1}" -f (Split-Path -Leaf $Path), $_.Exception.Message)
         return $false
     }
+}
+
+# --------------------------------------------------------------------------- H-01 trust layer
+# The download cache feeds installers that run ELEVATED. Before this, the cache defaulted to
+# %TEMP%\WinServerSetup-downloads - writable by the interactive user - and a cache hit required
+# only Length >= MinimumBytes whenever the spec carried no sha256 and did not set
+# requireValidSignature. An unprivileged user could therefore plant an unsigned executable under
+# the expected file name and have the elevated run launch it. Proven on this machine before the
+# fix: the shipped cache root granted Modify/FullControl to two non-administrative identities and
+# a 4 KB unsigned file was accepted as a valid cache hit.
+
+function Test-PathContainsReparsePoint {
+    <#
+        Fail closed on any reparse point in the chain: a junction anywhere between the volume
+        root and the target lets an attacker who controls one directory redirect the whole path
+        somewhere else after validation.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $current = $null
+    try { $current = [System.IO.Path]::GetFullPath($Path) } catch { return $true }
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        if (Test-Path -LiteralPath $current) {
+            try {
+                $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+                if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) { return $true }
+            } catch {
+                # Unreadable component: cannot prove it is safe, so treat it as unsafe.
+                return $true
+            }
+        }
+        $parent = [System.IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $current) { break }
+        $current = $parent
+    }
+    return $false
+}
+
+function Get-UntrustedAclWriter {
+    <#
+        Returns the identities that can write to $Path but are not SYSTEM, Administrators or
+        TrustedInstaller. A non-empty result means the location cannot be trusted to hold an
+        artifact that will later be executed elevated.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    # Declared INSIDE the function on purpose: the test suites extract a single function by AST
+    # and dot-source it, so a module-level $script: variable would be undefined there and every
+    # principal - including SYSTEM - would look untrusted.
+    # Compared by SID, never by display name: names are localized and renameable.
+    $trustedWriterSids = @(
+        'S-1-5-18',      # LOCAL SYSTEM
+        'S-1-5-32-544',  # BUILTIN\Administrators
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' # NT SERVICE\TrustedInstaller
+    )
+    $offenders = New-Object System.Collections.Generic.List[string]
+    $acl = $null
+    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch { $offenders.Add("<ACL unreadable: $($_.Exception.Message)>") | Out-Null; return $offenders.ToArray() }
+    foreach ($ace in $acl.Access) {
+        if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+        $rights = [string]$ace.FileSystemRights
+        if ($rights -notmatch 'Write|Modify|FullControl|CreateFiles|Delete|ChangePermissions|TakeOwnership') { continue }
+        $sid = $null
+        try {
+            $sid = if ($ace.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) { $ace.IdentityReference.Value }
+                   else { $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
+        } catch { $sid = $null }
+        if ($null -eq $sid) { $offenders.Add([string]$ace.IdentityReference) | Out-Null; continue }
+        # CREATOR OWNER is only as trustworthy as the owner, which is checked separately below.
+        if ($sid -eq 'S-1-3-0') { continue }
+        if ($trustedWriterSids -notcontains $sid) {
+            $offenders.Add(("{0} ({1}) : {2}" -f $ace.IdentityReference, $sid, $rights)) | Out-Null
+        }
+    }
+    # Returns a plain array and enumerates on output, so every CALL SITE must wrap it in @() -
+    # the project's documented idiom. Returning the List itself via `return ,$offenders` looks
+    # safer but breaks `@(...)` at the call site: it wraps the List in a one-element array and
+    # Count is then always 1, which would silently disable this gate.
+    return $offenders.ToArray()
+}
+
+function Test-TrustedDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    if (Test-PathContainsReparsePoint -Path $Path) { return $false }
+    return ((Get-UntrustedAclWriter -Path $Path).Count -eq 0)
+}
+
+function Initialize-TrustedDirectory {
+    <#
+        Creates or hardens a directory so only SYSTEM and Administrators can write to it:
+        inheritance disabled, inherited ACEs dropped, explicit full control for both.
+        Deterministic rather than fail-closed, because the cache root is ours to own.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    if (Test-PathContainsReparsePoint -Path $Path) {
+        throw "Refusing to use a cache path that contains a reparse point: $Path"
+    }
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
+
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)   # protect from inheritance, drop inherited ACEs
+    foreach ($existing in @($acl.Access)) { $null = $acl.RemoveAccessRule($existing) }
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+
+    # Taking ownership needs SeRestorePrivilege, which only an elevated run holds. The DACL set
+    # above is the enforced boundary; ownership is tightened when we are able to. Do not make
+    # this fatal - a non-elevated caller would otherwise be unable to prepare a cache at all.
+    try {
+        $ownerAcl = Get-Acl -LiteralPath $Path
+        $ownerAcl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+        Set-Acl -LiteralPath $Path -AclObject $ownerAcl
+    } catch {
+        Write-StructuredLog -Level SIGNATURE -Message ("Could not set Administrators as owner of {0} (needs elevation): {1}" -f $Path, $_.Exception.Message)
+    }
+    return $Path
+}
+
+function Get-TrustedFileIdentity {
+    # Identity used to detect replacement between validation and execution (TOCTOU).
+    param([Parameter(Mandatory)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    return [pscustomobject]@{
+        Length = [int64]$item.Length
+        Sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    }
+}
+
+function Test-ExecutableExtension {
+    param([Parameter(Mandatory)][string]$Path)
+    return ([System.IO.Path]::GetExtension($Path).ToLowerInvariant() -in @('.exe', '.msi', '.msix', '.msixbundle', '.appx', '.appxbundle', '.dll', '.ps1', '.cmd', '.bat'))
+}
+
+function Assert-TrustedArtifact {
+    <#
+        THE single validation contract. A fresh download and a cache hit both go through this,
+        so there is no cache bypass to forget about.
+
+        For anything executable a TRUST ANCHOR is mandatory: either a pinned SHA256, or a valid
+        Authenticode signature whose signer is on that component's allowlist. "No hash configured
+        because the URL tracks the latest version" is exactly the case that must NOT downgrade to
+        no verification at all - that is the hole H-01 describes.
+
+        Returns $true when the artifact may be used; writes the reason and returns $false
+        otherwise. Never throws for an untrusted artifact - the caller evicts and re-downloads.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ExpectedSha256 = "",
+        [string[]]$AllowedSignerSubjects = @(),
+        [switch]$AllowUnsignedNonExecutable
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    if (Test-PathContainsReparsePoint -Path $Path) {
+        Write-Warn ("Rejected artifact reached through a reparse point: {0}" -f (Split-Path -Leaf $Path))
+        Write-StructuredLog -Level SIGNATURE -Message ("Reparse point in path: {0}" -f $Path)
+        return $false
+    }
+
+    $hashPinned = -not [string]::IsNullOrWhiteSpace($ExpectedSha256)
+    if ($hashPinned -and -not (Test-FileSha256 -Path $Path -ExpectedSha256 $ExpectedSha256)) { return $false }
+
+    if (-not (Test-ExecutableExtension -Path $Path)) {
+        if ($AllowUnsignedNonExecutable -or $hashPinned) { return $true }
+        return $true   # non-executable payloads (archives, json) are covered by the hash when one exists
+    }
+
+    # Executable from here down: a trust anchor is required.
+    $signatureOk = Test-DownloadedFileSignature -Path $Path -AllowedSignerSubjects $AllowedSignerSubjects
+    if ($true -eq $signatureOk) { return $true }
+    if ($hashPinned) {
+        # Pinned hash already matched above; an unsigned-but-pinned artifact is acceptable
+        # because the bytes are exactly the ones the project chose.
+        Write-StructuredLog -Level SIGNATURE -Message ("Unsigned executable accepted on pinned hash: {0}" -f $Path)
+        return $true
+    }
+    Write-Warn ("Rejected executable with no trust anchor (no pinned sha256 and no acceptable signature): {0}" -f (Split-Path -Leaf $Path))
+    Write-StructuredLog -Level SIGNATURE -Message ("No trust anchor: {0}; signatureResult={1}" -f $Path, $signatureOk)
+    return $false
 }
 
 function Test-FileSha256 {
