@@ -43,10 +43,11 @@ $setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
 foreach ($name in @('Get-TermServiceProcessId', 'Test-TermServiceOwnsTcpPort', 'Test-TcpPortListening',
         'Get-Sha256Hex', 'ConvertTo-CanonicalPath', 'Get-RdpRegistryPortNumber', 'Test-RdpPortAgreement',
         'Assert-RdpPortAgreement', 'Test-TrustedTaskTargetPath', 'Assert-TrustedTaskTarget',
+        'Copy-TaskTargetToStaging', 'Save-StagedTaskConfig',
         'Get-TaskTrustManifestPath', 'Save-TaskTrustManifest', 'Get-TaskTrustManifest',
         'ConvertFrom-ScheduledTaskDuration', 'ConvertFrom-ScheduledTaskArgument', 'Test-BlockerTaskArgumentContract',
         'Get-BlockerExecutionTimeLimitMinutes', 'New-BlockerTaskArgument', 'Test-RdpBlockerTaskHealth',
-        'Install-RdpBruteforceBlocker')) {
+        'Get-TrustedPrincipalSid', 'Install-RdpBruteforceBlocker')) {
     . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
 }
 
@@ -59,6 +60,8 @@ $script:RegisterCalls     = New-Object System.Collections.Generic.List[string]
 $script:LastSettings      = $null
 $script:VerificationRuns  = 0
 $script:UntrustedWriters  = @{}
+$script:PathOwners        = @{}
+$script:ReplaceCapable    = @{}
 $script:ReparsePaths      = @()
 $script:HardenedPaths     = New-Object System.Collections.Generic.List[string]
 $script:HardeningFixes    = $true
@@ -99,10 +102,29 @@ function Test-PathContainsReparsePoint {
     param([string]$Path)
     return ($script:ReparsePaths -contains [string]$Path)
 }
+# FU-01: the owner and the parent walk are scripted here for the same reason as the DACL - so the
+# installer's routing can be driven deterministically. Both are exercised against REAL owners and
+# REAL DACLs in tests\TaskTargetOwnership.Tests.ps1; this suite is about what the installer does
+# with the verdict. Defaults are the safe values, so a case opts in to being untrusted.
+function Get-PathOwnerSid {
+    param([string]$Path)
+    if ($script:PathOwners.ContainsKey([string]$Path)) { return $script:PathOwners[[string]$Path] }
+    return 'S-1-5-32-544'
+}
+function Get-ReplaceCapableUntrustedPrincipal {
+    param([string]$Path)
+    if ($script:ReplaceCapable.ContainsKey([string]$Path)) { return @($script:ReplaceCapable[[string]$Path]) }
+    return @()
+}
 function Initialize-TrustedTaskAcl {
     param([string]$Path)
     $script:HardenedPaths.Add([string]$Path) | Out-Null
-    if ($script:HardeningFixes) { $script:UntrustedWriters.Remove([string]$Path) | Out-Null }
+    if ($script:HardeningFixes) {
+        # Production hardening rewrites the DACL AND takes ownership, throwing if either fails.
+        $script:UntrustedWriters.Remove([string]$Path) | Out-Null
+        $script:PathOwners.Remove([string]$Path) | Out-Null
+        $script:ReplaceCapable.Remove([string]$Path) | Out-Null
+    }
     return $Path
 }
 function Initialize-TrustedDirectory {
@@ -182,6 +204,8 @@ try {
     New-Item -ItemType Directory -Path $sandboxScripts -Force | Out-Null
     $script:TrustRoot = Join-Path $testRoot 'trust'
     New-Item -ItemType Directory -Path $script:TrustRoot -Force | Out-Null
+    $script:StagingRoot = ConvertTo-CanonicalPath (Join-Path $testRoot 'staging')
+    New-Item -ItemType Directory -Path $script:StagingRoot -Force | Out-Null
 
     $blockerScript = Join-Path $sandboxScripts 'Block-RdpBruteforce.ps1'
     Set-Content -LiteralPath $blockerScript -Value '# blocker under test' -Encoding UTF8
@@ -196,6 +220,15 @@ try {
     # no case can write outside its own temp tree. That the production root is ACL-hardened is
     # asserted directly against its source at the bottom of this file.
     function Get-TaskTrustManifestRoot { return $script:TrustRoot }
+    # FU-01: same for the staging root. In production this is %ProgramData%\WinServerSetup\tasks,
+    # created, owned and hardened by Get-TaskStagingRoot; redirected here so the installer under
+    # test never touches the real machine. The production root's own hardening is asserted
+    # against its source at the bottom of this file.
+    function Get-TaskStagingRoot { return $script:StagingRoot }
+
+    # FU-01: what the task is actually registered against - the COPIES, never the checkout.
+    $stagedScript = ConvertTo-CanonicalPath (Join-Path $script:StagingRoot 'Block-RdpBruteforce.ps1')
+    $stagedConfig = ConvertTo-CanonicalPath (Join-Path $script:StagingRoot 'Block-RdpBruteforce.config.json')
 
     function New-BlockerConfig {
         param([int]$RdpPort = 5801, [int]$Interval = 1, $LimitMinutes = 5, [bool]$Enabled = $true, [bool]$RdpEnabled = $true)
@@ -216,6 +249,8 @@ try {
         $script:LastSettings = $null
         $script:VerificationRuns = 0
         $script:UntrustedWriters = @{}
+        $script:PathOwners = @{}
+        $script:ReplaceCapable = @{}
         $script:ReparsePaths = @()
         $script:HardenedPaths.Clear()
         $script:HardeningFixes = $true
@@ -287,21 +322,68 @@ try {
         "M-04: an absent executionTimeLimitMinutes must fall back to a bounded default."
 
     # =========================================================================================
+    # FU-01 - the task must be registered against a COPY the project owns, not the checkout.
+    #
+    # The project root is not a defensible location for a SYSTEM task target: measured on a real
+    # machine it was owned by the interactive user and granted FullControl to BUILTIN\Users. The
+    # script and the effective config are therefore staged into a directory this project creates,
+    # owns and hardens, and only the staged copies are registered, validated and health-checked.
+    # =========================================================================================
+    $Global:Config = New-BlockerConfig
+    Reset-BlockerState
+    Install-RdpBruteforceBlocker
+    $registered = $script:RegisteredTasks[$taskName]
+    $registeredArguments = [string]@($registered.Actions)[0].Arguments
+
+    Assert-True (Test-Path -LiteralPath $stagedScript) "FU-01: the blocker script must be COPIED into the staging root before the task is registered."
+    Assert-Equal (Get-Content -LiteralPath $blockerScript -Raw -Encoding UTF8) (Get-Content -LiteralPath $stagedScript -Raw -Encoding UTF8) `
+        "FU-01: the staged copy must be byte-identical to the checkout it was taken from."
+    Assert-True ($registeredArguments -match [regex]::Escape($stagedScript)) `
+        ("FU-01: the registered action must execute the STAGED copy. Got: {0}" -f $registeredArguments)
+    Assert-True ($registeredArguments -notmatch [regex]::Escape($blockerScript)) `
+        ("FU-01: the registered action must not reference the checkout script at all. Got: {0}" -f $registeredArguments)
+    Assert-True ($registeredArguments -notmatch [regex]::Escape($sandboxConfig)) `
+        ("FU-01: the registered action must not reference the checkout config either. Got: {0}" -f $registeredArguments)
+
+    # The manifest is what the health check re-proves later, so it has to name the copies too -
+    # otherwise the health check would keep validating a file the task never runs.
+    $manifest = Get-TaskTrustManifest -TaskName $taskName
+    Assert-Equal $stagedScript ([string]$manifest.ScriptPath) "FU-01: the trust manifest must record the staged script, so the health check validates what actually runs."
+    Assert-Equal $stagedConfig ([string]$manifest.ConfigPath) "FU-01: the trust manifest must record the staged config."
+    Assert-Equal (Get-Sha256Hex -Path $stagedScript) ([string]$manifest.ScriptSha256) "FU-01: the recorded hash must be the hash of the staged copy."
+
+    # ---- FU-01: the staged config is the EFFECTIVE config, reduced to what the blocker reads.
+    #      The merged configuration can carry an activation product key from the ignored local
+    #      override, and the staged file is readable by BUILTIN\Users - so an allowlist, not a
+    #      copy of the whole thing. ----
+    $Global:Config = New-BlockerConfig -RdpPort 5801 -Interval 7
+    $Global:Config | Add-Member -NotePropertyName activation -NotePropertyValue ([pscustomobject]@{ enabled = $true; productKey = 'SUPER-SECRET-KEY-0001' })
+    Reset-BlockerState
+    Install-RdpBruteforceBlocker
+    $stagedConfigText = Get-Content -LiteralPath $stagedConfig -Raw -Encoding UTF8
+    Assert-True ($stagedConfigText -notmatch 'SUPER-SECRET-KEY-0001') `
+        "FU-01: the staged config is world-readable, so it must carry only the sections the blocker consumes - never an activation product key from the local override."
+    $stagedConfigObject = $stagedConfigText | ConvertFrom-Json
+    Assert-Equal 5801 ([int]$stagedConfigObject.rdp.newPort) "FU-01: the staged config must carry rdp.newPort, which the blocker uses for every rule it writes."
+    Assert-Equal 7 ([int]$stagedConfigObject.rdpBruteforceBlocker.taskIntervalMinutes) `
+        "FU-01: the staged config must be the EFFECTIVE configuration, not a copy of the tracked file - an override the task never saw was the quiet half of this finding."
+
+    # =========================================================================================
     # H-02 - every file the SYSTEM task executes or reads must be un-plantable.
     # =========================================================================================
     # ---- H-02.1 A destination that grants Modify to Users is hardened, then re-validated. ----
     $Global:Config = New-BlockerConfig
     Reset-BlockerState
-    $script:UntrustedWriters[$sandboxScripts] = @('BUILTIN\Users (S-1-5-32-545) : Modify')
+    $script:UntrustedWriters[$script:StagingRoot] = @('BUILTIN\Users (S-1-5-32-545) : Modify')
     Install-RdpBruteforceBlocker
-    Assert-True ($script:HardenedPaths -contains $sandboxScripts) `
+    Assert-True ($script:HardenedPaths -contains $script:StagingRoot) `
         "H-02: a task target writable by a non-administrative SID must be hardened before the task is registered."
     Assert-Equal 1 $script:RegisterCalls.Count "H-02: registration may continue once the target has actually been hardened."
 
     # ---- H-02.2 ... and when hardening does NOT fix it, the registration must fail closed. ----
     Reset-BlockerState
     $script:HardeningFixes = $false
-    $script:UntrustedWriters[$blockerScript] = @('NT AUTHORITY\Authenticated Users (S-1-5-11) : Modify')
+    $script:UntrustedWriters[$stagedScript] = @('NT AUTHORITY\Authenticated Users (S-1-5-11) : Modify')
     $installError = Invoke-InstallExpectingFailure
     Assert-True ($installError -match 'Authenticated Users') `
         ("H-02: the refusal must name the principal that can write the target. Got: {0}" -f $installError)
@@ -310,16 +392,45 @@ try {
     # ---- H-02.3 Root-only validation is not enough: the CONFIG the task consumes counts too. ----
     Reset-BlockerState
     $script:HardeningFixes = $false
-    $script:UntrustedWriters[$sandboxConfig] = @('BUILTIN\Users (S-1-5-32-545) : Modify')
+    $script:UntrustedWriters[$stagedConfig] = @('BUILTIN\Users (S-1-5-32-545) : Modify')
     $installError = Invoke-InstallExpectingFailure
-    Assert-True ($installError -match [regex]::Escape($sandboxConfig)) `
+    Assert-True ($installError -match [regex]::Escape($stagedConfig)) `
         ("H-02: the config the task consumes must be validated by name. Got: {0}" -f $installError)
     Assert-Equal 0 $script:RegisterCalls.Count "H-02: a writable config file must not be registered as a task input."
+
+    # ---- FU-01.6 An untrusted OWNER must route to -Harden exactly like a writable DACL does:
+    #      the same hardening pass takes ownership, so refusing outright would abort installs it
+    #      can actually repair. What must NOT happen is registering anyway. ----
+    Reset-BlockerState
+    $script:PathOwners[$stagedScript] = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+    Install-RdpBruteforceBlocker
+    Assert-True ($script:HardenedPaths -contains $stagedScript) `
+        "FU-01: a task target with an untrusted owner must be hardened - taking ownership is exactly what that pass does."
+    Assert-Equal 1 $script:RegisterCalls.Count "FU-01: registration may continue once ownership has actually been taken."
+
+    # ---- FU-01.7 ... and when ownership cannot be taken, registration must fail closed. ----
+    Reset-BlockerState
+    $script:HardeningFixes = $false
+    $script:PathOwners[$stagedScript] = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+    $installError = Invoke-InstallExpectingFailure
+    Assert-True ($installError -match 'S-1-5-21-1111111111-2222222222-3333333333-1001') `
+        ("FU-01: the refusal must name the owner that still holds WRITE_DAC. Got: {0}" -f $installError)
+    Assert-Equal 0 $script:RegisterCalls.Count "FU-01: a target still owned by a non-administrative principal must not be registered."
+
+    # ---- FU-01.8 A replace-capable PARENT is not repairable by hardening the target, so it must
+    #      end the installation rather than be registered against. ----
+    Reset-BlockerState
+    $script:HardeningFixes = $false
+    $script:ReplaceCapable[$script:StagingRoot] = @('BUILTIN\Users (S-1-5-32-545) : FullControl')
+    $installError = Invoke-InstallExpectingFailure
+    Assert-True ($installError -match 'can be replaced by') `
+        ("FU-01: the refusal must say the component can be REPLACED, which is a different failure from being writable. Got: {0}" -f $installError)
+    Assert-Equal 0 $script:RegisterCalls.Count "FU-01: a task target whose parent can be swapped must not be registered."
 
     # ---- H-02.4 A junction anywhere in the chain must fail closed and must never be "hardened"
     #      into looking safe - hardening a reparse point writes the ACL of its target. ----
     Reset-BlockerState
-    $script:ReparsePaths = @($sandboxScripts)
+    $script:ReparsePaths = @($script:StagingRoot)
     $installError = Invoke-InstallExpectingFailure
     Assert-True ($installError -match 'reparse') ("H-02: a reparse point must be named in the refusal. Got: {0}" -f $installError)
     Assert-Equal 0 $script:HardenedPaths.Count "H-02: a path containing a reparse point must never be hardened in place."
@@ -374,13 +485,13 @@ try {
     # ---- L-02.3 THE case the old substring check got wrong: the config path is present in the
     #      argument string but is never passed to the blocker. ----
     $task = Reset-HealthyTask
-    @($task.Actions)[0].Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Unrelated "{1}"' -f $blockerScript, $sandboxConfig)
+    @($task.Actions)[0].Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Unrelated "{1}"' -f $stagedScript, $stagedConfig)
     Assert-Equal $false (Test-RdpBlockerTaskHealth -TaskName $taskName) `
         "L-02: an unrelated argument that merely CONTAINS the config path must not be considered healthy."
 
     # ---- L-02.4 ... and a malformed -ConfigPath value that only starts with the right path. ----
     $task = Reset-HealthyTask
-    @($task.Actions)[0].Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ConfigPath "{1} extra"' -f $blockerScript, $sandboxConfig)
+    @($task.Actions)[0].Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ConfigPath "{1} extra"' -f $stagedScript, $stagedConfig)
     Assert-Equal $false (Test-RdpBlockerTaskHealth -TaskName $taskName) "L-02: a malformed -ConfigPath value must not be considered healthy."
 
     # ---- L-02.5 Principal and run level. ----
@@ -434,20 +545,20 @@ try {
     Assert-Equal $true (Test-RdpBlockerTaskHealth -TaskName $taskName) `
         "M-04: a run inside its limit is IgnoreNew working as intended and must stay healthy."
 
-    # ---- H-02.5 The blocker script modified after registration - the exact TOCTOU this manifest
-    #      exists to catch. ----
+    # ---- H-02.5 The STAGED blocker script modified after registration - the exact TOCTOU this
+    #      manifest exists to catch, now aimed at the file the task really executes. ----
     $task = Reset-HealthyTask
-    Set-Content -LiteralPath $blockerScript -Value '# blocker under test, tampered' -Encoding UTF8
+    Set-Content -LiteralPath $stagedScript -Value '# blocker under test, tampered' -Encoding UTF8
     Assert-Equal $false (Test-RdpBlockerTaskHealth -TaskName $taskName) `
         "H-02: a blocker script changed after registration must fail the health check."
-    Set-Content -LiteralPath $blockerScript -Value '# blocker under test' -Encoding UTF8
+    # The next Reset-HealthyTask re-copies from the checkout, so the tamper does not leak forward.
 
     # ---- H-02.6 A target that became writable, or reachable through a junction, after the fact. ----
     $task = Reset-HealthyTask
-    $script:UntrustedWriters[$blockerScript] = @('BUILTIN\Users (S-1-5-32-545) : Modify')
+    $script:UntrustedWriters[$stagedScript] = @('BUILTIN\Users (S-1-5-32-545) : Modify')
     Assert-Equal $false (Test-RdpBlockerTaskHealth -TaskName $taskName) "H-02: a task target that became writable must fail the health check."
     $task = Reset-HealthyTask
-    $script:ReparsePaths = @($sandboxConfig)
+    $script:ReparsePaths = @($stagedConfig)
     Assert-Equal $false (Test-RdpBlockerTaskHealth -TaskName $taskName) "H-02: a task target reached through a reparse point must fail the health check."
 
     # ---- H-02.7 No manifest at all means nothing can be vouched for. ----
@@ -464,55 +575,75 @@ try {
     # H-02 - the blocker is not the only SYSTEM task. The post-reboot SFC task runs as SYSTEM at
     # the highest run level too, so its own targets must be validated before it is registered.
     # =========================================================================================
+    # Only the two functions this section adds. The ACL mocks and the trust functions imported at
+    # the top of the file are still in scope - re-declaring them here duplicated the mock bodies,
+    # and the copies then missed the owner and replace-capability state added for FU-01.
     . ([scriptblock]::Create((Import-FunctionUnderTest 'Test-ScheduledTaskContract' $setupAsts)))
     . ([scriptblock]::Create((Import-FunctionUnderTest 'Register-PostRebootSfcTask' $setupAsts)))
-    foreach ($name in @('Test-TrustedTaskTargetPath', 'Assert-TrustedTaskTarget')) {
-        . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
-    }
-    function Get-UntrustedAclWriter {
-        param([string]$Path)
-        $key = [string]$Path
-        if ($script:UntrustedWriters.ContainsKey($key)) { return @($script:UntrustedWriters[$key]) }
-        return @()
-    }
-    function Test-PathContainsReparsePoint { param([string]$Path) return ($script:ReparsePaths -contains [string]$Path) }
-    function Initialize-TrustedTaskAcl {
-        param([string]$Path)
-        $script:HardenedPaths.Add([string]$Path) | Out-Null
-        if ($script:HardeningFixes) { $script:UntrustedWriters.Remove([string]$Path) | Out-Null }
-        return $Path
-    }
     $sfcScriptPath = Join-Path $sandboxScripts 'Run-PostRebootSfc.ps1'
     Set-Content -LiteralPath $sfcScriptPath -Value '# post-reboot sfc under test' -Encoding UTF8
+    $stagedSfc = ConvertTo-CanonicalPath (Join-Path $script:StagingRoot 'Run-PostRebootSfc.ps1')
     $Global:Config = New-BlockerConfig
     $Global:Config | Add-Member -NotePropertyName autoReboot -NotePropertyValue ([pscustomobject]@{ scheduleSfcAfterReboot = $true })
 
     Reset-BlockerState
     Register-PostRebootSfcTask
     Assert-Equal 1 $script:RegisterCalls.Count "H-02: the post-reboot SFC task must still register when every target is trusted."
+    $sfcArguments = [string]@($script:RegisteredTasks['WinServerSetup Post-Reboot SFC'].Actions)[0].Arguments
+    Assert-True (Test-Path -LiteralPath $stagedSfc) "FU-01: the post-reboot SFC helper must be staged as well; it runs as SYSTEM at the highest run level too."
+    Assert-True ($sfcArguments -match [regex]::Escape($stagedSfc)) `
+        ("FU-01: the SFC task must execute the staged copy. Got: {0}" -f $sfcArguments)
+    Assert-True ($sfcArguments -notmatch [regex]::Escape($sfcScriptPath)) `
+        ("FU-01: the SFC task must not reference the checkout helper. Got: {0}" -f $sfcArguments)
+    # Without -ProjectRoot the helper resolves its own root from $PSScriptRoot and logs beside the
+    # staged script, inside the hardened tree. Passing the checkout made SYSTEM write into a
+    # directory a non-administrator may control - a junction on logs\ turns that into a SYSTEM
+    # file-write primitive.
+    Assert-True ($sfcArguments -notmatch '-ProjectRoot') `
+        ("FU-01: the SFC task must not be pointed back at the checkout for its log directory. Got: {0}" -f $sfcArguments)
 
     Reset-BlockerState
     $script:HardeningFixes = $false
-    $script:UntrustedWriters[$sfcScriptPath] = @('BUILTIN\Users (S-1-5-32-545) : Modify')
+    $script:UntrustedWriters[$stagedSfc] = @('BUILTIN\Users (S-1-5-32-545) : Modify')
     $sfcError = $null
     try { Register-PostRebootSfcTask } catch { $sfcError = [string]$_.Exception.Message }
     Assert-True ($null -ne $sfcError) "H-02: a writable post-reboot SFC script must abort registration, not be scheduled for SYSTEM."
     Assert-Equal 0 $script:RegisterCalls.Count "H-02: no SYSTEM task may be registered against a target a non-administrator can rewrite."
 
     # =========================================================================================
-    # H-02 with a REAL DACL. Everything above is scripted; this proves the hardening actually
-    # removes a non-administrative writer. Skipped where the guarded host cannot load Get-Acl.
+    # H-02 / FU-01 with a REAL DACL. Everything above is scripted; this proves the hardening pass
+    # really removes every non-administrative writer AND really takes ownership.
+    #
+    # Taking ownership for BUILTIN\Administrators needs an elevated token - a non-elevated shell
+    # holds that SID deny-only and Windows refuses it as an owner - so the case is gated on a
+    # measured probe rather than on an assumption about the runner. GitHub Actions
+    # windows-latest runs elevated and executes it; a developer shell usually skips it.
+    # Test-TrustedTaskTargetPath is deliberately NOT asserted true afterwards: %TEMP% is by
+    # design replace-capable by the interactive user, so the full walk can never pass there.
+    # That walk is proven end to end against real owners in tests\TaskTargetOwnership.Tests.ps1.
     # =========================================================================================
     $aclAvailable = ($null -ne (Get-Command Get-Acl -ErrorAction SilentlyContinue)) -and ($null -ne (Get-Command Set-Acl -ErrorAction SilentlyContinue))
-    foreach ($name in @('Get-UntrustedAclWriter', 'Test-PathContainsReparsePoint', 'Initialize-TrustedTaskAcl', 'Test-TrustedTaskTargetPath')) {
+    foreach ($name in @('Get-UntrustedAclWriter', 'Test-PathContainsReparsePoint', 'Initialize-TrustedTaskAcl',
+            'Test-TrustedTaskTargetPath', 'Get-PathOwnerSid', 'Get-ReplaceCapableUntrustedPrincipal')) {
         . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
     }
     $aclDir = Join-Path $testRoot 'acl-probe'
     New-Item -ItemType Directory -Path $aclDir -Force | Out-Null
+    $canTakeOwnership = $false
+    if ($aclAvailable) {
+        try {
+            $ownershipProbe = New-Object System.Security.AccessControl.DirectorySecurity
+            $ownershipProbe.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+            Set-Acl -LiteralPath $aclDir -AclObject $ownershipProbe -ErrorAction Stop
+            $canTakeOwnership = ((Get-PathOwnerSid -Path $aclDir) -eq 'S-1-5-32-544')
+        } catch { $canTakeOwnership = $false }
+    }
     if (-not $aclAvailable) {
         Write-Host "SKIP H-02 real-DACL case: Get-Acl/Set-Acl are not loadable in this guarded host; the other host covers it."
     } elseif (Test-PathContainsReparsePoint -Path $aclDir) {
         Write-Host "SKIP H-02 real-DACL case: this machine's temp path chain contains a reparse point."
+    } elseif (-not $canTakeOwnership) {
+        Write-Host "SKIP H-02/FU-01 real-DACL case: this host cannot make BUILTIN\Administrators the owner of a file, which the hardening pass requires by design. Run elevated (CI does) to execute it."
     } else {
         $probeAcl = Get-Acl -LiteralPath $aclDir
         $probeAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
@@ -560,9 +691,13 @@ try {
                 "H-02: BUILTIN\Users must keep no write, delete or ownership right on a hardened SYSTEM task target."
             Assert-Equal $true (Get-Acl -LiteralPath $aclDir).AreAccessRulesProtected `
                 "H-02: hardening must disable inheritance, or a permissive parent re-opens the hole."
-            Assert-Equal $true (Test-TrustedTaskTargetPath -Path $aclDir).Trusted `
-                "H-02: hardening must actually remove every non-administrative writer from a real DACL."
             Assert-Equal 0 (@(Get-UntrustedAclWriter -Path $aclDir).Count) "H-02: no untrusted writer may remain after hardening."
+            # FU-01: the half a clean DACL cannot express. An owner keeps WRITE_DAC whatever the
+            # DACL says, so hardening that does not also move ownership leaves the hole open.
+            Assert-Equal 'S-1-5-32-544' (Get-PathOwnerSid -Path $aclDir) `
+                "FU-01: hardening must leave BUILTIN\Administrators as the OWNER; anyone else keeps WRITE_DAC and can undo the DACL above."
+            Assert-Equal 0 (@(Get-ReplaceCapableUntrustedPrincipal -Path $aclDir).Count) `
+                "FU-01: a hardened target must leave no non-administrative principal able to delete or replace it."
         } finally {
             # Correct at either privilege level: an elevated run still holds Administrators
             # FullControl on the hardened directory, and a non-elevated run - which has no access
@@ -578,7 +713,32 @@ try {
     Assert-True ((Import-FunctionUnderTest 'Get-TaskTrustManifestRoot' $setupAsts) -match 'Initialize-TrustedDirectory') `
         "H-02: the trust manifest directory must itself be ACL-hardened, or the manifest is just another writable file."
 
-    Write-Host "PASS blocker task registration refuses a port disagreement, bounds a single run, validates every SYSTEM task target, and the health check re-proves the whole action/principal/trigger/settings/ACL/hash contract."
+    # ---- The REAL Get-TaskStagingRoot, run last so nothing above is affected. It is redirected
+    #      into the sandbox for every install case, so its own layout is exercised here instead:
+    #      %ProgramData% is pointed at a temp tree and the hardening pass is recorded rather than
+    #      performed, which needs no elevation and works on both hosts. ----
+    . ([scriptblock]::Create((Import-FunctionUnderTest 'Get-TaskStagingRoot' $setupAsts)))
+    function Initialize-TrustedTaskAcl { param([string]$Path) $script:HardenedPaths.Add([string]$Path) | Out-Null; return $Path }
+    $previousProgramData = $env:ProgramData
+    try {
+        $env:ProgramData = (New-Item -ItemType Directory -Path (Join-Path $testRoot 'programdata') -Force).FullName
+        $script:HardenedPaths.Clear()
+        $realStaging = Get-TaskStagingRoot
+
+        Assert-Equal (ConvertTo-CanonicalPath (Join-Path $env:ProgramData 'WinServerSetup\tasks')) $realStaging `
+            "FU-01: the SYSTEM task staging root must be %ProgramData%\WinServerSetup\tasks, not anywhere in the checkout."
+        Assert-True (Test-Path -LiteralPath $realStaging) "FU-01: the staging root must be created, not merely named."
+        Assert-True ($script:HardenedPaths -contains (Join-Path $env:ProgramData 'WinServerSetup\tasks')) `
+            "FU-01: the staging root must be ACL-hardened and owned by us, or copying into it achieves nothing."
+        # The parent is the component a replace-capable principal would swap to substitute the
+        # whole hardened directory without ever touching a file inside it.
+        Assert-True ($script:HardenedPaths -contains (Join-Path $env:ProgramData 'WinServerSetup')) `
+            "FU-01: the staging root's PARENT must be hardened too - replacing it replaces the hardened directory wholesale."
+    } finally {
+        $env:ProgramData = $previousProgramData
+    }
+
+    Write-Host "PASS blocker task registration stages its script and effective config into the directory this project owns, refuses a port disagreement, bounds a single run, validates every SYSTEM task target, and the health check re-proves the whole action/principal/trigger/settings/ACL/hash contract against the staged copies."
 } finally {
     $Global:Config = $previousConfig
     $Global:ProjectRoot = $previousRoot

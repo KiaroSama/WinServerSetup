@@ -171,21 +171,24 @@ function Invoke-ActivationIfConfigured {
 # =============================================================================
 function Register-PostRebootSfcTask {
     if (-not $Global:Config.autoReboot.scheduleSfcAfterReboot) { return }
-    # Canonical, like the blocker's script path: the trust validation below and the argument
-    # pattern the health check matches must both name the same spelling of the same file.
-    $sfcScript = ConvertTo-CanonicalPath (Join-Path $Global:ProjectRoot "scripts\Run-PostRebootSfc.ps1")
-    if (-not (Test-Path $sfcScript)) {
-        Write-Warn "Post-reboot SFC helper not found: $sfcScript"
+    $sourceScript = Join-Path $Global:ProjectRoot "scripts\Run-PostRebootSfc.ps1"
+    if (-not (Test-Path -LiteralPath $sourceScript)) {
+        Write-Warn "Post-reboot SFC helper not found: $sourceScript"
         return
     }
     $psExe = Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe"
-    # H-02: this task also runs as SYSTEM at the highest run level, so its executable, its script
-    # and the directories that could be used to replace them get the same validation and the same
-    # deterministic hardening as the blocker's targets.
-    Assert-TrustedTaskTarget -Harden -Path @(
-        $psExe, (ConvertTo-CanonicalPath $Global:ProjectRoot), (Split-Path -Parent $sfcScript), $sfcScript) | Out-Null
+    # H-02 / FU-01: this task also runs as SYSTEM at the highest run level, so it gets the same
+    # treatment as the blocker - the script is staged into the directory this project owns, and
+    # only that copy is validated and registered.
+    $stagingRoot = Get-TaskStagingRoot
+    $sfcScript = Copy-TaskTargetToStaging -StagingRoot $stagingRoot -SourcePath $sourceScript
+    Assert-TrustedTaskTarget -Harden -Path @($psExe, $stagingRoot, $sfcScript) | Out-Null
     $taskName = "WinServerSetup Post-Reboot SFC"
-    $arguments = "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$sfcScript`" -ProjectRoot `"$Global:ProjectRoot`""
+    # -ProjectRoot is deliberately NOT passed any more. Without it the helper resolves its own
+    # root from $PSScriptRoot, so it writes its logs beside the staged script under the hardened
+    # %ProgramData% tree instead of into a checkout a non-administrator may control - where a
+    # planted junction on logs\ would have turned this task into a SYSTEM file-write primitive.
+    $arguments = "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$sfcScript`""
 
     $action    = New-ScheduledTaskAction    -Execute $psExe -Argument $arguments
     # Delay the scan so it does not contend with boot-time servicing, which is the usual reason
