@@ -130,17 +130,73 @@ function Get-LauncherRoute {
     return "ElevatedPowerShell"
 }
 
-function Get-PreferredPowerShellExe {
-    $candidates = New-Object System.Collections.Generic.List[string]
+function Test-TrustedElevationExecutable {
+    <#
+        L-04. Whatever this approves is handed to Start-Process -Verb RunAs, so it must live
+        where an unprivileged user cannot replace it. A valid signature alone is not enough:
+        a byte-copy of the real powershell.exe keeps its signature after being dropped into a
+        user-writable directory, so the location has to be proven too. Fail closed - a candidate
+        that cannot be verified is rejected.
+
+        Self-contained on purpose: the launcher runs before scripts\Core.ps1 is dot-sourced and
+        cannot reach the equivalent helpers there.
+    #>
+    param([string]$Path)
+
+    # Declared inside the function because the test suites extract a single function by AST; a
+    # module-level $script: variable would be undefined there and every principal would look
+    # untrusted. Compared by SID, never by display name: names are localized and renameable.
+    $trustedSids = @(
+        'S-1-5-18',      # LOCAL SYSTEM
+        'S-1-5-32-544',  # BUILTIN\Administrators
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' # NT SERVICE\TrustedInstaller
+    )
+    $writeRights = 'Write|Modify|FullControl|CreateFiles|Delete|ChangePermissions|TakeOwnership'
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    # A bare name would be resolved by Start-Process through PATH, which is this whole finding.
+    if (-not [IO.Path]::IsPathRooted($Path)) { return $false }
 
     try {
-        $pwshFromPath = Get-Command "pwsh.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($pwshFromPath -and $pwshFromPath.Source) {
-            $candidates.Add($pwshFromPath.Source) | Out-Null
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+
+        # A reparse point anywhere between the volume root and the file lets whoever controls
+        # that one directory redirect the path after it has been checked. The per-user Windows
+        # Terminal app-execution alias is exactly this shape.
+        $current = $Path
+        while (-not [string]::IsNullOrWhiteSpace($current)) {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq [IO.FileAttributes]::ReparsePoint) { return $false }
+            $parent = [IO.Path]::GetDirectoryName($current)
+            if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $current) { break }
+            $current = $parent
         }
+
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        # The owner is a writer too: it can always rewrite the DACL and then replace the file.
+        if ($trustedSids -notcontains $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) { return $false }
+        foreach ($ace in $acl.Access) {
+            if ($ace.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+            if (([string]$ace.FileSystemRights) -notmatch $writeRights) { continue }
+            $sid = if ($ace.IdentityReference -is [Security.Principal.SecurityIdentifier]) { $ace.IdentityReference.Value }
+                   else { $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+            if ($sid -eq 'S-1-3-0') { continue }   # CREATOR OWNER: covered by the owner check above
+            if ($trustedSids -notcontains $sid) { return $false }
+        }
+
+        return ((Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop).Status -eq 'Valid')
     } catch {
-        Write-LauncherLog -Level "DEBUG" -Message ("Could not resolve pwsh.exe from PATH: {0}" -f $_.Exception.Message)
+        Write-LauncherLog -Level "DEBUG" -Message ("Rejected an elevation candidate that could not be verified: {0}: {1}" -f $Path, $_.Exception.Message)
+        return $false
     }
+}
+
+function Get-PreferredPowerShellExe {
+    # L-04. Fixed, administrator-owned locations are asked first and PATH only last, because
+    # prepending a directory to PATH is something an unprivileged user can do for their own
+    # session and this result is what Windows elevates. Every candidate, PATH included, still
+    # has to pass Test-TrustedElevationExecutable, so the fallback cannot become a bypass.
+    $candidates = New-Object System.Collections.Generic.List[string]
 
     if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
         $candidates.Add((Join-Path $env:ProgramFiles "PowerShell\7\pwsh.exe")) | Out-Null
@@ -163,26 +219,41 @@ function Get-PreferredPowerShellExe {
         $candidates.Add((Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe")) | Out-Null
     }
 
-    try {
-        $windowsPowerShellFromPath = Get-Command "powershell.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($windowsPowerShellFromPath -and $windowsPowerShellFromPath.Source) {
-            $candidates.Add($windowsPowerShellFromPath.Source) | Out-Null
+    foreach ($name in @("pwsh.exe", "powershell.exe")) {
+        try {
+            $fromPath = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($fromPath -and $fromPath.Source) {
+                $candidates.Add($fromPath.Source) | Out-Null
+            }
+        } catch {
+            Write-LauncherLog -Level "DEBUG" -Message ("Could not resolve {0} from PATH: {1}" -f $name, $_.Exception.Message)
         }
-    } catch {
-        Write-LauncherLog -Level "DEBUG" -Message ("Could not resolve powershell.exe from PATH: {0}" -f $_.Exception.Message)
     }
 
     foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-        if (Test-Path -LiteralPath $candidate) {
+        if (Test-TrustedElevationExecutable -Path $candidate) {
             return (Get-Item -LiteralPath $candidate).FullName
         }
     }
 
-    throw "No PowerShell executable was found. Install PowerShell 7 or ensure Windows PowerShell is available."
+    throw "No trusted PowerShell executable was found. Install PowerShell 7, or repair Windows PowerShell, so the elevated host can be started from a location only administrators can write to."
 }
 
 function Get-WindowsTerminalExe {
+    # L-04. The wt.exe PATH offers is normally %LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe: a
+    # zero-byte app-execution alias in a directory the interactive user owns outright, and this
+    # path is started with -Verb RunAs. Resolve the real package install location first; the
+    # alias is gone as a candidate because it can never pass the trust check.
     $candidates = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $terminalPackage = Get-AppxPackage -Name "Microsoft.WindowsTerminal" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($terminalPackage -and $terminalPackage.InstallLocation) {
+            $candidates.Add((Join-Path $terminalPackage.InstallLocation "wt.exe")) | Out-Null
+        }
+    } catch {
+        Write-LauncherLog -Level "DEBUG" -Message ("Could not resolve the Windows Terminal package location: {0}" -f $_.Exception.Message)
+    }
 
     try {
         $wtFromPath = Get-Command "wt.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -193,12 +264,8 @@ function Get-WindowsTerminalExe {
         Write-LauncherLog -Level "DEBUG" -Message ("Could not resolve wt.exe from PATH: {0}" -f $_.Exception.Message)
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-        $candidates.Add((Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\wt.exe")) | Out-Null
-    }
-
     foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
-        if (Test-Path -LiteralPath $candidate) {
+        if (Test-TrustedElevationExecutable -Path $candidate) {
             return (Get-Item -LiteralPath $candidate).FullName
         }
     }

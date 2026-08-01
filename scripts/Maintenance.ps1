@@ -171,12 +171,19 @@ function Invoke-ActivationIfConfigured {
 # =============================================================================
 function Register-PostRebootSfcTask {
     if (-not $Global:Config.autoReboot.scheduleSfcAfterReboot) { return }
-    $sfcScript = Join-Path $Global:ProjectRoot "scripts\Run-PostRebootSfc.ps1"
+    # Canonical, like the blocker's script path: the trust validation below and the argument
+    # pattern the health check matches must both name the same spelling of the same file.
+    $sfcScript = ConvertTo-CanonicalPath (Join-Path $Global:ProjectRoot "scripts\Run-PostRebootSfc.ps1")
     if (-not (Test-Path $sfcScript)) {
         Write-Warn "Post-reboot SFC helper not found: $sfcScript"
         return
     }
     $psExe = Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe"
+    # H-02: this task also runs as SYSTEM at the highest run level, so its executable, its script
+    # and the directories that could be used to replace them get the same validation and the same
+    # deterministic hardening as the blocker's targets.
+    Assert-TrustedTaskTarget -Harden -Path @(
+        $psExe, (ConvertTo-CanonicalPath $Global:ProjectRoot), (Split-Path -Parent $sfcScript), $sfcScript) | Out-Null
     $taskName = "WinServerSetup Post-Reboot SFC"
     $arguments = "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$sfcScript`" -ProjectRoot `"$Global:ProjectRoot`""
 
@@ -205,6 +212,177 @@ function Register-PostRebootSfcTask {
 # =============================================================================
 # CLEANUP + HEALTH CHECK (carry over)
 # =============================================================================
+# ------------------------------------------------------------------- H-03 cleanup allowlist
+# The old guard was a DENYLIST that rejected only EXACT matches of a drive root or a protected
+# root, so C:\Windows\System32 passed, every user profile passed, and a downloadRoot typo could
+# aim a recursive delete at almost anything. Deletion is now allowlist-driven: the project's own
+# cache must carry a sentinel this application wrote, and the only other permitted targets are
+# two exact, well-known system temp directories.
+
+$script:CacheSentinelName = '.winserversetup-cache'
+
+function Get-ProtectedCleanupRoot {
+    # Roots whose contents must never be enumerated for deletion. Returned canonicalized.
+    $roots = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData,
+            $env:SystemDrive, $env:USERPROFILE, (Split-Path -Parent $env:USERPROFILE), $Global:ProjectRoot)) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        try { $roots.Add([System.IO.Path]::GetFullPath($candidate).TrimEnd('\')) | Out-Null } catch { $null = $_ }
+    }
+    return $roots.ToArray()
+}
+
+function Test-ProtectedCleanupPath {
+    <#
+        $true when $Path is a volume root, IS a protected root, is an ANCESTOR of one, or is a
+        DESCENDANT of Windows / Program Files / Program Files (x86) / a user profile root.
+
+        Descendants of ProgramData are deliberately NOT rejected here: the hardened cache lives
+        at %ProgramData%\WinServerSetup\cache. What protects it is the sentinel plus the ACL
+        check, not its location.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $full = ''
+    try { $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $true }
+    if ([string]::IsNullOrWhiteSpace($full)) { return $true }
+    if ($full -eq [System.IO.Path]::GetPathRoot($full).TrimEnd('\')) { return $true }
+
+    foreach ($root in (Get-ProtectedCleanupRoot)) {
+        if ([string]::Equals($full, $root, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        # An ancestor of a protected root would take the protected root with it.
+        if ($root.StartsWith($full + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    foreach ($noDescend in @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:USERPROFILE)) {
+        if ([string]::IsNullOrWhiteSpace($noDescend)) { continue }
+        $canon = ''
+        try { $canon = [System.IO.Path]::GetFullPath($noDescend).TrimEnd('\') } catch { continue }
+        if ($full.StartsWith($canon + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Initialize-CacheSentinel {
+    # Marks a directory as this application's own cache. Written only by us, into a directory
+    # already hardened to SYSTEM + Administrators, so an unprivileged user cannot forge it.
+    param([Parameter(Mandatory)][string]$Path)
+    $sentinel = Join-Path $Path $script:CacheSentinelName
+    if (-not (Test-Path -LiteralPath $sentinel)) {
+        Set-Content -LiteralPath $sentinel -Encoding UTF8 -Value ("WinServerSetup download cache. Created {0}." -f (Get-Date).ToUniversalTime().ToString('o'))
+    }
+    return $sentinel
+}
+
+function Test-DedicatedCacheDirectory {
+    <#
+        Every condition must hold before a recursive delete is permitted:
+          - the path resolves and is not protected (above);
+          - no reparse point anywhere in the chain;
+          - a sentinel this application wrote is present;
+          - no non-administrative principal can write there.
+        Any failure means "do not delete anything", never "delete carefully".
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $false }
+    if (Test-ProtectedCleanupPath -Path $Path) { return $false }
+    if (Test-PathContainsReparsePoint -Path $Path) { return $false }
+    if (-not (Test-Path -LiteralPath (Join-Path $Path $script:CacheSentinelName))) { return $false }
+    if ((@(Get-UntrustedAclWriter -Path $Path)).Count -gt 0) { return $false }
+    return $true
+}
+
+function Assert-DownloadRootAllowed {
+    # Runs during configuration validation, before full setup does any work, so a dangerous
+    # typo is rejected up front rather than at cleanup time.
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $true }   # empty means "use the hardened default"
+    if (-not [System.IO.Path]::IsPathRooted($Path)) { throw "downloadRoot must be an absolute path: $Path" }
+    if (Test-ProtectedCleanupPath -Path $Path) { throw "downloadRoot resolves to a protected or system location and would be refused at cleanup time: $Path" }
+    return $true
+}
+
+function Remove-CacheContentsSafe {
+    <#
+        Deletes the CONTENTS of the project's own cache and nothing else. Traversal never
+        follows a reparse point, so a junction planted inside the cache cannot be used to
+        escape it.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $result = [pscustomobject]@{ Path = $Path; Succeeded = $true; Removed = 0; Failed = 0; Unsafe = $false; Skipped = 0 }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $result }
+
+    if (-not (Test-DedicatedCacheDirectory -Path $Path)) {
+        $result.Succeeded = $false
+        $result.Unsafe = $true
+        Write-Fail "Refusing to clean a directory that is not this application's dedicated cache: $Path"
+        Write-StructuredLog -Level CLEANUP -Message ("Refused cleanup target (no valid sentinel, untrusted ACL, reparse point or protected path): {0}" -f $Path)
+        return $result
+    }
+
+    Write-Info "Cleaning cache: $Path"
+    try {
+        Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | ForEach-Object {
+            if ($_.Name -eq $script:CacheSentinelName) { return }   # keep the marker
+            try {
+                # A reparse point inside the cache is unlinked explicitly, never traversed.
+                # DEFENCE IN DEPTH, not a fix for observed behaviour: probed on PowerShell 7.6.4
+                # and 5.1.26100, `Remove-Item -Recurse -Force` on a junction already removes the
+                # link and leaves the target intact. This branch makes that independent of host
+                # and PowerShell version rather than relying on it, so it is deliberately not
+                # claimed as mutation-covered.
+                if (($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
+                    if ($_.PSIsContainer) { [System.IO.Directory]::Delete($_.FullName, $false) } else { [System.IO.File]::Delete($_.FullName) }
+                    $result.Removed++
+                    Write-StructuredLog -Level CLEANUP -Message ("Unlinked reparse point without traversing it: {0}" -f $_.FullName)
+                    return
+                }
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+                $result.Removed++
+            } catch {
+                $result.Failed++
+                Write-StructuredLog -Level CLEANUP -Message ("Could not remove {0}: {1}" -f $_.FullName, $_.Exception.Message)
+            }
+        }
+    } catch {
+        $result.Failed++
+        Write-StructuredLog -Level CLEANUP -Message ("Could not enumerate {0}: {1}" -f $Path, $_.Exception.Message)
+    }
+
+    if ($result.Failed -gt 0) {
+        $result.Succeeded = $false
+        Write-Warn ("Cache cleanup failed for {0} ({1} removed, {2} error(s))." -f $Path, $result.Removed, $result.Failed)
+        return $result
+    }
+    Write-Ok ("Cleaned cache: {0} ({1} item(s) removed)" -f $Path, $result.Removed)
+    return $result
+}
+
+function Remove-SystemTempContentsSafe {
+    <#
+        The two system temp directories this tool is documented to clean, matched EXACTLY after
+        canonicalization. Nothing else is accepted, so a config value can never redirect this
+        at another part of Windows.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $result = [pscustomobject]@{ Path = $Path; Succeeded = $true; Removed = 0; Failed = 0; Unsafe = $false; Skipped = 0 }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $result }
+
+    $allowed = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in @((Join-Path $env:WINDIR 'Temp'), (Join-Path $env:WINDIR 'SoftwareDistribution\Download'))) {
+        try { $allowed.Add([System.IO.Path]::GetFullPath($candidate).TrimEnd('\')) | Out-Null } catch { $null = $_ }
+    }
+    $full = ''
+    try { $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { $full = '' }
+
+    if ([string]::IsNullOrWhiteSpace($full) -or -not ($allowed -contains $full) -or (Test-PathContainsReparsePoint -Path $full)) {
+        $result.Succeeded = $false
+        $result.Unsafe = $true
+        Write-Fail "Refusing to clean a path that is not an allowlisted system temp directory: $Path"
+        Write-StructuredLog -Level CLEANUP -Message ("Refused non-allowlisted system cleanup target: {0}" -f $Path)
+        return $result
+    }
+    return (Remove-DirectoryContentsSafe -Path $full)
+}
+
 function Remove-DirectoryContentsSafe {
     <#
         Deletes the CONTENTS of a directory and reports exactly what happened.
@@ -294,16 +472,19 @@ function Clear-WinServerSetupTempAndCache {
     if (-not $s -or -not $s.enabled) { Set-StepSkipped "disabled in config"; return }
     Write-Section "Cleaning temp and cache files"
     $failures = 0
-    if ($s.cleanProjectDownloadCache -and -not (Remove-DirectoryContentsSafe -Path (Get-DownloadCachePath)).Succeeded) { $failures++ }
+    # H-03: the project cache goes through the sentinel-gated allowlist; the two documented
+    # system temp directories go through their own exact-match allowlist. Neither accepts an
+    # arbitrary path any more.
+    if ($s.cleanProjectDownloadCache -and -not (Remove-CacheContentsSafe -Path (Get-DownloadCachePath)).Succeeded) { $failures++ }
     if ($s.cleanUserTemp -and -not (Remove-WinServerSetupTempArtifacts)) { $failures++ }
-    if ($s.cleanWindowsTemp -and -not (Remove-DirectoryContentsSafe -Path (Join-Path $env:WINDIR "Temp")).Succeeded) { $failures++ }
+    if ($s.cleanWindowsTemp -and -not (Remove-SystemTempContentsSafe -Path (Join-Path $env:WINDIR "Temp")).Succeeded) { $failures++ }
     if ($s.cleanWindowsUpdateDownloadCache) {
         $wuWasRunning = (Get-Service -Name wuauserv -ErrorAction Stop).Status -eq 'Running'
         $bitsWasRunning = (Get-Service -Name bits -ErrorAction Stop).Status -eq 'Running'
         try {
             Stop-Service -Name wuauserv -Force -ErrorAction Stop
             Stop-Service -Name bits -Force -ErrorAction Stop
-            if (-not (Remove-DirectoryContentsSafe -Path (Join-Path $env:WINDIR "SoftwareDistribution\Download")).Succeeded) { $failures++ }
+            if (-not (Remove-SystemTempContentsSafe -Path (Join-Path $env:WINDIR "SoftwareDistribution\Download")).Succeeded) { $failures++ }
         } catch { $failures++; Write-Warn "WU cache cleanup: $($_.Exception.Message)" }
         finally {
             try { Restore-ServiceState -Name bits -WasRunning $bitsWasRunning } catch { $failures++; Write-Warn "Could not restore BITS state: $($_.Exception.Message)" }
@@ -380,10 +561,12 @@ function Invoke-HealthCheck {
         @{ Name = "Windows Search"; Enabled = [bool]$Global:Config.indexing.enabled; Test = { (Get-Service -Name WSearch -ErrorAction SilentlyContinue).Status -eq "Running" } },
         @{ Name = "RDP Port matches config"; Enabled = [bool]$Global:Config.rdp.enabled; Test = { (Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name PortNumber).PortNumber -eq [int]$Global:Config.rdp.newPort -and (Test-TermServiceOwnsTcpPort ([int]$Global:Config.rdp.newPort)) } },
         @{ Name = "EmptyStandbyList Task"; Enabled = [bool]$Global:Config.emptyStandbyList.enabled; Test = { Test-ScheduledTaskContract ([string]$Global:Config.emptyStandbyList.taskName) (Join-Path ([string]$Global:Config.emptyStandbyList.installDir) ([string]$Global:Config.emptyStandbyList.exeName)) ([regex]::Escape([string]$Global:Config.emptyStandbyList.argument)) } },
-        # -RequireHealthyLastResult: the blocker is a security control, so "the task exists" is not
-        # good enough. A task whose last run failed, that is disabled, or that has no next run
-        # scheduled is silently protecting nothing.
-        @{ Name = "RDP Blocker Task"; Enabled = [bool]$Global:Config.rdpBruteforceBlocker.enabled; Test = { Test-ScheduledTaskContract -TaskName ([string]$Global:Config.rdpBruteforceBlocker.taskName) -ExpectedExecutable (Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe") -ExpectedArgumentPattern ([regex]::Escape($Global:ConfigPath)) -RequireHealthyLastResult } },
+        # L-02: the blocker is a security control, so "a task with that name exists" is not good
+        # enough - and neither is a regex that merely finds the config path SOMEWHERE in the
+        # argument string. Test-RdpBlockerTaskHealth re-proves the whole contract recorded at
+        # registration: executable, script path, canonical -ConfigPath, principal, run level,
+        # trigger interval, ExecutionTimeLimit, MultipleInstances, target ACL and target hash.
+        @{ Name = "RDP Blocker Task"; Enabled = [bool]$Global:Config.rdpBruteforceBlocker.enabled; Test = { Test-RdpBlockerTaskHealth -TaskName ([string]$Global:Config.rdpBruteforceBlocker.taskName) } },
         @{ Name = "Show File Extensions"; Enabled = [bool]$Global:Config.appearance.showFileExtensions; Test = { (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name HideFileExt -ErrorAction SilentlyContinue).HideFileExt -eq 0 } },
         @{ Name = "Windows Long Paths"; Enabled = [bool]$Global:Config.filesystem.enableLongPaths; Test = { (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled -eq 1 } },
         @{ Name = "Dark Mode"; Enabled = [bool]$Global:Config.appearance.darkMode; Test = { (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name AppsUseLightTheme -ErrorAction SilentlyContinue).AppsUseLightTheme -eq 0 } },

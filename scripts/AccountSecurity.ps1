@@ -301,18 +301,35 @@ function Set-LocalLockoutPolicyValues {
 }
 
 # gpupdate blocks indefinitely when a domain controller is slow or unreachable, so it runs as a
-# bounded child process and the whole tree is terminated on expiry.
+# bounded child process and the whole tree is terminated on expiry. This is the only gpupdate
+# runner in the project - every caller routes through it, so no call site can reintroduce an
+# unbounded wait. Its arguments and default budget are declared inside the function because the
+# test suites lift it out by AST and run it without the rest of this file.
 function Invoke-BoundedGpupdate {
     param([int]$TimeoutSeconds = 120)
-    $process = Start-Process -FilePath 'gpupdate.exe' -ArgumentList '/target:computer', '/force' -WindowStyle Hidden -PassThru -ErrorAction Stop
+    $arguments = @('/target:computer', '/force')
+    Write-StructuredLog -Level COMMAND -Message ("gpupdate.exe {0} (timeout {1}s)" -f ($arguments -join ' '), $TimeoutSeconds)
+    $process = Start-Process -FilePath 'gpupdate.exe' -ArgumentList $arguments -WindowStyle Hidden -PassThru -ErrorAction Stop
     try {
+        # Caching the handle keeps ExitCode readable once the process has exited on 5.1.
+        $null = $process.Handle
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             # taskkill /T kills the tree on both hosts; Process.Kill($true) does not exist on
-            # the .NET Framework that Windows PowerShell 5.1 runs on.
-            & taskkill.exe /PID $process.Id /T /F 2>&1 | Out-Null
+            # the .NET Framework that Windows PowerShell 5.1 runs on. Killing only the parent
+            # would leave gpupdate's own children running against the unreachable controller.
+            # 2>$null, not 2>&1: merging a native command's stderr into the success stream raises
+            # a terminating NativeCommandError on 5.1, which would replace the timeout message
+            # below with a confusing one whenever the process died just after the wait expired.
+            & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null
+            Write-StructuredLog -Level ERROR -Message ("gpupdate.exe exceeded {0}s; process tree {1} terminated." -f $TimeoutSeconds, $process.Id)
             throw "Group Policy refresh did not complete within $TimeoutSeconds seconds and was terminated."
         }
-        if ($process.ExitCode -ne 0) { throw "Group Policy refresh failed with exit code $($process.ExitCode)." }
+        # The bounded overload can return before ExitCode is populated on 5.1; once the wait has
+        # already succeeded the parameterless call returns immediately and flushes it.
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+        Write-StructuredLog -Level COMMAND -Message ("gpupdate.exe exit code: {0}" -f $exitCode)
+        if ($exitCode -ne 0) { throw "Group Policy refresh failed with exit code $exitCode." }
     } finally {
         $process.Dispose()
     }

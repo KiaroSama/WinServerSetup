@@ -10,13 +10,26 @@
 # SECTION 5: WINGET INSTALL (items 9 indirect)
 # =============================================================================
 function Install-WingetPackages {
-    if (-not (Ensure-Winget)) { return }
+    # M-08: every package the config enables must end up in InstalledApps or FailedApps. WinGet
+    # being unavailable used to return silently, so a run that installed no application at all
+    # still reported success and exited 0.
+    $requested = @($Global:Config.winget.packages | Where-Object { $_.enabled })
+    if (-not (Ensure-Winget)) {
+        foreach ($pkg in $requested) {
+            Write-Warn ("{0} was not installed: WinGet is unavailable." -f [string]$pkg.name)
+            $null = $Global:RunStats.FailedApps.Add([string]$pkg.name)
+        }
+        return
+    }
     $interactive = [bool]$Global:Config.winget.interactiveInstallers
-    foreach ($pkg in $Global:Config.winget.packages) {
-        if (-not $pkg.enabled) { continue }
+    foreach ($pkg in $requested) {
         $name = [string]$pkg.name
         $id   = [string]$pkg.id
-        if ([string]::IsNullOrWhiteSpace($id)) { Write-Warn "Skipping $name (empty id)."; continue }
+        if ([string]::IsNullOrWhiteSpace($id)) {
+            Write-Warn "$name cannot be installed: its configured package id is empty."
+            $null = $Global:RunStats.FailedApps.Add($name)
+            continue
+        }
 
         Write-Info "Checking package: $name ($id)"
         if (Test-WingetPackageInstalled -Id $id) {
@@ -38,11 +51,16 @@ function Install-WingetPackages {
         Write-Info "Installing $name ..."
         try {
             $installResult = Invoke-LoggedCommand -FilePath (Get-WingetExecutable) -Arguments $wingetArgs -DisplayName "winget install $name"
-            if ($installResult.ExitCode -eq 0) {
-                Write-Ok "$name installed."
+            if ($installResult.ExitCode -ne 0) {
+                Write-Warn "$name install exited with code $($installResult.ExitCode). See structured log for winget output."
+                $null = $Global:RunStats.FailedApps.Add($name)
+            } elseif (Test-WingetPackageInstalled -Id $id) {
+                # M-08: exit code 0 is the installer's own claim. The package has to be detectable
+                # afterwards before the run may call it installed.
+                Write-Ok "$name installed and verified."
                 $null = $Global:RunStats.InstalledApps.Add($name)
             } else {
-                Write-Warn "$name install exited with code $($installResult.ExitCode). See structured log for winget output."
+                Write-Warn "$name reported a successful install but is not detectable afterwards."
                 $null = $Global:RunStats.FailedApps.Add($name)
             }
         } catch {
@@ -118,7 +136,9 @@ function Install-DirectInstaller {
 
     Write-Info "Installing $name silently with args: $silentArgs"
     try {
-        $code = Invoke-SilentExeInstall -Path $exePath -Arguments @($silentArgs)
+        # H-01: hand the same trust anchor to the launcher so it revalidates the exact artifact
+        # immediately before executing it, rather than trusting the download-time result.
+        $code = Invoke-SilentExeInstall -Path $exePath -Arguments @($silentArgs) -ExpectedSha256 $expectedSha256 -AllowedSignerSubjects $allowedSignerSubjects
         $silentResult = Resolve-InstallerExitCode -ExitCode $code
         if ($silentResult.Succeeded) {
             if ($silentResult.RebootPending) { Set-PendingReboot "$name installer returned $code" }
@@ -330,6 +350,8 @@ function Install-V2RayN {
         if ($preserveDir -and (Test-Path -LiteralPath $preserveDir)) {
             Write-Warn "Preserved v2rayN user data was left for manual recovery at: $preserveDir"
         }
+        # M-08: v2rayN is enabled in the shipped config, so a failed update is a failed run.
+        $null = $Global:RunStats.FailedApps.Add("v2rayN")
         return
     } finally {
         # Staging always goes away, on success and on every failure path.
@@ -342,11 +364,15 @@ function Install-V2RayN {
         }
     }
 
+    # M-08: the installed executable is v2rayN's independent verification contract - the archive
+    # extracting without error is not evidence that anything runnable landed on disk.
     $exeFull = Join-Path $finalDir $exeRelative
     if (-not (Test-Path -LiteralPath $exeFull)) {
         Write-Warn "v2rayN executable not found after extraction."
+        $null = $Global:RunStats.FailedApps.Add("v2rayN")
         return
     }
+    $null = $Global:RunStats.InstalledApps.Add("v2rayN")
     $workDir = Split-Path -Parent $exeFull
 
     if ($settings.createDesktopShortcut) {
@@ -381,23 +407,34 @@ function Install-LatestPowerShellFromGitHub {
         Write-Info "PowerShell GitHub install disabled via installLatestFromGitHub."
         return
     }
+    # M-08: PowerShell 7 is enabled in the shipped config, so every path that leaves it
+    # uninstalled has to be recorded. Returning silently reported success for the whole run.
     $repo = [string]$s.githubRepo; if ([string]::IsNullOrWhiteSpace($repo)) { $repo = "PowerShell/PowerShell" }
     Write-Info "Querying latest PowerShell release ($repo)..."
     try {
         $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing -Headers @{ 'User-Agent' = 'WinServerSetup' }
-    } catch { Write-Warn "GitHub query failed: $($_.Exception.Message)"; return }
+    } catch {
+        Write-Warn "GitHub query failed: $($_.Exception.Message)"
+        $null = $Global:RunStats.FailedApps.Add("PowerShell 7")
+        return
+    }
 
     $latestVer = $null
     try { $latestVer = [version](([string]$release.tag_name).TrimStart("v")) } catch { Write-StructuredLog -Level WARN -Message ("Could not parse PowerShell release tag '{0}': {1}" -f $release.tag_name, $_.Exception.Message) }
     $currentVer = Get-PowerShellCoreVersion
     if ($currentVer -and $latestVer -and -not $s.forceInstall -and $currentVer -ge $latestVer) {
         Write-Ok "PowerShell $currentVer already current vs GitHub latest $latestVer."
+        $null = $Global:RunStats.InstalledApps.Add("PowerShell 7")
         return
     }
 
     $regex = [string]$s.assetNameRegex; if ([string]::IsNullOrWhiteSpace($regex)) { $regex = "^PowerShell-.*-win-x64\.msi$" }
     $asset = $release.assets | Where-Object { $_.name -match $regex } | Select-Object -First 1
-    if (-not $asset) { Write-Warn "No PowerShell asset matched regex $regex"; return }
+    if (-not $asset) {
+        Write-Warn "No PowerShell asset matched regex $regex"
+        $null = $Global:RunStats.FailedApps.Add("PowerShell 7")
+        return
+    }
 
     $msi = Get-SafeDownloadCacheFilePath -FileName ([string]$asset.name)
     # An empty hash means "not pinned", not "refuse": this URL resolves to whatever the latest
@@ -405,7 +442,11 @@ function Install-LatestPowerShellFromGitHub {
     # sets one, Invoke-DownloadFile enforces it.
     $expectedSha256 = if ($s.PSObject.Properties.Name -contains "expectedSha256") { [string]$s.expectedSha256 } else { "" }
     if (-not (Invoke-DownloadFile -Url $asset.browser_download_url -Destination $msi -ExpectedSha256 $expectedSha256 `
-                -AllowedHosts @('github.com', '*.github.com', 'objects.githubusercontent.com', '*.githubusercontent.com'))) { return }
+                -AllowedHosts @('github.com', '*.github.com', 'objects.githubusercontent.com', '*.githubusercontent.com'))) {
+        Write-Warn "PowerShell 7 download failed; skipping install."
+        $null = $Global:RunStats.FailedApps.Add("PowerShell 7")
+        return
+    }
 
     $msiArgs = @("/i", "`"$msi`"")
     if ($s.interactiveInstaller) {
@@ -423,9 +464,15 @@ function Install-LatestPowerShellFromGitHub {
         # the single definition of installer success.
         $msiResult = Resolve-InstallerExitCode -ExitCode $proc.ExitCode
         if ($msiResult.Succeeded) {
-            Write-Ok "PowerShell installer completed."
             if ($msiResult.RebootPending) { Set-PendingReboot "PowerShell 7 installer requested reboot" }
-            $null = $Global:RunStats.InstalledApps.Add("PowerShell 7")
+            # M-08: pwsh.exe on disk is the independent evidence; the MSI exit code is not.
+            if (Get-PowerShell7ExePath) {
+                Write-Ok "PowerShell installer completed and pwsh.exe was found."
+                $null = $Global:RunStats.InstalledApps.Add("PowerShell 7")
+            } else {
+                Write-Warn "PowerShell installer reported success but pwsh.exe was not found afterwards."
+                $null = $Global:RunStats.FailedApps.Add("PowerShell 7")
+            }
         } else {
             Write-Warn "PowerShell installer exited with code $($proc.ExitCode)."
             $null = $Global:RunStats.FailedApps.Add("PowerShell 7")
@@ -440,9 +487,16 @@ function Install-LatestPowerShellFromGitHub {
 # SECTION 9: WINDOWS TERMINAL + PS7 DEFAULT PROFILE (items 4)
 # =============================================================================
 function Install-WindowsTerminal {
+    # M-08: Windows Terminal is enabled in the shipped config. Every path that leaves it
+    # uninstalled - no WinGet, a failing install, or wt.exe missing afterwards - is recorded, so
+    # none of them can leave the run reporting success.
     $s = $Global:Config.windowsTerminal
     if (-not $s -or -not $s.enabled) { return }
-    if (-not (Ensure-Winget)) { return }
+    if (-not (Ensure-Winget)) {
+        Write-Warn "Windows Terminal was not installed: WinGet is unavailable."
+        $null = $Global:RunStats.FailedApps.Add("Windows Terminal")
+        return
+    }
 
     $pkg = [string]$s.packageId; if ([string]::IsNullOrWhiteSpace($pkg)) { $pkg = "Microsoft.WindowsTerminal" }
     if (Test-WingetPackageInstalled -Id $pkg) {
@@ -454,15 +508,27 @@ function Install-WindowsTerminal {
         try {
             $terminalResult = Invoke-LoggedCommand -FilePath (Get-WingetExecutable) -Arguments $wingetInstallArgs -DisplayName "winget install Windows Terminal"
             if ($terminalResult.ExitCode -eq 0) { Write-Ok "Windows Terminal install completed." }
-            else { Write-Warn "Windows Terminal install exited with code $($terminalResult.ExitCode)." }
+            else {
+                Write-Warn "Windows Terminal install exited with code $($terminalResult.ExitCode)."
+                $null = $Global:RunStats.FailedApps.Add("Windows Terminal")
+                return
+            }
         }
-        catch { Write-Fail "Windows Terminal install failed: $($_.Exception.Message)"; return }
+        catch {
+            Write-Fail "Windows Terminal install failed: $($_.Exception.Message)"
+            $null = $Global:RunStats.FailedApps.Add("Windows Terminal")
+            return
+        }
     }
 
+    # wt.exe is the independent evidence: winget reports success for a package that the machine
+    # cannot actually run (Server SKUs without the Store, a blocked App Execution Alias).
     if (-not (Test-WindowsTerminalInstalled)) {
         Write-Warn "Windows Terminal executable was not found; default terminal/profile settings were skipped."
+        $null = $Global:RunStats.FailedApps.Add("Windows Terminal")
         return
     }
+    $null = $Global:RunStats.InstalledApps.Add("Windows Terminal")
     if ($s.setAsDefaultTerminal)              { Set-WindowsTerminalAsDefault }
     if ($s.setPowerShell7AsDefaultProfile)    { Set-WindowsTerminalPowerShell7Default }
 }
@@ -898,11 +964,16 @@ function Test-DotNetFramework35Enabled {
 }
 
 function Install-DotNetFramework35 {
+    # M-08: the verification contract for this runtime is the resulting feature state, and every
+    # outcome - enabled, unverifiable, or still disabled - is recorded so none of them can leave
+    # the run reporting success.
     if (-not $Global:Config.runtimes.installDotNetFramework35) { Set-StepSkipped "disabled in config"; return }
+    $runtimeName = ".NET Framework 3.5"
     Write-Info "Installing .NET Framework 3.5 feature."
 
     if ($true -eq (Test-DotNetFramework35Enabled)) {
         Write-Ok ".NET Framework 3.5 is already enabled."
+        $null = $Global:RunStats.InstalledApps.Add($runtimeName)
         return
     }
 
@@ -917,7 +988,7 @@ function Install-DotNetFramework35 {
         }
     } catch {
         Write-Fail ".NET Framework 3.5 install failed: $($_.Exception.Message)"
-        $null = $Global:RunStats.FailedApps.Add(".NET Framework 3.5")
+        $null = $Global:RunStats.FailedApps.Add($runtimeName)
         return
     }
 
@@ -927,13 +998,20 @@ function Install-DotNetFramework35 {
     $state = Test-DotNetFramework35Enabled
     if ($true -eq $state) {
         Write-Ok ".NET Framework 3.5 feature is enabled."
+        $null = $Global:RunStats.InstalledApps.Add($runtimeName)
     } elseif ($null -eq $state) {
-        Write-Warn ".NET Framework 3.5 install completed but its state could not be verified on this system."
+        # M-08: "installed but undetectable" is not a success. Neither feature API could report
+        # the state, so there is no evidence the runtime is there and the run must say so.
+        Write-Fail ".NET Framework 3.5 install completed but its state could not be verified on this system."
+        $null = $Global:RunStats.FailedApps.Add($runtimeName)
     } elseif ($restartNeeded) {
+        # The feature genuinely reports EnablePending until the restart that is already tracked
+        # in RunStats.RebootRequired, so this is a success whose evidence settles after reboot.
         Write-Warn ".NET Framework 3.5 requires a restart before it reports as enabled."
+        $null = $Global:RunStats.InstalledApps.Add($runtimeName)
     } else {
         Write-Fail ".NET Framework 3.5 did not report as enabled after installation."
-        $null = $Global:RunStats.FailedApps.Add(".NET Framework 3.5")
+        $null = $Global:RunStats.FailedApps.Add($runtimeName)
     }
 }
 
@@ -946,8 +1024,18 @@ function Get-DotNetFrameworkReleaseValue {
 
 function Install-DotNetFramework4Plus {
     if (-not $Global:Config.runtimes.installDotNetFramework4Plus) { return }
+    # Declared inside the function on purpose: the test suites extract a single function by AST,
+    # so a module-level $script: constant would be undefined there.
+    # 533320 is the NDP v4 Release value for .NET Framework 4.8.1, and reading it back is this
+    # runtime's independent verification contract (M-08).
+    $runtimeName = ".NET Framework 4.8.1"
+    $requiredRelease = 533320
     $rv = Get-DotNetFrameworkReleaseValue
-    if ($rv -ge 533320) { Write-Ok ".NET Framework 4.8.1+ already installed (release $rv)."; return }
+    if ($rv -ge $requiredRelease) {
+        Write-Ok ".NET Framework 4.8.1+ already installed (release $rv)."
+        $null = $Global:RunStats.InstalledApps.Add($runtimeName)
+        return
+    }
     $url = [string]$Global:Config.runtimes.dotNetFramework481OfflineUrl
     if ([string]::IsNullOrWhiteSpace($url)) { $url = "https://go.microsoft.com/fwlink/?linkid=2203305" }
     $msi = Get-SafeDownloadCacheFilePath -FileName "NDP481-x86-x64-AllOS-ENU.exe"
@@ -957,7 +1045,12 @@ function Install-DotNetFramework4Plus {
     $rt = $Global:Config.runtimes
     $expectedSha256 = if ($rt.PSObject.Properties.Name -contains "dotNetFramework481ExpectedSha256") { [string]$rt.dotNetFramework481ExpectedSha256 } else { "" }
     if (-not (Invoke-DownloadFile -Url $url -Destination $msi -ExpectedSha256 $expectedSha256 `
-                -AllowedHosts @('go.microsoft.com', '*.microsoft.com', 'download.visualstudio.microsoft.com', '*.download.visualstudio.microsoft.com'))) { return }
+                -AllowedHosts @('go.microsoft.com', '*.microsoft.com', 'download.visualstudio.microsoft.com', '*.download.visualstudio.microsoft.com'))) {
+        # M-08: returning silently here left a requested runtime uninstalled and the run at exit 0.
+        Write-Warn "$runtimeName download failed; skipping install."
+        $null = $Global:RunStats.FailedApps.Add($runtimeName)
+        return
+    }
     Write-Info "Installing .NET Framework 4.8.1 (passive, no restart)..."
     try {
         $proc = Start-Process -FilePath $msi -ArgumentList "/passive /norestart" -Wait -PassThru -WindowStyle Hidden
@@ -966,52 +1059,119 @@ function Install-DotNetFramework4Plus {
         # several distinct outcomes (1638 already-installed, 1602 cancelled, 1603 fatal) and
         # each success code gets its own message. Collapsing them into Succeeded/RebootPending
         # would lose that detail for no gain.
+        $claimedSuccess = $false
+        $rebootPending = $false
         switch ([int]$proc.ExitCode) {
             0 {
                 Write-Ok ".NET Framework 4.8.1 install command finished."
+                $claimedSuccess = $true
             }
             3010 {
                 Write-Ok ".NET Framework 4.8.1 install command finished; reboot required."
                 Set-PendingReboot ".NET Framework 4.8.1 installer requested reboot"
+                $claimedSuccess = $true
+                $rebootPending = $true
             }
             1641 {
                 Write-Ok ".NET Framework 4.8.1 installer reported success with reboot required."
                 Set-PendingReboot ".NET Framework 4.8.1 installer requested reboot"
+                $claimedSuccess = $true
+                $rebootPending = $true
             }
             1638 {
                 Write-Ok ".NET Framework 4.8.1 or a newer equivalent is already installed."
+                $claimedSuccess = $true
             }
             1602 {
                 Write-Warn ".NET Framework 4.8.1 install was cancelled by the user or installer UI."
-                $null = $Global:RunStats.FailedApps.Add(".NET Framework 4.8.1")
             }
             1603 {
                 Write-Warn ".NET Framework 4.8.1 install failed with fatal MSI error 1603."
-                $null = $Global:RunStats.FailedApps.Add(".NET Framework 4.8.1")
             }
             default {
                 Write-Warn ".NET Framework 4.8.1 installer exited with code $($proc.ExitCode)."
-                $null = $Global:RunStats.FailedApps.Add(".NET Framework 4.8.1")
             }
         }
-    } catch { Write-Warn ".NET 4.8.1 install failed: $($_.Exception.Message)" }
+
+        # M-08: the exit code above is only the installer's own claim. The NDP v4 release value is
+        # the independent evidence, and it is read back before the runtime counts as installed.
+        # A reboot-pending success is exempt because that evidence only settles after the restart
+        # that is already tracked in RunStats.RebootRequired.
+        if (-not $claimedSuccess) {
+            $null = $Global:RunStats.FailedApps.Add($runtimeName)
+        } elseif ($rebootPending) {
+            $null = $Global:RunStats.InstalledApps.Add($runtimeName)
+        } else {
+            $installedRelease = Get-DotNetFrameworkReleaseValue
+            if ($installedRelease -ge $requiredRelease) {
+                Write-Ok ("$runtimeName verified (release $installedRelease).")
+                $null = $Global:RunStats.InstalledApps.Add($runtimeName)
+            } else {
+                Write-Warn ("$runtimeName reported success but the NDP v4 release value is still $installedRelease (expected at least $requiredRelease).")
+                $null = $Global:RunStats.FailedApps.Add($runtimeName)
+            }
+        }
+    } catch {
+        Write-Warn ".NET 4.8.1 install failed: $($_.Exception.Message)"
+        $null = $Global:RunStats.FailedApps.Add($runtimeName)
+    }
 }
 
 function Install-WingetRuntimePackage {
+    <#
+        M-08: the verification contract for one requested runtime, and the single funnel every
+        .NET Desktop, .NET Core and Visual C++ runtime passes through.
+
+        The installer's exit code is only its own claim - winget exits 0 for a package that was
+        not actually placed on the machine - so the runtime has to be detectable afterwards
+        before the run may record it as installed. A non-zero exit code, an exception, and an
+        unverifiable install all land in FailedApps, which is what makes the final exit code
+        non-zero. Every one of those three used to be a bare Write-Warn.
+    #>
     param([Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][string]$Id)
     try {
         if (Test-WingetPackageInstalled -Id $Id) {
             Write-Ok "$Name already installed."
+            $null = $Global:RunStats.InstalledApps.Add($Name)
             return
         }
         $runtimeResult = Invoke-LoggedCommand -FilePath (Get-WingetExecutable) -Arguments @("install", "--id", $Id, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget", "--silent") -DisplayName "winget runtime $Name"
-        if ($runtimeResult.ExitCode -eq 0) { Write-Ok "$Name installed." } else { Write-Warn "$Name install exit code $($runtimeResult.ExitCode)." }
-    } catch { Write-Warn "${Name}: $($_.Exception.Message)" }
+        if ($runtimeResult.ExitCode -ne 0) {
+            Write-Warn "$Name install exit code $($runtimeResult.ExitCode)."
+            $null = $Global:RunStats.FailedApps.Add($Name)
+        } elseif (Test-WingetPackageInstalled -Id $Id) {
+            Write-Ok "$Name installed and verified."
+            $null = $Global:RunStats.InstalledApps.Add($Name)
+        } else {
+            Write-Warn "$Name reported a successful install but is not detectable afterwards."
+            $null = $Global:RunStats.FailedApps.Add($Name)
+        }
+    } catch {
+        Write-Warn "${Name}: $($_.Exception.Message)"
+        $null = $Global:RunStats.FailedApps.Add($Name)
+    }
+}
+
+function Install-RequestedWingetRuntime {
+    <#
+        M-08: WinGet being unavailable used to make each runtime group return before installing
+        anything, so a run that installed no runtime at all still exited 0. A runtime this config
+        asked for is recorded as failed when it cannot even be attempted, which keeps the whole
+        requested set accounted for rather than a subset of it.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Packages)
+    if (-not (Ensure-Winget)) {
+        foreach ($package in $Packages) {
+            Write-Warn ("{0} was not installed: WinGet is unavailable." -f $package.Name)
+            $null = $Global:RunStats.FailedApps.Add([string]$package.Name)
+        }
+        return
+    }
+    foreach ($package in $Packages) { Install-WingetRuntimePackage -Name $package.Name -Id $package.Id }
 }
 
 function Install-DotNetDesktopRuntimes {
     if (-not $Global:Config.runtimes.installDotNetDesktopRuntimes) { return }
-    if (-not (Ensure-Winget)) { return }
     $packages = @()
     if ($Global:Config.runtimes.includeUnsupportedDotNetVersions) {
         $packages += @(
@@ -1025,12 +1185,11 @@ function Install-DotNetDesktopRuntimes {
         @{ Name = ".NET Desktop Runtime 9 x64"; Id = "Microsoft.DotNet.DesktopRuntime.9" },
         @{ Name = ".NET Desktop Runtime 10 x64"; Id = "Microsoft.DotNet.DesktopRuntime.10" }
     )
-    foreach ($p in $packages) { Install-WingetRuntimePackage -Name $p.Name -Id $p.Id }
+    Install-RequestedWingetRuntime -Packages $packages
 }
 
 function Install-DotNetCoreRuntimes {
     if (-not $Global:Config.runtimes.installDotNetCoreRuntimes) { return }
-    if (-not (Ensure-Winget)) { return }
     $packages = @()
     if ($Global:Config.runtimes.includeUnsupportedDotNetVersions) {
         $packages += @(
@@ -1044,15 +1203,19 @@ function Install-DotNetCoreRuntimes {
         @{ Name = ".NET Runtime 9 x64"; Id = "Microsoft.DotNet.Runtime.9" },
         @{ Name = ".NET Runtime 10 x64"; Id = "Microsoft.DotNet.Runtime.10" }
     )
-    foreach ($p in $packages) { Install-WingetRuntimePackage -Name $p.Name -Id $p.Id }
+    Install-RequestedWingetRuntime -Packages $packages
 }
 
-# NOTE: ASP.NET Core Runtimes are intentionally NOT installed (item 31).
-# The installAspNetCoreRuntimes flag in config is forced to false and this
-# function is left here as a no-op for backwards compatibility.
+# NOTE: ASP.NET Core Runtimes are intentionally NOT installed (item 31). The shipped
+# WinServerSetup.config.json carries no installDotNetAspNetCoreRuntimes key at all, so a default
+# run never requests them and this is a silent no-op.
 function Install-DotNetAspNetCoreRuntimes {
     if ($Global:Config.runtimes.installDotNetAspNetCoreRuntimes) {
-        Write-Warn "ASP.NET Core Runtime install requested in config but explicitly disabled per project policy."
+        # M-08: this is the one case where config and project policy disagree. The operator asked
+        # for a runtime that will not be installed, so the run must fail rather than warn - a
+        # warning here is indistinguishable from success and leaves the conflict unresolved.
+        Write-Fail "ASP.NET Core Runtime install requested in config but explicitly disabled per project policy (item 31). Remove runtimes.installDotNetAspNetCoreRuntimes from the config to clear this."
+        $null = $Global:RunStats.FailedApps.Add("ASP.NET Core Runtime")
     } else {
         Write-Info "ASP.NET Core Runtime install is disabled by project policy (item 31)."
     }
@@ -1060,7 +1223,6 @@ function Install-DotNetAspNetCoreRuntimes {
 
 function Install-VisualCppRuntimes {
     if (-not $Global:Config.runtimes.installVisualCppRuntimes) { return }
-    if (-not (Ensure-Winget)) { return }
     $packages = @(
         @{ Name = "VC++ 2015-2022 x64"; Id = "Microsoft.VCRedist.2015+.x64" },
         @{ Name = "VC++ 2015-2022 x86"; Id = "Microsoft.VCRedist.2015+.x86" }
@@ -1078,7 +1240,7 @@ function Install-VisualCppRuntimes {
             @{ Name = "VC++ 2005 x86"; Id = "Microsoft.VCRedist.2005.x86" }
         )
     }
-    foreach ($p in $packages) { Install-WingetRuntimePackage -Name $p.Name -Id $p.Id }
+    Install-RequestedWingetRuntime -Packages $packages
 }
 
 function Install-Runtimes {

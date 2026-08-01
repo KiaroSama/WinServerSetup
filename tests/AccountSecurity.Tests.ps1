@@ -122,6 +122,7 @@ $script:ProcessDisposed = $false
 
 # --- Console shims (the real ones live in WinServerSetup.ps1) ---------------
 function Write-Ok   { param([string]$Message) $script:LogLines.Add("[OK] $Message")   | Out-Null }
+function Write-StructuredLog { param([string]$Level = 'INFO', [string]$Message = '', [string]$Section = '') $script:LogLines.Add("[$Level] $Message") | Out-Null }
 function Write-Info { param([string]$Message) $script:LogLines.Add("[INFO] $Message") | Out-Null }
 function Write-Warn { param([string]$Message) $script:LogLines.Add("[WARN] $Message") | Out-Null }
 function Read-HostThemed {
@@ -216,8 +217,10 @@ function Invoke-BoundedGpupdate {
 }
 function Start-Process {
     param([string]$FilePath, [string[]]$ArgumentList, [string]$WindowStyle, [switch]$PassThru, $ErrorAction)
-    $fake = [pscustomobject]@{ Id = 424242; ExitCode = $script:ProcessExitCode }
-    $fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param([int]$Milliseconds) return $script:ProcessExitsInTime }
+    # Handle mirrors the real Process property the implementation caches so ExitCode stays
+    # readable after exit on 5.1; WaitForExit is called both with and without a budget.
+    $fake = [pscustomobject]@{ Id = 424242; ExitCode = $script:ProcessExitCode; Handle = [IntPtr]::Zero }
+    $fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param([int]$Milliseconds = 0) if ($Milliseconds -eq 0) { return } return $script:ProcessExitsInTime }
     $fake | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $script:ProcessDisposed = $true }
     return $fake
 }

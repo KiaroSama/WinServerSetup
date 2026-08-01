@@ -73,12 +73,19 @@ function Get-WinEvent {
             $null)
         throw $record
     }
-    if ($FilterXPath) { $script:Queries.Add([string]$FilterXPath) | Out-Null }
-    if ($MaxEvents) { return @($script:Events | Sort-Object RecordId -Descending | Select-Object -First 1) }
-    if ($FilterXPath -and $FilterXPath -match 'EventRecordID\s*>\s*(\d+)') {
-        return @($script:Events | Where-Object { $_.RecordId -gt [long]$matches[1] })
+    # The "has the Security log been cleared?" probe is the newest record with no filter at all.
+    # Every other query now carries -MaxEvents as well (H-04), so the probe has to be recognised
+    # by its exact shape rather than by the mere presence of -MaxEvents.
+    if ($MaxEvents -eq 1 -and -not $FilterXPath -and -not $FilterHashtable) {
+        return @($script:Events | Sort-Object RecordId -Descending | Select-Object -First 1)
     }
-    return @($script:Events)
+    if ($FilterXPath) { $script:Queries.Add([string]$FilterXPath) | Out-Null }
+    $source = @($script:Events)
+    if ($FilterXPath -and $FilterXPath -match 'EventRecordID\s*>\s*(\d+)') {
+        $source = @($source | Where-Object { $_.RecordId -gt [long]$matches[1] })
+    }
+    if ($MaxEvents -and [int]$MaxEvents -gt 0) { $source = @($source | Select-Object -First ([int]$MaxEvents)) }
+    return $source
 }
 function Get-NetFirewallRule {
     param([string]$DisplayName, $ErrorAction)
@@ -121,7 +128,7 @@ function Reset-TestState {
         rdpBruteforceBlocker = [pscustomobject]@{
             enabled = $true; threshold = $Threshold; lookbackMinutes = $LookbackMinutes
             taskIntervalMinutes = 1; rulePrefix = "RuntimeTest RDP Block"; whitelistCIDRs = @()
-            includeNetworkLogonType3 = $false; blockAllInbound = $false; permanentBlock = $false
+            includeNetworkLogonType3 = $false; attributionWindowSeconds = 120; blockAllInbound = $false; permanentBlock = $false
             ruleRetentionDays = 30; logMaxBytes = 65536; logRetentionFiles = 2; statePath = $statePath
         }
     }
@@ -133,13 +140,51 @@ function Reset-TestState {
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
 }
 
+function Remove-TestRoot {
+    # The blocker hardens a quarantined state file down to SYSTEM + Administrators (L-03), which
+    # is exactly the point - and which stops a non-elevated test process deleting its own
+    # fixture. Grant this identity back per file first, by SID so it does not depend on the
+    # account name or locale, then clean up.
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    foreach ($file in @(Get-ChildItem -LiteralPath $testRoot -File -Recurse -Force -ErrorAction SilentlyContinue)) {
+        & icacls.exe $file.FullName '/grant' ("*{0}:(F)" -f $sid) 2>&1 | Out-Null
+    }
+    Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-BlockerRun {
+    <#
+        The blocker is guarded by a machine-wide named mutex, so ANOTHER RDP blocker run on the
+        same machine - a second shell's test pass - makes this one skip. Skipping is a healthy
+        branch, but it writes no state and touches no firewall rule, so every assertion here
+        would then fail with a misleading "nothing happened" message. Wait for the guard to be
+        free first (a bounded wait on an explicit signal, no sleeps), then run; if it was skipped
+        anyway, retry a bounded number of times and finally say why.
+    #>
+    param([int]$Attempts = 3)
+    $configArgument = "ignored.json"
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $gate = New-Object System.Threading.Mutex($false, 'Global\WinServerSetup-RdpBlocker')
+        try {
+            $owned = $false
+            try { $owned = $gate.WaitOne(60000) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+            if ($owned) { $gate.ReleaseMutex() }
+        } finally { $gate.Dispose() }
+
+        $marker = $script:LogLines.Count
+        $result = Invoke-RdpBruteforceBlocker -ResolvedConfigPath $configArgument
+        if ((@($script:LogLines | Select-Object -Skip $marker) -join "`n") -notmatch 'already running') { return $result }
+    }
+    throw "Every attempt was skipped because another RDP blocker run held the machine-wide guard."
+}
+
 try {
     # -- R1: the incremental query must be raw XPath the real parser accepts -----------------
     Reset-TestState
     $script:Events = @(New-TestEvent 100 "203.0.113.5" (Get-Date))
-    Assert-Equal 0 (Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json") "Seed run failed."
+    Assert-Equal 0 (Invoke-BlockerRun) "Seed run failed."
     $script:Events += New-TestEvent 101 "203.0.113.5" (Get-Date)
-    Assert-Equal 0 (Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json") "Incremental run failed."
+    Assert-Equal 0 (Invoke-BlockerRun) "Incremental run failed."
 
     $incremental = @($script:Queries | Where-Object { $_ -match 'EventRecordID' })
     Assert-True ($incremental.Count -gt 0) "No incremental EventRecordID query was ever issued."
@@ -160,7 +205,7 @@ try {
     # -- R2: an empty Security window is healthy, not a task failure ------------------------
     Reset-TestState
     $script:ThrowNoMatchingEvents = $true
-    Assert-Equal 0 (Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json") `
+    Assert-Equal 0 (Invoke-BlockerRun) `
         ("An empty event window must succeed. Logs: {0}" -f ($script:LogLines -join " | "))
     $logText = $script:LogLines -join "`n"
     Assert-True ($logText -notmatch '\[ERROR\]') "An empty window must not be logged as an error."
@@ -171,28 +216,31 @@ try {
     # rule created. Pre-fix, the local-kind cast widened/shifted the window by the UTC offset.
     Reset-TestState -Threshold 1 -LookbackMinutes 30
     $staleUtc = (Get-Date).ToUniversalTime().AddMinutes(-45)
+    $epoch = New-Object System.DateTime(1970, 1, 1, 0, 0, 0, ([System.DateTimeKind]::Utc))
     [pscustomobject]@{
-        Version = 1; LastRecordId = 500
-        Events = @([pscustomobject]@{
-            RecordId = 500; TimeCreatedUtc = $staleUtc.ToString('o')
-            IpAddress = "203.0.113.77"; LogonType = "10"; TargetUserName = "victim"
+        Version = 2; LastRecordId = 500
+        Counters = @([pscustomobject]@{
+            Ip = "203.0.113.77"; Times = @([long][math]::Floor(($staleUtc - $epoch).TotalSeconds))
+            Types = "10"; Users = "victim"; Evidence = "RemoteInteractive"
         })
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath -Encoding UTF8
 
     $script:Events = @(New-TestEvent 500 "203.0.113.77" $staleUtc.ToLocalTime())
-    Assert-Equal 0 (Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json") "Stale-window run failed."
+    Assert-Equal 0 (Invoke-BlockerRun) "Stale-window run failed."
     Assert-Equal 0 $script:FirewallRules.Count `
         ("An event older than lookbackMinutes must leave the rolling window (UTC offset {0})." -f [TimeZoneInfo]::Local.BaseUtcOffset)
+    Assert-Equal 0 @(Get-ChildItem -LiteralPath $testRoot -Filter 'state.json.corrupt-*' -File -ErrorAction SilentlyContinue).Count `
+        "The stale event must be aged out of a HEALTHY state file, not discarded by quarantining it."
 
     # -- R4: exactly one new event still advances the bookmark (5.1 array unwrapping) --------
     Reset-TestState -Threshold 5
     $script:Events = @(New-TestEvent 900 "203.0.113.90" (Get-Date))
-    Assert-Equal 0 (Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json") "Single-event run failed."
+    Assert-Equal 0 (Invoke-BlockerRun) "Single-event run failed."
     $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-Equal 900 ([long]$state.LastRecordId) `
         "A single new event must advance LastRecordId on both PowerShell 5.1 and 7."
 
     Write-Host "PASS RDP blocker runtime: valid XPath, empty-window tolerance, UTC-correct rolling window, single-event bookmark."
 } finally {
-    Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-TestRoot
 }

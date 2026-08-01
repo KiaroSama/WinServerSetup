@@ -45,7 +45,11 @@ $setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
         $fileAst
     })
 
-foreach ($name in @('Get-WebResponseFinalUri', 'Test-DownloadHostAllowed', 'Test-SignerSubjectAllowed', 'Test-FileSha256', 'Invoke-DownloadFile')) {
+# H-01 added a trust layer that Invoke-DownloadFile now calls into, so those functions have to
+# be imported alongside it or the download path fails with "term is not recognized".
+foreach ($name in @('Get-WebResponseFinalUri', 'Test-DownloadHostAllowed', 'Test-SignerSubjectAllowed', 'Test-FileSha256',
+        'Test-PathContainsReparsePoint', 'Get-UntrustedAclWriter', 'Initialize-TrustedDirectory',
+        'Test-ExecutableExtension', 'Assert-TrustedArtifact', 'Invoke-DownloadFile')) {
     . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
 }
 
@@ -126,6 +130,18 @@ $asyncResult = $worker.BeginInvoke()
 
 $workRoot = Join-Path $env:TEMP ("WinServerSetup-DownloadRuntime-{0}" -f [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
+
+# H-01: Invoke-DownloadFile now refuses to write into a directory a non-administrator can write
+# to. That gate is correct and is covered for real - including the reject case - by
+# tests\InstallerCacheTrust.Tests.ps1, which builds a directory granting Modify to
+# BUILTIN\Users and asserts it is reported untrusted.
+#
+# It cannot also be exercised here: hardening this sandbox to SYSTEM+Administrators makes it
+# unwritable by the unelevated process running the suite, so the download under test could
+# never run. Stubbing the ACL lookup keeps THIS suite about the download path (redirects,
+# hashes, signatures, retries) without weakening the gate, which still executes for real in
+# production and in the H-01 suite.
+function Get-UntrustedAclWriter { param([string]$Path) return @() }
 
 try {
     Assert-True $listener.IsListening "Local test listener never started on port $port."
