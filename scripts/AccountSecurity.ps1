@@ -109,7 +109,13 @@ function Write-AccountSecurityBackup {
     $root = if ($Global:ProjectRoot) { $Global:ProjectRoot } else { Split-Path -Parent (Split-Path -Parent $PSScriptRoot) }
     $directory = Join-Path $root 'backups'
     if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
-    $path = Join-Path $directory ("account-security-{0}-{1}.json" -f $Kind, (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss'))
+    # The stamp is second-granular, so two records written in the same second would land on the
+    # same path and the earlier recovery record would be lost. Suffix until the name is free -
+    # the same idiom scripts\Run-PostRebootSfc.ps1 uses for its timestamped logs.
+    $baseName = "account-security-{0}-{1}" -f $Kind, (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+    $path = Join-Path $directory "$baseName.json"
+    $suffix = 1
+    while (Test-Path -LiteralPath $path) { $path = Join-Path $directory "$baseName-$suffix.json"; $suffix++ }
     [pscustomobject]@{ Version = 1; Kind = $Kind; CreatedUtc = (Get-Date).ToUniversalTime().ToString('o'); Data = $Data } |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
     return $path

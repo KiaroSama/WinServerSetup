@@ -2694,11 +2694,11 @@ function Wait-TermServiceTcpPort {
 }
 
 function Restore-RdpPort {
-    param([string]$RegistryPath, [int]$PreviousPort, [bool]$RestartService)
+    param([string]$RegistryPath, [int]$PreviousPort, [bool]$RestartService, [int]$WaitTimeoutSeconds = 30)
     Set-ItemProperty -Path $RegistryPath -Name "PortNumber" -Type DWord -Value $PreviousPort -ErrorAction Stop
     if ($RestartService) {
         Restart-Service TermService -Force -ErrorAction Stop
-        if (-not (Wait-TermServiceTcpPort -Port $PreviousPort -TimeoutSeconds 30)) {
+        if (-not (Wait-TermServiceTcpPort -Port $PreviousPort -TimeoutSeconds $WaitTimeoutSeconds)) {
             throw "Rollback wrote PortNumber=$PreviousPort, but TermService did not reclaim that listener."
         }
     } else {

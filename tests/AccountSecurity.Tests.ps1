@@ -5,11 +5,13 @@
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'Cmdlets are shadowed deliberately to mock Windows-only APIs.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Mock signatures mirror the real cmdlets so parameter binding matches production.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidAssignmentToAutomaticVariable', '', Justification = 'Mock parameter names must match the real cmdlet parameter names.')]
-param()
+# -ScriptPath targets an alternate copy so these tests can be replayed against a deliberately
+# defective build to prove they still fail. CI and local runs use the default.
+param([string]$ScriptPath = "")
 
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$accountScript = Join-Path $projectRoot "scripts\AccountSecurity.ps1"
+$accountScript = if ([string]::IsNullOrWhiteSpace($ScriptPath)) { Join-Path $projectRoot "scripts\AccountSecurity.ps1" } else { $ScriptPath }
 if (-not (Test-Path -LiteralPath $accountScript)) { throw "Missing account security implementation: $accountScript" }
 $source = Get-Content -LiteralPath $accountScript -Raw -Encoding UTF8
 
@@ -283,6 +285,22 @@ try {
     foreach ($invalid in @("", "name/with/slash", "name.", "123456789012345678901")) {
         Assert-True (-not (Test-ValidLocalAccountName $invalid)) "Invalid local account name was accepted: $invalid"
     }
+
+    # --- two records in the same second must not overwrite each other --------
+    # These are the recovery records for the rename and for the lockout change, so a lost one is
+    # exactly the data an operator needs after something went wrong. The filename stamp is
+    # second-granular; a frozen clock makes the collision deterministic instead of a race.
+    Reset-TestState
+    function Get-Date { return [datetime]::new(2026, 1, 2, 3, 4, 5, [DateTimeKind]::Utc) }
+    try {
+        $firstRecord = Write-AccountSecurityBackup -Kind 'administrator-name' -Data ([pscustomobject]@{ Marker = 'first' })
+        $secondRecord = Write-AccountSecurityBackup -Kind 'administrator-name' -Data ([pscustomobject]@{ Marker = 'second' })
+    } finally { Remove-Item -LiteralPath Function:\Get-Date -Force }
+    Assert-True ($firstRecord -ne $secondRecord) "Two records written in the same second must not share a path. Both were '$firstRecord'."
+    Assert-Equal 2 (@(Get-ChildItem -LiteralPath (Join-Path $testRoot 'backups') -File)).Count "Two same-second backups must leave two files on disk."
+    $firstData = Get-Content -LiteralPath $firstRecord -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Equal 'first' $firstData.Data.Marker "The earlier recovery record must survive the later write, not be overwritten by it."
+    Assert-True ((Split-Path -Leaf $secondRecord) -like 'account-security-administrator-name-*.json') "A suffixed record must still match the pattern the restore path globs for."
 
     # --- happy path: rename + password, fully verified -----------------------
     Reset-TestState

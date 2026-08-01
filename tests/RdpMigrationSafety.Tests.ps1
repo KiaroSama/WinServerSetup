@@ -179,24 +179,25 @@ Assert-True ($script:PendingRebootReasons[0] -match '3389') "The pending-reboot 
 #         here is the worst outcome in this file: the operator is told RDP was restored while the
 #         box is unreachable.
 #
-#         Restore-RdpPort hard-codes -TimeoutSeconds 30, so driving this branch through the real
-#         wait would cost 30 s per run. Case 6 above already proves the real wait returns false
-#         when ownership never appears; the stub below supplies that verdict instantly so the
-#         branch that CONSUMES it can be exercised. Restore-RdpPort itself is unmodified. ----
-$script:WaitResult = $false
-function Wait-TermServiceTcpPort { param([int]$Port, [int]$TimeoutSeconds = 30) return $script:WaitResult }
-
+#         -WaitTimeoutSeconds drives the REAL Wait-TermServiceTcpPort here. While the wait was
+#         hard-coded to 30 s this branch could only be reached through a stubbed wait, which
+#         proved nothing about the production wiring; now the whole path runs unmocked in about
+#         two seconds. ----
 Reset-RdpTestState -ServicePid 4321 -ListenerPids @(9999)
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $rollbackError = $null
 try {
-    Restore-RdpPort -RegistryPath $rdpKey -PreviousPort 3389 -RestartService $true
+    Restore-RdpPort -RegistryPath $rdpKey -PreviousPort 3389 -RestartService $true -WaitTimeoutSeconds 2
 } catch {
     $rollbackError = [string]$_.Exception.Message
 }
+$stopwatch.Stop()
 Assert-True ($null -ne $rollbackError) "An unverified rollback must throw, never return quietly."
 Assert-True ($rollbackError -match 'did not reclaim') "The rollback failure must say the service never reclaimed the port."
 Assert-Equal 1 $script:SetItemPropertyCalls.Count "The registry must still be rolled back before the failure is raised."
 Assert-Equal 1 $script:RestartCount "The failing rollback must have attempted the restart."
+Assert-True ($stopwatch.Elapsed.TotalSeconds -ge 1) "The rollback must actually poll the real wait before giving up."
+Assert-True ($stopwatch.Elapsed.TotalSeconds -lt 15) "Restore-RdpPort must pass -WaitTimeoutSeconds through instead of waiting out the 30 s default."
 
 # ---- Retained source greps: cheap smoke checks over call sites that are not directly invoked
 #      here (Configure-RdpPortAndFirewall drives real registry and firewall APIs). ----
