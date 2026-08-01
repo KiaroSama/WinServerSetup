@@ -271,7 +271,47 @@ try {
     Assert-Equal 0 $incrementalResult ("Incremental stateful run failed. Logs: {0}" -f ($script:LogLines -join " | "))
     Assert-True (($script:EventQueries -join "`n") -match 'EventRecordID.*11') "Second run must query after the persisted RecordId instead of reparsing the full window."
 
-    Write-Host "PASS RDP blocker security behavior, scoped firewall rules, validation, failures, and state bookmark."
+    # A run that overlaps an in-progress run is an ordinary scheduling overlap, not a failure.
+    # Returning non-zero sets the task's LastTaskResult=1, and the health check treats anything
+    # other than 0/267011 as unhealthy - so a harmless overlap made the health check report this
+    # security control as broken and masked whether it was genuinely failing.
+    #
+    # The mutex must be held on ANOTHER thread: a named mutex is re-entrant for the thread that
+    # already owns it, so taking it on this thread would let WaitOne(0) succeed and never exercise
+    # the contention path. A second runspace gives a real competing thread with no blind sleeps -
+    # both handoffs are bounded waits on explicit signals.
+    Reset-TestState
+    $acquiredSignal = New-Object System.Threading.ManualResetEventSlim($false)
+    $releaseSignal = New-Object System.Threading.ManualResetEventSlim($false)
+    $mutexHolder = [powershell]::Create()
+    $null = $mutexHolder.AddScript({
+            param($Acquired, $Release)
+            $heldMutex = New-Object System.Threading.Mutex($false, 'Global\WinServerSetup-RdpBlocker')
+            try {
+                if (-not $heldMutex.WaitOne(30000)) { return }
+                $Acquired.Set()
+                $null = $Release.Wait(60000)
+                $heldMutex.ReleaseMutex()
+            } finally { $heldMutex.Dispose() }
+        }).AddArgument($acquiredSignal).AddArgument($releaseSignal)
+    $holderHandle = $mutexHolder.BeginInvoke()
+    try {
+        Assert-True ($acquiredSignal.Wait(30000)) "The competing thread could not take the blocker mutex; the overlap case never ran."
+        $overlapResult = Invoke-RdpBruteforceBlocker -ResolvedConfigPath "ignored.json"
+        $overlapLogs = $script:LogLines -join "`n"
+        Assert-Equal 0 $overlapResult ("A concurrent run must exit 0 so the scheduled task does not record a failure. Logs: {0}" -f ($script:LogLines -join " | "))
+        Assert-True ($overlapLogs -match '\[INFO\].*already running') "A concurrent run must be logged at INFO."
+        Assert-True ($overlapLogs -notmatch '\[ERROR\]') "A concurrent run must not be logged as an error."
+        Assert-Equal 0 $script:FirewallRules.Count "A skipped concurrent run must not touch firewall state."
+    } finally {
+        $releaseSignal.Set()
+        $null = $mutexHolder.EndInvoke($holderHandle)
+        $mutexHolder.Dispose()
+        $acquiredSignal.Dispose()
+        $releaseSignal.Dispose()
+    }
+
+    Write-Host "PASS RDP blocker security behavior, scoped firewall rules, validation, failures, state bookmark, and benign concurrent-run exit code."
 } finally {
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

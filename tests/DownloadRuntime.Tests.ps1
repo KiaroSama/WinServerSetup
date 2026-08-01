@@ -50,7 +50,7 @@ function Import-FunctionUnderTest {
     return $definition.Extent.Text
 }
 
-foreach ($name in @('Get-WebResponseFinalUri', 'Test-DownloadHostAllowed', 'Test-FileSha256', 'Invoke-DownloadFile')) {
+foreach ($name in @('Get-WebResponseFinalUri', 'Test-DownloadHostAllowed', 'Test-SignerSubjectAllowed', 'Test-FileSha256', 'Invoke-DownloadFile')) {
     . ([scriptblock]::Create((Import-FunctionUnderTest $name)))
 }
 
@@ -70,6 +70,23 @@ Assert-Equal $false (Test-DownloadHostAllowed -Uri ([uri]'http://example.com/a')
 Assert-Equal $true  (Test-DownloadHostAllowed -Uri ([uri]'https://example.com/a') -AllowedHosts @()) "HTTPS with no allowlist is permitted."
 Assert-Equal $true  (Test-DownloadHostAllowed -Uri ([uri]'https://cdn.example.com/a') -AllowedHosts @('*.example.com')) "Wildcard host must match."
 Assert-Equal $false (Test-DownloadHostAllowed -Uri ([uri]'https://evil.test/a') -AllowedHosts @('*.example.com')) "Non-matching host must be rejected."
+
+# ---- 1b. An absent JSON property reaches these helpers as @($null), NOT as an empty array.
+# @($null).Count is 1, so every "no restriction configured" shortcut was skipped: the host check
+# threw on $null.StartsWith(), and the signer check interpolated $null into "**", matching every
+# certificate while still appearing to enforce a publisher allowlist. ----
+Assert-Equal $true (Test-DownloadHostAllowed -Uri ([uri]'https://example.com/a') -AllowedHosts @($null)) `
+    "An absent host allowlist must mean allow-any, not a null-reference throw."
+Assert-Equal $false (Test-SignerSubjectAllowed -Subject 'CN=Totally Unrelated, O=Elsewhere' -AllowedSignerSubjects @($null)) `
+    "An absent signer allowlist must never silently accept an unrelated signer."
+
+# ---- 1c. An allowlist entry pins a whole CN/O value, not a substring of the entire DN. ----
+Assert-Equal $false (Test-SignerSubjectAllowed -Subject 'CN=Dolphin Emulator, O=Unrelated' -AllowedSignerSubjects @('Dolphin')) `
+    "A partial token must not match a longer CN; that is publisher impersonation."
+Assert-Equal $true (Test-SignerSubjectAllowed -Subject 'CN=voidtools, O=voidtools, C=AU' -AllowedSignerSubjects @('voidtools')) `
+    "The shipped short-token entries must still match their real certificate CN/O."
+Assert-Equal $true (Test-SignerSubjectAllowed -Subject 'CN=voidtools, O=voidtools' -AllowedSignerSubjects @('CN=voidtools, O=voidtools')) `
+    "An entry containing '=' must pin the full distinguished name."
 
 # ---- 2. Final-URI resolution must fail closed on an unusable response. ----
 $failedClosed = $false

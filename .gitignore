@@ -148,6 +148,7 @@ obj/
 /reference.md
 /CLAUDE.md
 /AGENTS.md
+!/AGENTS.md
 /.agents/
 /.claude/
 /.kiro/
@@ -155,6 +156,7 @@ obj/
 /.cursor/
 /.cline/
 /graphify-out/
+/plans/
 /.env
 /.env.*
 !/.env.example

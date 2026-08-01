@@ -106,23 +106,31 @@ Run from the current folder without self-relocation:
 
 The full setup workflow performs these actions:
 
-1. Applies dark mode and Explorer settings.
-2. Enables Windows long paths.
-3. Adds the Persian keyboard layout without removing existing layouts.
-4. Creates configured portable folders.
-5. Starts app download prefetch with the configured safe parallel limit.
-6. Runs multi-pass Windows Update while downloads continue in the background.
-7. Applies QoS and Windows Update bandwidth policies.
-8. Installs configured applications and runtimes sequentially.
-9. Configures default browser, media player, 7-Zip associations, PowerShell 7, and Windows Terminal where Windows allows it.
-10. Changes the RDP port safely.
-11. Enables Windows Search Indexing.
-12. Registers scheduled tasks.
-13. Disables configured startup entries and removes configured Windows components.
-14. Pins configured Quick Access entries and replaces taskbar pins where Windows allows it.
-15. Runs health checks and cleanup.
-16. Prints the final summary.
-17. Schedules post-reboot SFC and restarts only after all setup tasks finish when a reboot is required.
+1. Applies configured account security: the built-in Administrator rename and the machine-wide local account lockout policy. Both are disabled by default, both are skipped entirely when `-NoPause` is set, and each can be placed behind an interactive confirmation with its `promptDuringFullSetup` flag.
+2. Applies dark mode and shows file extensions.
+3. Enables Windows long paths.
+4. Adds the Persian keyboard layout without removing existing layouts.
+5. Creates configured custom folders and their Defender exclusions.
+6. Starts app download prefetch with the configured safe parallel limit, runs multi-pass Windows Update in the foreground while those downloads continue, then waits for the prefetch to finish. The prefetch start and wait run only when `parallel.enabled` is true.
+7. Runs activation from config. Disabled by default: nothing happens unless `activation.enabled` is set together with a product key or KMS server, which are accepted only from the git-ignored local override.
+8. Applies QoS and Windows Update bandwidth policies.
+9. Installs configured applications: winget packages, direct installers, v2rayN, PowerShell 7, Windows Terminal, the PowerShell 7 `.ps1` open handler, and Brave extensions.
+10. Configures default browser and media player where Windows allows it.
+11. Sets 7-Zip archive associations for the current user.
+12. Changes the RDP port safely and configures the firewall.
+13. Enables Windows Search Indexing.
+14. Installs the .NET and Visual C++ runtimes.
+15. Installs the EmptyStandbyList scheduled task. Disabled by default.
+16. Installs the RDP brute-force blocker scheduled task.
+17. Disables configured startup entries.
+18. Removes configured Appx packages.
+19. Removes configured Windows capabilities.
+20. Replaces the Edge taskbar pin with Brave where Windows allows it.
+21. Pins configured Quick Access entries.
+22. Runs the health check.
+23. Cleans temp and cache.
+24. Prints the final summary.
+25. Schedules post-reboot SFC and restarts only after all setup tasks finish, when a reboot is required and `autoReboot` is enabled.
 
 ## Configured Applications
 
@@ -162,6 +170,8 @@ Before winget installation, the script removes the `msstore` winget source when 
 | `WinServerSetup.ps1` | Main provisioning script and menu. |
 | `Run-WinServerSetup.ps1` | Auto-elevating launcher. |
 | `WinServerSetup.config.json` | Main configuration file. |
+| `scripts\Config.ps1` | Strict configuration import, git-ignored local-override merge, and validation. Rejects an activation product key in the tracked config. |
+| `scripts\AccountSecurity.ps1` | Built-in Administrator rename and local account-lockout policy, with secret-free recovery records under `backups\`. |
 | `scripts\Prefetch-AppDownloads.ps1` | Background app download prefetch helper. |
 | `scripts\Block-RdpBruteforce.ps1` | Scheduled RDP brute-force blocker. |
 | `scripts\Run-PostRebootSfc.ps1` | One-time post-reboot SFC runner. |
@@ -191,8 +201,20 @@ Important sections:
 | `rdp` | Controls RDP port, old-port blocking, and service restart behavior. |
 | `winget.packages` | Controls winget-installed applications. |
 | `directInstallers` | Controls direct installer downloads. |
+| `v2rayN` | Controls the v2rayN GitHub release install, target folder, shortcuts, and the user data paths preserved across upgrades (part of menu 7). |
+| `windowsTerminal` | Controls Windows Terminal installation, default-terminal registration, and the PowerShell 7 default profile (part of menu 7). |
+| `braveExtensions` | Controls the Brave extension list and whether it is applied through the force-install policy (menu 8). |
 | `runtimes` | Controls .NET and Visual C++ runtime installation. |
+| `defaultApps` | Controls default browser and media player handling and the DISM association XML import (menu 9). |
+| `sevenZipDefaults` | Controls the 7-Zip install path and which archive extensions are associated for the current user (menu 9b). |
+| `taskbar` | Controls unpinning Edge and pinning Brave on the taskbar (menu 19). |
+| `quickAccess` | Controls which folders and whether the Recycle Bin are pinned to Quick Access (menu 20). |
+| `startupDisable` | Controls which startup entries are disabled, matched by name pattern (menu 16). |
+| `removeAppxPackages` | Controls which Appx packages are removed (menu 17). |
+| `removeWindowsCapabilities` | Controls which Windows capabilities are removed (menu 18). |
 | `rdpBruteforceBlocker` | Controls failed-login blocking threshold and schedule. |
+| `administratorAccount` | Controls the built-in Administrator rename and its restore (menus 27 and 29). Disabled by default. **No password field is accepted here**: the new password is only ever read from an interactive hidden prompt, never from any config file. |
+| `accountLockout` | Controls disabling the machine-wide local account lockout policy and its restore (menus 28 and 30). Disabled by default, and no credential value is accepted in the tracked config. |
 | `autoReboot` | Controls final automatic reboot and post-reboot SFC scheduling. |
 | `cleanup` | Controls project download cache cleanup, scoped WinServerSetup user-temp cleanup, Windows temp cleanup, and optional recycle bin cleanup. |
 
@@ -269,13 +291,17 @@ These defaults are deliberately conservative. Each is opt-in because enabling it
 | `activation.enabled`, `activation.productKey`, `activation.kmsServer` | disabled / empty | No third-party KMS server is shipped enabled. Activate only where you hold the legal right; put keys in the git-ignored `WinServerSetup.config.local.json`, never in the tracked config. |
 | `runtimes.includeUnsupportedDotNetVersions` | `false` | Out-of-support runtimes receive no security fixes. |
 | `customFolders.excludeCompressedFromDefender` | `false` | A Defender exclusion on a user-writable Downloads subfolder is a malware-staging path. |
-| `emptyStandbyList.enabled` | `false` | The upstream binary is fetched from a branch, not a pinned release, and would run as `SYSTEM`. |
+| `emptyStandbyList.enabled` | `false` | The upstream binary is unsigned and runs as `SYSTEM`. Enabling it also requires an integrity anchor: either `apps\installers\EmptyStandbyList.exe` locally, or a pinned `emptyStandbyList.expectedSha256`. With neither, the download is refused. |
 | `rdpBruteforceBlocker.includeNetworkLogonType3` | `false` | `LogonType` 3 is not RDP-specific and causes false positives. |
 | `rdpBruteforceBlocker.blockAllInbound` | `false` | Host-wide blocks are far broader than the threat. |
 | `administratorAccount.enabled` | `false` | Renaming the built-in account is an explicit, interactive decision. |
 | `accountLockout.disableLocalAccountLockout` | `false` | Machine-wide: it removes lockout for **every** local account, trading login-flood resistance for unlimited password guessing. Only pair it with a strong password plus RDP allowlisting or VPN. |
 
 Direct installers require a valid Authenticode signature from an expected publisher (`requireValidSignature`, `allowedSignerSubjects`) and are constrained to `allowedDownloadHosts`. Downloads reject non-HTTPS URLs and validate the final URI after redirects.
+
+An `allowedSignerSubjects` entry pins a whole `CN` or `O` value of the certificate subject, compared case-insensitively — `Dolphin` matches `CN=Dolphin` but **not** `CN=Dolphin Emulator`. An entry containing `=` (for example `CN=voidtools, O=voidtools`) is compared against the complete distinguished name instead, so a full DN can be pinned. An entry list that is absent or empty means "no publisher restriction"; it never silently accepts an arbitrary signer.
+
+`emptyStandbyList` ships disabled. When enabled, it uses `apps\installers\EmptyStandbyList.exe` if present; otherwise it downloads from `sourceRepo` at `sourceRef` and **requires** a pinned `expectedSha256`, because that binary is unsigned and is registered as a `SYSTEM` scheduled task. `powershell.expectedSha256` and `runtimes.dotNetFramework481ExpectedSha256` are optional and empty by default: those URLs resolve to the current release, so an empty value means "not pinned" and does not block the download, while a value that is set is enforced.
 
 ## Troubleshooting
 
@@ -368,6 +394,37 @@ The relocated copy must publish a readiness marker containing this run's token a
 ### Restore account-security changes
 
 Both account-security operations write a secret-free recovery record under `backups\` (git-ignored). Passwords are never written to any record, log, or config. Use the paired restore functions to revert the built-in account name or the local lockout policy from the newest record.
+
+## Development and Verification
+
+Runtime scripts must work on **both** Windows PowerShell 5.1 and PowerShell 7. Both hosts parse-check every `.ps1` and run the full test suite, so a change that only works on one host will fail. See [`AGENTS.md`](AGENTS.md) for the full contributor contract, including the `$Global:` state rule, the secrets rule, and the list of PowerShell 5.1 traps that have caused real bugs here.
+
+Run the whole sequence from the repository root before opening a pull request:
+
+```powershell
+# 1. Config is valid JSON
+Get-Content -Raw -Encoding UTF8 .\WinServerSetup.config.json | ConvertFrom-Json | Out-Null
+
+# 2. Parse-check every *.ps1 under PowerShell 7           -> "... 0 failed."
+& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\.github\parse-check.ps1
+
+# 3. Parse-check every *.ps1 under Windows PowerShell 5.1 -> "... 0 failed."
+& 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\.github\parse-check.ps1
+
+# 4. PSScriptAnalyzer at Error + Warning                  -> no output means clean
+$targets  = @('WinServerSetup.ps1', 'Run-WinServerSetup.ps1', 'Publish-ToGitHub.ps1')
+$targets += (Get-ChildItem .\scripts -Filter *.ps1 -File).FullName
+$targets += (Get-ChildItem .\tests   -Filter *.ps1 -File).FullName
+$targets | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Settings .\PSScriptAnalyzerSettings.psd1 }
+
+# 5. Tests under PowerShell 7                             -> "FAILED=0"
+& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\Invoke-AllTests.ps1 -TimeoutSeconds 180
+
+# 6. Tests under Windows PowerShell 5.1                   -> "FAILED=0"
+& 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\Invoke-AllTests.ps1 -TimeoutSeconds 180
+```
+
+Every command must exit 0. Test suites are discovered from disk by `tests\Invoke-AllTests.ps1`, so a newly added `tests\*.Tests.ps1` is picked up automatically; gate on `FAILED=0` rather than on the suite count, which grows over time. CI (`.github/workflows/powershell-lint.yml`) runs exactly this sequence on `windows-latest` for every push and pull request.
 
 ## Public Release Hygiene
 

@@ -59,6 +59,7 @@
     "installLegacyVisualCppRuntimes": true,
     "installDotNetFramework4Plus": true,
     "dotNetFramework481OfflineUrl": "https://go.microsoft.com/fwlink/?linkid=2203305",
+    "dotNetFramework481ExpectedSha256": "",
     "installDotNetCoreRuntimes": true,
     "includeUnsupportedDotNetVersions": false
   },
@@ -211,6 +212,8 @@
   "emptyStandbyList": {
     "enabled": false,
     "sourceRepo": "stefanpejcic/EmptyStandbyList",
+    "sourceRef": "master",
+    "expectedSha256": "",
     "installDir": "C:\\Empty Cache",
     "exeName": "EmptyStandbyList.exe",
     "argument": "standbylist",
@@ -248,6 +251,7 @@
     "enabled": true,
     "githubRepo": "PowerShell/PowerShell",
     "assetNameRegex": "^PowerShell-.*-win-x64\\.msi$",
+    "expectedSha256": "",
     "installLatestFromGitHub": true,
     "forceInstall": false,
     "interactiveInstaller": false,

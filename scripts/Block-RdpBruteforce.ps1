@@ -373,7 +373,13 @@ function Invoke-RdpBruteforceBlocker {
 
         $mutex = New-Object System.Threading.Mutex($false, 'Global\WinServerSetup-RdpBlocker')
         try { $mutexAcquired = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $mutexAcquired = $true }
-        if (-not $mutexAcquired) { throw "Another RDP blocker instance is already running." }
+        if (-not $mutexAcquired) {
+            # A concurrent run is a normal scheduling overlap, not a failure. Returning non-zero
+            # here would set LastTaskResult=1 and make the health check report this security
+            # control as broken.
+            Write-LogLine "Another RDP blocker instance is already running; skipping this run." "INFO"
+            return 0
+        }
 
         $statePath = [string]$settings.statePath
         if ([string]::IsNullOrWhiteSpace($statePath)) { $statePath = Join-Path $projectRoot "state\rdp-blocker-state.json" }

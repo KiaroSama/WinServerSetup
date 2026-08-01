@@ -523,6 +523,28 @@ function Set-RegistryDefaultValue {
     (Get-Item -Path $Path).SetValue('', $Value, [Microsoft.Win32.RegistryValueKind]::String)
 }
 
+function Set-RegistryValue {
+    <#
+        Ensures the key exists, then sets a named value. The ensure-then-set pair was
+        copy-pasted about a dozen times with inconsistent error handling; this is the
+        single definition. -IgnoreErrors reproduces the sites that deliberately wrote
+        best-effort values with -ErrorAction SilentlyContinue.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()]$Value,
+        [Microsoft.Win32.RegistryValueKind]$Type = [Microsoft.Win32.RegistryValueKind]::DWord,
+        [switch]$IgnoreErrors
+    )
+    # Key creation always fails hard: every converted site inherited $ErrorActionPreference='Stop'
+    # for its New-Item. -IgnoreErrors relaxes only the value write, which is the sole place the
+    # best-effort sites used -ErrorAction SilentlyContinue.
+    $ea = if ($IgnoreErrors) { 'SilentlyContinue' } else { 'Stop' }
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
+    Set-ItemProperty -LiteralPath $Path -Name $Name -Type $Type -Value $Value -ErrorAction $ea
+}
+
 function Get-RegistryDefaultValue {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path $Path)) { return $null }
@@ -566,6 +588,40 @@ function Get-SafeDownloadCacheFilePath {
     return $candidate
 }
 
+function Test-SignerSubjectAllowed {
+    param(
+        [Parameter(Mandatory)][string]$Subject,
+        [string[]]$AllowedSignerSubjects = @()
+    )
+    # The single place publisher identity is decided. Matching an entry as a substring of the
+    # whole distinguished name meant an allowlist of "Dolphin" also accepted
+    # "CN=Dolphin Emulator, O=Anyone", so entries are anchored to a whole CN or O value.
+    # An entry containing '=' is treated as a full-DN pin instead.
+    # Returns $false for an empty allowlist; the caller decides what "no allowlist" means.
+    $allowed = @($AllowedSignerSubjects | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($allowed.Count -eq 0) { return $false }
+
+    $values = New-Object System.Collections.Generic.List[string]
+    foreach ($rdn in ($Subject -split ',')) {
+        $parts = $rdn -split '=', 2
+        if ($parts.Count -ne 2) { continue }
+        if ($parts[0].Trim() -notin @('CN', 'O')) { continue }
+        $values.Add($parts[1].Trim().Trim('"')) | Out-Null
+    }
+
+    foreach ($entry in $allowed) {
+        $candidate = ([string]$entry).Trim()
+        if ($candidate.Contains('=')) {
+            if ([string]::Equals($Subject.Trim(), $candidate, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+            continue
+        }
+        foreach ($value in $values) {
+            if ([string]::Equals($value, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+    }
+    return $false
+}
+
 function Test-DownloadedFileSignature {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -579,9 +635,12 @@ function Test-DownloadedFileSignature {
     try {
         $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
         if ($sig.Status -eq 'Valid') {
+            # An absent JSON property arrives as @($null), whose Count of 1 would otherwise enter
+            # the allowlist branch and then match every subject - a silent fail-open.
+            $AllowedSignerSubjects = @($AllowedSignerSubjects | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
             if ($AllowedSignerSubjects.Count -gt 0) {
                 $subject = [string]$sig.SignerCertificate.Subject
-                $matched = @($AllowedSignerSubjects | Where-Object { $subject -like "*$_*" }).Count -gt 0
+                $matched = Test-SignerSubjectAllowed -Subject $subject -AllowedSignerSubjects $AllowedSignerSubjects
                 if (-not $matched) {
                     Write-Warn ("Signer is not allowlisted for {0}." -f (Split-Path -Leaf $Path))
                     Write-StructuredLog -Level SIGNATURE -Message ("Rejected signer: {0}; signer={1}" -f $Path, $subject)
@@ -755,6 +814,9 @@ function Add-RelocationLog {
 function Test-DownloadHostAllowed {
     param([Parameter(Mandatory)][uri]$Uri, [string[]]$AllowedHosts)
     if ($Uri.Scheme -ne 'https') { return $false }
+    # An absent JSON property reaches callers as @($null): Count is 1, so the "no restriction"
+    # shortcut below would be skipped and $null.StartsWith() would throw.
+    $AllowedHosts = @($AllowedHosts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($AllowedHosts.Count -eq 0) { return $true }
     foreach ($allowedHost in $AllowedHosts) {
         if ($allowedHost.StartsWith('*.')) {
@@ -1102,15 +1164,22 @@ function Get-InstalledRegistryDisplayName {
     )
     foreach ($r in $roots) {
         try {
-            Get-ChildItem $r -ErrorAction SilentlyContinue | ForEach-Object {
+            # `return` inside ForEach-Object exits only that iteration, not the function: the
+            # matched name leaks into the pipeline, the scan continues across every remaining key,
+            # and the trailing `return $null` appends a $null - so callers received an array, not a
+            # name. Emit the value instead and take the first match outside the block.
+            $match = Get-ChildItem $r -ErrorAction SilentlyContinue | ForEach-Object {
                 try {
                     $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-                    if ($p -and $p.DisplayName -like "*$NameLike*") { return $p.DisplayName }
+                    if ($p -and $p.DisplayName -like "*$NameLike*") { $p.DisplayName }
                 } catch { $null = $_ }
-            }
+            } | Select-Object -First 1
+            if ($match) { return [string]$match }
         } catch { $null = $_ }
     }
-    return $null
+    # Bare `return`, never `return $null`: $null written to the output stream is exactly how a
+    # caller invoking this as a bare statement gets its own return value corrupted.
+    return
 }
 
 function Invoke-SilentExeInstall {
@@ -1128,6 +1197,27 @@ function Invoke-SilentExeInstall {
     }
     Write-StructuredLog -Level COMMAND -Message ("Installer exit code: {0}" -f $proc.ExitCode)
     return $proc.ExitCode
+}
+
+function Resolve-InstallerExitCode {
+    <#
+        Single definition of what a Windows Installer exit code means.
+        0    = success
+        3010 = success, reboot required
+        1641 = success, reboot already initiated by the installer
+        Anything else is a failure. Keeping this in one place stops each new installer
+        from re-deriving the rule and getting it subtly wrong - the PowerShell 7 MSI path
+        accepted only 0 and 3010, so a successful 1641 was reported as a failure.
+
+        Pure by design: callers decide what to do with RebootPending, so the rule itself
+        is trivially testable without a registry or a real installer.
+    #>
+    param([Parameter(Mandatory)][int]$ExitCode)
+    return [pscustomobject]@{
+        ExitCode      = $ExitCode
+        Succeeded     = ($ExitCode -in @(0, 1641, 3010))
+        RebootPending = ($ExitCode -in @(1641, 3010))
+    }
 }
 
 function Invoke-LoggedCommand {
@@ -1435,7 +1525,7 @@ function Test-WingetPackageInstalled {
     # Fall back to the uninstall registry: a package installed outside winget still lands there.
     try {
         $displayName = ($Id -split '\.') | Select-Object -Last 1
-        if (-not [string]::IsNullOrWhiteSpace($displayName) -and (Get-InstalledRegistryDisplayName -NamePattern $displayName)) {
+        if (-not [string]::IsNullOrWhiteSpace($displayName) -and (Get-InstalledRegistryDisplayName -NameLike $displayName)) {
             Write-StructuredLog -Level WINGET -Message ("Package {0} detected through the uninstall registry." -f $Id)
             return $true
         }
@@ -1467,12 +1557,11 @@ function Enable-FileExtensions {
         return
     }
     $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
     $cur = (Get-ItemProperty -Path $path -Name "HideFileExt" -ErrorAction SilentlyContinue).HideFileExt
     if ($cur -eq 0) {
         Write-Ok "File extensions are already shown in Explorer."
     } else {
-        Set-ItemProperty -Path $path -Name "HideFileExt" -Type DWord -Value 0
+        Set-RegistryValue -Path $path -Name "HideFileExt" -Value 0
         Write-Ok "Enabled 'Show file extensions' in Explorer for current user."
         try {
             $sig = '[DllImport("shell32.dll")] public static extern int SHChangeNotify(int eventId, int flags, IntPtr item1, IntPtr item2);'
@@ -1528,9 +1617,8 @@ function Set-WindowsDarkMode {
         return
     }
     $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
-    Set-ItemProperty -Path $path -Name "AppsUseLightTheme"   -Type DWord -Value 0
-    Set-ItemProperty -Path $path -Name "SystemUsesLightTheme" -Type DWord -Value 0
+    Set-RegistryValue -Path $path -Name "AppsUseLightTheme"   -Value 0
+    Set-RegistryValue -Path $path -Name "SystemUsesLightTheme" -Value 0
 
     # Some Windows 10/11 builds need the shell colorization keys touched too
     # before Start/taskbar pick up the system dark state.
@@ -1539,11 +1627,9 @@ function Set-WindowsDarkMode {
         try { Set-ItemProperty -Path $colorPath -Name "ThemeChangesDesktopIcons" -Value 0 -ErrorAction SilentlyContinue } catch { Write-StructuredLog -Level WARN -Message ("Could not set ThemeChangesDesktopIcons: {0}" -f $_.Exception.Message) }
     }
     $dwmPath = "HKCU:\Software\Microsoft\Windows\DWM"
-    if (-not (Test-Path $dwmPath)) { New-Item -Path $dwmPath -Force | Out-Null }
-    Set-ItemProperty -Path $dwmPath -Name "ColorPrevalence" -Type DWord -Value 0 -ErrorAction SilentlyContinue
+    Set-RegistryValue -Path $dwmPath -Name "ColorPrevalence" -Value 0 -IgnoreErrors
     $accentPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"
-    if (-not (Test-Path $accentPath)) { New-Item -Path $accentPath -Force | Out-Null }
-    Set-ItemProperty -Path $accentPath -Name "StartColorMenu" -Type DWord -Value 0xff202020 -ErrorAction SilentlyContinue
+    Set-RegistryValue -Path $accentPath -Name "StartColorMenu" -Value 0xff202020 -IgnoreErrors
     Write-Ok "Dark mode registry keys set for apps + system."
 
     if ($Global:Config.appearance.restartExplorer) {
@@ -1720,8 +1806,10 @@ function Install-DirectInstaller {
     $verifyName  = [string]$Spec.verifyRegistryName
     $expectedSha256 = if ($Spec.PSObject.Properties.Name -contains "expectedSha256") { [string]$Spec.expectedSha256 } else { "" }
     $requireValidSignature = if ($Spec.PSObject.Properties.Name -contains "requireValidSignature") { [bool]$Spec.requireValidSignature } else { $false }
-    $allowedDownloadHosts = @($Spec.allowedDownloadHosts)
-    $allowedSignerSubjects = @($Spec.allowedSignerSubjects)
+    # An absent JSON property is $null, and @($null) is a ONE-element array, not an empty one.
+    # Unfiltered it defeats every "no restriction configured" shortcut downstream.
+    $allowedDownloadHosts = @($Spec.allowedDownloadHosts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $allowedSignerSubjects = @($Spec.allowedSignerSubjects | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
     if (-not [string]::IsNullOrWhiteSpace($verifyName)) {
         $existing = Get-InstalledRegistryDisplayName -NameLike $verifyName
@@ -1772,8 +1860,9 @@ function Install-DirectInstaller {
     Write-Info "Installing $name silently with args: $silentArgs"
     try {
         $code = Invoke-SilentExeInstall -Path $exePath -Arguments @($silentArgs)
-        if ($code -in @(0, 1641, 3010)) {
-            if ($code -in @(1641, 3010)) { Set-PendingReboot "$name installer returned $code" }
+        $silentResult = Resolve-InstallerExitCode -ExitCode $code
+        if ($silentResult.Succeeded) {
+            if ($silentResult.RebootPending) { Set-PendingReboot "$name installer returned $code" }
             if (Test-DirectInstallerInstalled -Name $name -RegistryName $verifyName) {
                 Write-Ok "$name silent install succeeded and was verified."
                 $null = $Global:RunStats.InstalledApps.Add($name)
@@ -1786,8 +1875,9 @@ function Install-DirectInstaller {
             if ($Spec.fallbackInteractive) {
                 Write-Warn "Silent install may not be supported. Launching the installer interactively..."
                 $interactive = Start-Process -FilePath $exePath -Wait -PassThru -ErrorAction Stop
-                if ($interactive.ExitCode -in @(0, 1641, 3010) -and (Test-DirectInstallerInstalled -Name $name -RegistryName $verifyName)) {
-                    if ($interactive.ExitCode -in @(1641, 3010)) { Set-PendingReboot "$name interactive installer returned $($interactive.ExitCode)" }
+                $interactiveResult = Resolve-InstallerExitCode -ExitCode $interactive.ExitCode
+                if ($interactiveResult.Succeeded -and (Test-DirectInstallerInstalled -Name $name -RegistryName $verifyName)) {
+                    if ($interactiveResult.RebootPending) { Set-PendingReboot "$name interactive installer returned $($interactive.ExitCode)" }
                     $null = $Global:RunStats.InstalledApps.Add("$name (interactive)")
                 } else {
                     Write-Warn "$name interactive install was not independently verified."
@@ -1806,7 +1896,9 @@ function Install-DirectInstaller {
             } catch {
                 Write-Warn "$name interactive fallback could not be started: $($_.Exception.Message)"
             }
-            if ($null -ne $interactive -and $interactive.ExitCode -in @(0, 1641, 3010) -and (Test-DirectInstallerInstalled -Name $name -RegistryName $verifyName)) {
+            # -and short-circuits, so the helper is never handed a null exit code.
+            $fallbackSucceeded = ($null -ne $interactive) -and (Resolve-InstallerExitCode -ExitCode $interactive.ExitCode).Succeeded
+            if ($fallbackSucceeded -and (Test-DirectInstallerInstalled -Name $name -RegistryName $verifyName)) {
                 $null = $Global:RunStats.InstalledApps.Add("$name (interactive)")
             } else {
                 Write-Warn "$name interactive fallback was not independently verified."
@@ -1823,7 +1915,14 @@ function Install-DirectInstaller {
             if ($svc) {
                 Set-Service -Name "Everything" -StartupType Automatic -ErrorAction SilentlyContinue
                 Start-Service -Name "Everything" -ErrorAction SilentlyContinue
-                Write-Ok "Everything service set to Automatic + started."
+                # Both calls above are silenced, so re-read the service and report what actually
+                # happened instead of claiming success unconditionally.
+                $after = Get-Service -Name "Everything" -ErrorAction SilentlyContinue
+                if ($after -and $after.Status -eq 'Running') {
+                    Write-Ok "Everything service set to Automatic and running."
+                } else {
+                    Write-Warn ("Everything service did not reach Running (current: {0})." -f $(if ($after) { $after.Status } else { 'not found' }))
+                }
             }
         } catch { Write-Warn "Could not configure Everything service: $($_.Exception.Message)" }
     }
@@ -2042,7 +2141,12 @@ function Install-LatestPowerShellFromGitHub {
     if (-not $asset) { Write-Warn "No PowerShell asset matched regex $regex"; return }
 
     $msi = Get-SafeDownloadCacheFilePath -FileName ([string]$asset.name)
-    if (-not (Invoke-DownloadFile -Url $asset.browser_download_url -Destination $msi)) { return }
+    # An empty hash means "not pinned", not "refuse": this URL resolves to whatever the latest
+    # GitHub release is, so blocking on an unset hash would break a default run. When the config
+    # sets one, Invoke-DownloadFile enforces it.
+    $expectedSha256 = if ($s.PSObject.Properties.Name -contains "expectedSha256") { [string]$s.expectedSha256 } else { "" }
+    if (-not (Invoke-DownloadFile -Url $asset.browser_download_url -Destination $msi -ExpectedSha256 $expectedSha256 `
+                -AllowedHosts @('github.com', '*.github.com', 'objects.githubusercontent.com', '*.githubusercontent.com'))) { return }
 
     $msiArgs = @("/i", "`"$msi`"")
     if ($s.interactiveInstaller) {
@@ -2055,9 +2159,13 @@ function Install-LatestPowerShellFromGitHub {
     try {
         $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList ($msiArgs -join ' ') -Wait -PassThru -WindowStyle Hidden
         Write-StructuredLog -Level COMMAND -Message ("PowerShell MSI exit code: {0}" -f $proc.ExitCode)
-        if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+        # This path used to accept only 0 and 3010, so an MSI that returned 1641 (success,
+        # reboot already initiated) was reported as a failed install. The shared helper is
+        # the single definition of installer success.
+        $msiResult = Resolve-InstallerExitCode -ExitCode $proc.ExitCode
+        if ($msiResult.Succeeded) {
             Write-Ok "PowerShell installer completed."
-            if ($proc.ExitCode -eq 3010) { Set-PendingReboot "PowerShell 7 installer requested reboot" }
+            if ($msiResult.RebootPending) { Set-PendingReboot "PowerShell 7 installer requested reboot" }
             $null = $Global:RunStats.InstalledApps.Add("PowerShell 7")
         } else {
             Write-Warn "PowerShell installer exited with code $($proc.ExitCode)."
@@ -2103,9 +2211,8 @@ function Install-WindowsTerminal {
 function Set-WindowsTerminalAsDefault {
     Write-Info "Setting Windows Terminal as default terminal (current user)."
     $sk = "HKCU:\Console\%%Startup"
-    if (-not (Test-Path $sk)) { New-Item -Path $sk -Force | Out-Null }
-    Set-ItemProperty -Path $sk -Name "DelegationConsole"  -Type String -Value "{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}"
-    Set-ItemProperty -Path $sk -Name "DelegationTerminal" -Type String -Value "{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}"
+    Set-RegistryValue -Path $sk -Name "DelegationConsole"  -Type String -Value "{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}"
+    Set-RegistryValue -Path $sk -Name "DelegationTerminal" -Type String -Value "{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}"
     Write-Ok "Windows Terminal set as default terminal application."
 }
 
@@ -2230,8 +2337,7 @@ function Set-PowerShell7AsPs1Default {
     $extPath = "HKCU:\Software\Classes\.ps1"
     Set-RegistryDefaultValue -Path $extPath -Value $progId
     $openWithPath = Join-Path $extPath "OpenWithProgids"
-    if (-not (Test-Path $openWithPath)) { New-Item -Path $openWithPath -Force | Out-Null }
-    New-ItemProperty -Path $openWithPath -Name $progId -Value "" -PropertyType String -Force | Out-Null
+    Set-RegistryValue -Path $openWithPath -Name $progId -Type String -Value ""
 
     $userChoice = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.ps1\UserChoice"
     if (Test-Path $userChoice) {
@@ -2414,8 +2520,7 @@ function Set-FileExtensionDefaultHandler {
 
     # HKCU\Software\Classes\<.ext>\OpenWithProgids\<ProgId> = ""
     $owpPath = Join-Path $classPath "OpenWithProgids"
-    if (-not (Test-Path $owpPath)) { New-Item -Path $owpPath -Force | Out-Null }
-    Set-ItemProperty -Path $owpPath -Name $ProgId -Value "" -Type String
+    Set-RegistryValue -Path $owpPath -Name $ProgId -Type String -Value ""
 
     if ($RemoveUserChoice) {
         # If a previous UserChoice exists, Windows enforces it (with a hash) and
@@ -2825,11 +2930,21 @@ function Install-DotNetFramework4Plus {
     $url = [string]$Global:Config.runtimes.dotNetFramework481OfflineUrl
     if ([string]::IsNullOrWhiteSpace($url)) { $url = "https://go.microsoft.com/fwlink/?linkid=2203305" }
     $msi = Get-SafeDownloadCacheFilePath -FileName "NDP481-x86-x64-AllOS-ENU.exe"
-    if (-not (Invoke-DownloadFile -Url $url -Destination $msi)) { return }
+    # An empty hash means "not pinned", not "refuse": this fwlink resolves to the current 4.8.1
+    # package, so blocking on an unset hash would break a default run. When the config sets one,
+    # Invoke-DownloadFile enforces it.
+    $rt = $Global:Config.runtimes
+    $expectedSha256 = if ($rt.PSObject.Properties.Name -contains "dotNetFramework481ExpectedSha256") { [string]$rt.dotNetFramework481ExpectedSha256 } else { "" }
+    if (-not (Invoke-DownloadFile -Url $url -Destination $msi -ExpectedSha256 $expectedSha256 `
+                -AllowedHosts @('go.microsoft.com', '*.microsoft.com', 'download.visualstudio.microsoft.com', '*.download.visualstudio.microsoft.com'))) { return }
     Write-Info "Installing .NET Framework 4.8.1 (passive, no restart)..."
     try {
         $proc = Start-Process -FilePath $msi -ArgumentList "/passive /norestart" -Wait -PassThru -WindowStyle Hidden
         Write-StructuredLog -Level COMMAND -Message (".NET Framework 4.8.1 installer exit code: {0}" -f $proc.ExitCode)
+        # Deliberately NOT routed through Resolve-InstallerExitCode: this installer reports
+        # several distinct outcomes (1638 already-installed, 1602 cancelled, 1603 fatal) and
+        # each success code gets its own message. Collapsing them into Succeeded/RebootPending
+        # would lose that detail for no gain.
         switch ([int]$proc.ExitCode) {
             0 {
                 Write-Ok ".NET Framework 4.8.1 install command finished."
@@ -2978,9 +3093,18 @@ function Install-EmptyStandbyList {
             Copy-Item -LiteralPath $local -Destination $exePath -Force
             Write-Ok "Copied EmptyStandbyList.exe from local installers folder."
         } else {
+            # This binary is unsigned and gets registered as a repeating SYSTEM task, so
+            # Authenticode cannot be the anchor and a pinned hash is the only control left.
+            # Refuse rather than fetch mutable bytes that will run as SYSTEM.
+            $expectedSha256 = if ($s.PSObject.Properties.Name -contains "expectedSha256") { [string]$s.expectedSha256 } else { "" }
+            if ([string]::IsNullOrWhiteSpace($expectedSha256)) {
+                Write-Warn "EmptyStandbyList.exe is not pinned. Put the binary in apps\installers, or set emptyStandbyList.expectedSha256 in config, and re-run."
+                return
+            }
             $repo = [string]$s.sourceRepo
-            $raw  = "https://raw.githubusercontent.com/$repo/master/$exeName"
-            if (-not (Invoke-DownloadFile -Url $raw -Destination $exePath)) {
+            $ref  = if ($s.PSObject.Properties.Name -contains "sourceRef" -and -not [string]::IsNullOrWhiteSpace([string]$s.sourceRef)) { [string]$s.sourceRef } else { "master" }
+            $raw  = "https://raw.githubusercontent.com/$repo/$ref/$exeName"
+            if (-not (Invoke-DownloadFile -Url $raw -Destination $exePath -ExpectedSha256 $expectedSha256 -AllowedHosts @('raw.githubusercontent.com'))) {
                 Write-Warn "Could not obtain EmptyStandbyList.exe. Put it in apps\installers and re-run."
                 return
             }
@@ -3052,12 +3176,10 @@ function Configure-WindowsUpdateBandwidthPolicies {
     Write-Info "Applying QoS / DeliveryOptimization / WindowsUpdate bandwidth policies..."
 
     $qos = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
-    if (-not (Test-Path $qos)) { New-Item -Path $qos -Force | Out-Null }
-    Set-ItemProperty -Path $qos -Name "NonBestEffortLimit" -Type DWord -Value ([int]$s.qosNonBestEffortLimit)
+    Set-RegistryValue -Path $qos -Name "NonBestEffortLimit" -Value ([int]$s.qosNonBestEffortLimit)
 
     $do = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
-    if (-not (Test-Path $do)) { New-Item -Path $do -Force | Out-Null }
-    Set-ItemProperty -Path $do -Name "DODownloadMode" -Type DWord -Value ([int]$s.deliveryOptimizationDownloadMode)
+    Set-RegistryValue -Path $do -Name "DODownloadMode" -Value ([int]$s.deliveryOptimizationDownloadMode)
 
     if ($s.disableUpdateBandwidthLimits) {
         $doLimitValues = @(
@@ -3129,9 +3251,15 @@ function Disable-StartupEntry {
             foreach ($prop in $p.PSObject.Properties) {
                 if ($prop.Name -like 'PS*') { continue }
                 if ([string]$prop.Value -match [regex]::Escape($Pattern) -or $prop.Name -match [regex]::Escape($Pattern)) {
-                    Remove-ItemProperty -Path $k -Name $prop.Name -ErrorAction SilentlyContinue
-                    Write-Ok "Removed startup entry: $k :: $($prop.Name)"
-                    $removedEntries.Add("$k :: $($prop.Name)") | Out-Null
+                    # Only count an entry that really went away; a silenced failure previously made
+                    # this function report a removal it never performed.
+                    try {
+                        Remove-ItemProperty -Path $k -Name $prop.Name -ErrorAction Stop
+                        Write-Ok "Removed startup entry: $k :: $($prop.Name)"
+                        $removedEntries.Add("$k :: $($prop.Name)") | Out-Null
+                    } catch {
+                        Write-Warn "Could not remove startup entry $k :: $($prop.Name): $($_.Exception.Message)"
+                    }
                 }
             }
         } catch { $null = $_ }
@@ -3146,10 +3274,16 @@ function Disable-StartupEntry {
                 $ws = New-Object -ComObject WScript.Shell
                 $target = $ws.CreateShortcut($_.FullName).TargetPath
             } catch { $null = $_ }
+            # Captured before the try: inside catch, $_ is the ErrorRecord, not the shortcut.
+            $shortcutPath = $_.FullName
             if ($_.Name -match [regex]::Escape($Pattern) -or $target -match [regex]::Escape($Pattern)) {
-                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-                Write-Ok "Removed startup shortcut: $($_.FullName)"
-                $removedEntries.Add($_.FullName) | Out-Null
+                try {
+                    Remove-Item $shortcutPath -Force -ErrorAction Stop
+                    Write-Ok "Removed startup shortcut: $shortcutPath"
+                    $removedEntries.Add($shortcutPath) | Out-Null
+                } catch {
+                    Write-Warn "Could not remove startup shortcut ${shortcutPath}: $($_.Exception.Message)"
+                }
             }
         }
     }
@@ -3201,6 +3335,9 @@ function Remove-ConfiguredWindowsCapabilities {
             if (-not $state) { Write-Info "Capability not present: $cap"; continue }
             if ($state.State -eq 'NotPresent') { Write-Ok "Capability already NotPresent: $cap"; continue }
             $dism = Invoke-LoggedCommand -FilePath "dism.exe" -Arguments @("/online", "/Remove-Capability", "/CapabilityName:$cap") -DisplayName "DISM remove capability $cap"
+            # Deliberately NOT routed through Resolve-InstallerExitCode: DISM is not a Windows
+            # Installer package and never returns 1641, so the shared helper would widen the
+            # accepted exit-code set here for no reason.
             if ($dism.ExitCode -eq 0 -or $dism.ExitCode -eq 3010) {
                 Write-Ok "Capability removal command completed: $cap"
                 if ($dism.ExitCode -eq 3010) { Set-PendingReboot "Capability removal requested reboot: $cap" }
