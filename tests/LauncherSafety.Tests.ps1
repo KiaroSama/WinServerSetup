@@ -190,7 +190,8 @@ try {
     Assert-True (-not [string]::IsNullOrWhiteSpace($env:ComSpec)) "The dead-child test needs cmd.exe from ComSpec."
     $deadChild = Start-Process -FilePath $env:ComSpec -ArgumentList '/c exit 3' -PassThru -WindowStyle Hidden
     $null = $deadChild.Handle   # cache the handle so ExitCode stays readable on Windows PowerShell 5.1
-    $deadChild.WaitForExit()
+    Assert-True ($deadChild.WaitForExit(30000)) "The dead-child fixture must exit inside its bounded wait."
+    $deadChild.WaitForExit()    # the bounded overload can leave ExitCode unset on 5.1; this settles it
     Assert-Equal -Expected 3 -Actual $deadChild.ExitCode -Message "The dead-child fixture must exit with code 3."
 
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()

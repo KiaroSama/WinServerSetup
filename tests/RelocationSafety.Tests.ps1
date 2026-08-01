@@ -143,7 +143,8 @@ try {
     $deadChild = Start-Process -FilePath $env:ComSpec -ArgumentList '/c exit 0' -PassThru -WindowStyle Hidden
     # Touch the handle so ExitCode stays readable after the process exits (needed on 5.1).
     $null = $deadChild.Handle
-    $deadChild.WaitForExit()
+    Assert-True ($deadChild.WaitForExit(30000)) "The stand-in child must exit inside its bounded wait."
+    $deadChild.WaitForExit()    # the bounded overload can leave ExitCode unset on 5.1; this settles it
     Assert-True $deadChild.HasExited "The test's stand-in child process must have exited before the wait starts."
 
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
