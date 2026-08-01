@@ -57,7 +57,7 @@ function New-TestProjectDirectory {
     param([string]$Path, [switch]$WithoutScript)
     New-Item -ItemType Directory -Path $Path -Force | Out-Null
     if (-not $WithoutScript) { Set-Content -LiteralPath (Join-Path $Path 'WinServerSetup.ps1') -Value '# placeholder' -Encoding UTF8 }
-    return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    return ConvertTo-CanonicalPath $Path
 }
 
 try {
@@ -68,8 +68,11 @@ try {
 
     # Write-RelocationReadyMarker stamps the marker with the project root it actually loaded from.
     $Global:ProjectRoot = $targetDir
-    $expectedTarget = (Resolve-Path -LiteralPath $targetDir).Path.TrimEnd('\')
-    $otherTarget = (Resolve-Path -LiteralPath $otherDir).Path.TrimEnd('\')
+    # Normalise exactly the way production does. Resolve-Path preserves an 8.3 short spelling
+    # while GetFullPath expands it, so mixing the two makes this suite pass on a developer machine
+    # with a long profile path and fail on a CI runner whose TEMP is C:\Users\RUNNER~1\...
+    $expectedTarget = ConvertTo-CanonicalPath $targetDir
+    $otherTarget = ConvertTo-CanonicalPath $otherDir
 
     # Stand-in for the relaunched child process while it is still alive.
     $liveChild = [pscustomobject]@{ HasExited = $false; ExitCode = 0 }
