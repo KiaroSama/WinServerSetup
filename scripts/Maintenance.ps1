@@ -171,7 +171,9 @@ function Invoke-ActivationIfConfigured {
 # =============================================================================
 function Register-PostRebootSfcTask {
     if (-not $Global:Config.autoReboot.scheduleSfcAfterReboot) { return }
-    $sfcScript = Join-Path $Global:ProjectRoot "scripts\Run-PostRebootSfc.ps1"
+    # Canonical, like the blocker's script path: the trust validation below and the argument
+    # pattern the health check matches must both name the same spelling of the same file.
+    $sfcScript = ConvertTo-CanonicalPath (Join-Path $Global:ProjectRoot "scripts\Run-PostRebootSfc.ps1")
     if (-not (Test-Path $sfcScript)) {
         Write-Warn "Post-reboot SFC helper not found: $sfcScript"
         return

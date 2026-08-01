@@ -167,7 +167,12 @@ function Invoke-BlockerVerificationRun {
     $script:VerificationRuns++
 }
 
-$testRoot = Join-Path $env:TEMP ("WinServerSetup-BlockerTask-{0}" -f ([guid]::NewGuid().ToString("N")))
+# GetFullPath, not a bare Join-Path: the code under test canonicalises every path it validates
+# through ConvertTo-CanonicalPath, and GetFullPath EXPANDS an 8.3 alias while Join-Path preserves
+# it. GitHub Actions windows-latest exposes %TEMP% as C:\Users\RUNNER~1\AppData\Local\Temp, so
+# without this the mocked ACL lookups below are keyed on the short spelling, the production code
+# asks about the long one, no key ever matches, and every H-02 case silently stops refusing.
+$testRoot = [System.IO.Path]::GetFullPath((Join-Path $env:TEMP ("WinServerSetup-BlockerTask-{0}" -f ([guid]::NewGuid().ToString("N")))))
 $previousConfig = $Global:Config
 $previousRoot = $Global:ProjectRoot
 $previousConfigPath = $Global:ConfigPath
@@ -518,19 +523,53 @@ try {
                     [System.Security.AccessControl.AccessControlType]::Allow)))
         Set-Acl -LiteralPath $aclDir -AclObject $probeAcl
         try {
+            # Every assertion below reads the DACL that was written. Nothing here depends on what
+            # THIS process can still open, so the case behaves identically whether the test host
+            # is elevated (CI, where the process stays in BUILTIN\Administrators and therefore
+            # keeps full access to the hardened directory) or not (a normal developer shell).
+            # Resolved from the well-known SID rather than the name, which is localizable.
+            $usersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+            $usersName = ''
+            try { $usersName = [string]$usersSid.Translate([System.Security.Principal.NTAccount]).Value } catch { $usersName = '' }
+            $writeMask = [int]([System.Security.AccessControl.FileSystemRights]::Write -bor
+                [System.Security.AccessControl.FileSystemRights]::Delete -bor
+                [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                [System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+            function Get-ProbeUsersAce {
+                return @((Get-Acl -LiteralPath $aclDir).Access | Where-Object {
+                        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                        [string]$_.IdentityReference.Value -in @($usersSid.Value, $usersName)
+                    })
+            }
+
+            # Precondition: the ACE this case plants really does grant a write-class right, so the
+            # "after" assertion cannot pass vacuously.
+            $before = @(Get-ProbeUsersAce)
+            Assert-True ($before.Count -ge 1) "H-02: the probe must actually grant BUILTIN\Users an ACE before hardening."
+            Assert-True (@($before | Where-Object { ([int]$_.FileSystemRights -band $writeMask) -ne 0 }).Count -ge 1) `
+                "H-02: the planted ACE must really carry a write-class right, or the hardening assertion proves nothing."
             Assert-Equal $false (Test-TrustedTaskTargetPath -Path $aclDir).Trusted `
                 "H-02: a directory a non-administrative SID can write must be reported as an untrusted task target."
+
             Initialize-TrustedTaskAcl -Path $aclDir | Out-Null
+
+            # The security property itself, read straight off the resulting DACL and independent of
+            # Get-UntrustedAclWriter, so a defect in that helper cannot make both sides agree.
+            $after = @(Get-ProbeUsersAce)
+            Assert-Equal 0 (@($after | Where-Object { ([int]$_.FileSystemRights -band $writeMask) -ne 0 }).Count) `
+                "H-02: BUILTIN\Users must keep no write, delete or ownership right on a hardened SYSTEM task target."
+            Assert-Equal $true (Get-Acl -LiteralPath $aclDir).AreAccessRulesProtected `
+                "H-02: hardening must disable inheritance, or a permissive parent re-opens the hole."
             Assert-Equal $true (Test-TrustedTaskTargetPath -Path $aclDir).Trusted `
                 "H-02: hardening must actually remove every non-administrative writer from a real DACL."
             Assert-Equal 0 (@(Get-UntrustedAclWriter -Path $aclDir).Count) "H-02: no untrusted writer may remain after hardening."
         } finally {
-            # Once the hardening works this non-elevated test process has no access left to the
-            # probe directory: Remove-Item cannot open it and Set-Acl cannot hand the access back
-            # (that needs SeSecurityPrivilege). Removing the EMPTY directory is authorised by the
-            # parent's DELETE_CHILD instead, which %TEMP% still grants. In a finally, because a
-            # failed assertion would otherwise leave an undeletable directory behind.
-            [System.IO.Directory]::Delete($aclDir, $false)
+            # Correct at either privilege level: an elevated run still holds Administrators
+            # FullControl on the hardened directory, and a non-elevated run - which has no access
+            # left to it at all - is authorised by the parent's DELETE_CHILD, which %TEMP% grants.
+            # Wrapped so cleanup can never mask the assertion that actually failed.
+            try { [System.IO.Directory]::Delete($aclDir, $false) }
+            catch { Remove-Item -LiteralPath $aclDir -Recurse -Force -ErrorAction SilentlyContinue }
         }
     }
 
