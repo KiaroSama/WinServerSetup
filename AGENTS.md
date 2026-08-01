@@ -76,6 +76,22 @@ The runner's summary line reports both a suite count and a failure count
 (`HOST=...  SUITES=n  FAILED=0`). Gate on `FAILED=0`; the suite count grows as suites
 are added, so do not treat any particular number as the pass condition.
 
+Shared assertions live in `tests\_Common.ps1` — `Assert-True`, `Assert-Equal` and
+`Import-FunctionUnderTest`. Dot-source it **after** `$projectRoot` (and `$mainScript`,
+where the suite takes a `-MainScript` override) and **before** the first assertion:
+
+```powershell
+. (Join-Path $PSScriptRoot '_Common.ps1')
+```
+
+It is not picked up as a suite because discovery filters on `*.Tests.ps1`. A suite that
+needs different behaviour just defines its own copy afterwards, which shadows the shared
+one. `Import-FunctionUnderTest` takes the parsed ASTs as a second argument —
+`Import-FunctionUnderTest $name $setupAsts` — rather than reading the caller's
+`$setupAsts` implicitly; reaching across the file boundary works at runtime but is
+invisible to PSScriptAnalyzer, which then flags each suite's own `$setupAsts` as
+assigned-and-never-used.
+
 ## PowerShell 5.1 traps
 
 Each of these caused a real bug in this repository. Check new code against the list —
