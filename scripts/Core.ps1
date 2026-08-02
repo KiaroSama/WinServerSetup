@@ -704,32 +704,35 @@ function Invoke-SelfRelocateIfNeeded {
     $target = [string]$Global:Config.targetProjectRoot
     if ([string]::IsNullOrWhiteSpace($target)) { $target = "C:\portable\Scripts\WinServerSetup" }
 
-    $currentFull = (Resolve-Path -LiteralPath $Global:ProjectRoot).Path.TrimEnd('\')
-    $targetFull  = $target.TrimEnd('\')
+    # ConvertTo-CanonicalPath on BOTH sides. Resolve-Path is deliberately not used here: it
+    # PRESERVES whatever spelling it was handed (an 8.3 alias stays short) while the config value
+    # arrived normalised by nothing at all, so "already installed at the target" was decided by
+    # string spelling rather than by identity. A short-name $PSScriptRoot, a forward-slash or
+    # dot-segment config value, or a stray trailing space each missed the match and relocated the
+    # install onto itself - and the pre-copy guard below does not catch it, because an identical
+    # pair is neither nested nor a drive root.
+    $currentFull = ConvertTo-CanonicalPath $Global:ProjectRoot
+    $targetFull  = ConvertTo-CanonicalPath $target
 
     if ([string]::Equals($currentFull, $targetFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Write-StartupLine -State "SKIP" -Label "Running from" -Value $target -ValueKind "StartupPath"
+        Write-StartupLine -State "SKIP" -Label "Running from" -Value $targetFull -ValueKind "StartupPath"
         return $false
     }
 
     # The deferred cleanup script refuses a nested or root pair, but it only runs AFTER robocopy
     # has copied - so a target inside the source was copied into itself first and merely left
     # behind as a duplicated, recursed tree. The same verdict has to gate the copy itself.
-    # GetFullPath on BOTH sides, never mixed with the Resolve-Path above: it expands 8.3 short
-    # names while Resolve-Path preserves them, so comparing one of each silently mismatches.
-    $comparableSource = [System.IO.Path]::GetFullPath($currentFull).TrimEnd('\')
-    $comparableTarget = [System.IO.Path]::GetFullPath($targetFull).TrimEnd('\')
-    $sourceRoot = [System.IO.Path]::GetPathRoot($comparableSource).TrimEnd('\')
-    $targetRoot = [System.IO.Path]::GetPathRoot($comparableTarget).TrimEnd('\')
-    if ([string]::Equals($comparableSource, $sourceRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-        [string]::Equals($comparableTarget, $targetRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $comparableTarget.StartsWith($comparableSource + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
-        $comparableSource.StartsWith($comparableTarget + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw ("Refusing to relocate: '{0}' and '{1}' are the same tree, one contains the other, or one is a drive root." -f $comparableSource, $comparableTarget)
+    $sourceRoot = [System.IO.Path]::GetPathRoot($currentFull).TrimEnd('\')
+    $targetRoot = [System.IO.Path]::GetPathRoot($targetFull).TrimEnd('\')
+    if ([string]::Equals($currentFull, $sourceRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($targetFull, $targetRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $targetFull.StartsWith($currentFull + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+        $currentFull.StartsWith($targetFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw ("Refusing to relocate: '{0}' and '{1}' are the same tree, one contains the other, or one is a drive root." -f $currentFull, $targetFull)
     }
 
     Write-StartupLine -State "RUN" -Label "Relocating project to" -Value $targetFull -ValueKind "StartupPath"
-    $parent = Split-Path -Parent $target
+    $parent = Split-Path -Parent $targetFull
     Ensure-Directory $parent
     $targetLogDir = Join-Path $targetFull "logs"
     $relocateLog = Join-Path $targetLogDir ("WinServerSetup-relocate-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
