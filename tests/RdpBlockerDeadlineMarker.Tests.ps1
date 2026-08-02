@@ -199,7 +199,7 @@ exit [int]$code
         "FU-04: a run ended by its deadline guard must exit with the dedicated timeout code, never 0 - exit 0 made Task Scheduler and installer verification treat the timeout as success."
 
     # ---- 4a: installer verification must reject that exit code. ----
-    $setupSourceFiles = @($mainScript) + @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance' |
+    $setupSourceFiles = @($mainScript) + @('Console', 'Core', 'Download', 'Rdp', 'RdpBlockerTask', 'Install', 'AppIntegration', 'Runtimes', 'SystemSettings', 'Maintenance' |
             ForEach-Object { Join-Path $projectRoot ("scripts\{0}.ps1" -f $_) }) | Where-Object { Test-Path -LiteralPath $_ }
     $setupAsts = @(foreach ($file in $setupSourceFiles) {
             $tokens = $null; $parseErrors = $null

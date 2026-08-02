@@ -22,6 +22,15 @@ function Assert-True {
     if (-not $Condition) { throw $Message }
 }
 
+function Assert-Contains {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$Pattern,
+        [Parameter(Mandatory)][string]$Message
+    )
+    if ($Text -notmatch $Pattern) { throw $Message }
+}
+
 function Assert-Equal {
     param($Expected, $Actual, [string]$Message)
     if ($Expected -ne $Actual) { throw ("{0} Expected={1}; Actual={2}" -f $Message, $Expected, $Actual) }
@@ -44,7 +53,7 @@ function Get-SetupSourceFile {
         [string]$MainScript = ""
     )
     $entry = if ([string]::IsNullOrWhiteSpace($MainScript)) { Join-Path $ProjectRoot 'WinServerSetup.ps1' } else { $MainScript }
-    $names = @('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance' |
+    $names = @('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'RdpBlockerTask', 'Install', 'AppIntegration', 'Runtimes', 'SystemSettings', 'Maintenance' |
             ForEach-Object { "scripts\{0}.ps1" -f $_ })
     return @(@($entry) + @($names | ForEach-Object { Join-Path $ProjectRoot $_ })) |
         Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique

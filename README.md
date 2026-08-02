@@ -174,8 +174,11 @@ Before winget installation, the script removes the `msstore` winget source when 
 | `scripts\Console.ps1` | Console output, the themed banner and menu, structured logging, and the active timer. |
 | `scripts\Core.ps1` | Config access, registry and filesystem helpers, download trust (host allowlist, publisher pinning), reboot handling, and self-relocation. |
 | `scripts\Download.ps1` | File download with retry and integrity verification, logged process execution, and winget resolution. |
-| `scripts\Rdp.ps1` | RDP port migration, firewall rules, and brute-force blocker installation. |
-| `scripts\Install.ps1` | winget packages, direct installers, v2rayN, PowerShell 7, Windows Terminal, browser and default-app configuration, and runtimes. |
+| `scripts\Rdp.ps1` | RDP listener checks, the operator port prompt, and the port migration with its firewall rule and rollback. |
+| `scripts\RdpBlockerTask.ps1` | Installing and health-checking the brute-force blocker SYSTEM scheduled task: target trust validation, staging, the trust manifest, and the registration contract. |
+| `scripts\Install.ps1` | The shared check-then-update decision, winget packages, direct installers, and v2rayN. |
+| `scripts\AppIntegration.ps1` | Applications that are installed and then wired into the shell: PowerShell 7, Windows Terminal and the `.ps1` handler, Brave and its extension policy, 7-Zip associations, and default apps. |
+| `scripts\Runtimes.ps1` | The .NET Framework, .NET desktop/core and Visual C++ runtimes. |
 | `scripts\SystemSettings.ps1` | Explorer and appearance settings, optimisation, cleanup, Quick Access, and taskbar pins. |
 | `scripts\Maintenance.ps1` | Windows Update, activation, post-reboot SFC, health check, and the final summary. |
 | `scripts\Config.ps1` | Strict configuration import, git-ignored local-override merge, and validation. Rejects an activation product key in the tracked config. |

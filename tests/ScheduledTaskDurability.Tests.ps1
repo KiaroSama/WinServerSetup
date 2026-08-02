@@ -21,7 +21,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 # WinServerSetup.ps1 dot-sources its function library from scripts\; the source assertions
 # below cover that whole partition.
-$main = (@('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance' |
+$main = (@('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'RdpBlockerTask', 'Install', 'AppIntegration', 'Runtimes', 'SystemSettings', 'Maintenance' |
         ForEach-Object { "scripts\{0}.ps1" -f $_ }) |
     ForEach-Object { Join-Path $projectRoot $_ } |
     Where-Object { Test-Path -LiteralPath $_ } |

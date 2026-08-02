@@ -120,7 +120,10 @@ $Global:WinServerSetupAnsiSupported = $null
 . (Join-Path $Global:ProjectRoot "scripts\Core.ps1")
 . (Join-Path $Global:ProjectRoot "scripts\Download.ps1")
 . (Join-Path $Global:ProjectRoot "scripts\Rdp.ps1")
+. (Join-Path $Global:ProjectRoot "scripts\RdpBlockerTask.ps1")
 . (Join-Path $Global:ProjectRoot "scripts\Install.ps1")
+. (Join-Path $Global:ProjectRoot "scripts\AppIntegration.ps1")
+. (Join-Path $Global:ProjectRoot "scripts\Runtimes.ps1")
 . (Join-Path $Global:ProjectRoot "scripts\SystemSettings.ps1")
 . (Join-Path $Global:ProjectRoot "scripts\Maintenance.ps1")
 
@@ -300,7 +303,7 @@ function Invoke-SetupStepWaveConcurrently {
                     $Global:ConfigPath = $ConfigPath
                     $Global:Config = $Config
                     $Global:CurrentStepSkipReason = $null
-                    foreach ($module in @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance')) {
+                    foreach ($module in @('Console', 'Core', 'Download', 'Rdp', 'RdpBlockerTask', 'Install', 'AppIntegration', 'Runtimes', 'SystemSettings', 'Maintenance')) {
                         . (Join-Path $ProjectRoot ("scripts\{0}.ps1" -f $module))
                     }
                     try {
