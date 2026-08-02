@@ -13,10 +13,11 @@ GitHub: https://github.com/KiaroSama
 - Unified color menu-driven and full unattended setup modes. Pressing Enter at `Select: [1]` runs the full setup by default.
 - Multi-pass Windows Update with Microsoft Update support and reboot suppression.
 - Application download prefetch while Windows Update is running.
-- Sequential application installation so only one installer runs at a time.
+- Sequential application installation so only one installer runs at a time — Windows Installer serialises MSIs behind a machine-global mutex, so running them concurrently would save nothing and produce spurious failures.
+- Applications that are already installed are updated in the directory they are installed in, rather than installed a second time in the default location.
 - Optional SHA256 and required Authenticode validation for direct installer downloads.
 - Dark mode, Explorer file extensions, Windows long paths, Persian keyboard layout, and Windows Search Indexing.
-- Safe RDP port change to TCP `5801` with firewall verification before registry changes.
+- Safe RDP port change: setup asks which port to use (the configured `rdp.newPort` is the offered default), opens the new port in the firewall before touching the registry, restarts the Remote Desktop service, verifies it owns the new port, and only then blocks the old one. Any failure rolls back and leaves the previous port reachable.
 - Hidden, highest-privilege scheduled tasks for EmptyStandbyList, RDP brute-force blocking, and post-reboot SFC.
 - PowerShell 7 install, Windows Terminal default profile configuration, and `.ps1` open handler setup.
 - 7-Zip archive file associations for the current user.
@@ -106,8 +107,8 @@ Run from the current folder without self-relocation:
 
 The full setup workflow performs these actions:
 
-1. Applies configured account security: the built-in Administrator rename and the machine-wide local account lockout policy. Both are disabled by default, both are skipped entirely when `-NoPause` is set, and each can be placed behind an interactive confirmation with its `promptDuringFullSetup` flag.
-2. Applies dark mode and shows file extensions.
+1. Applies configured account security: the built-in Administrator rename and the machine-wide local account lockout policy. Both are disabled by default and each can be placed behind an interactive confirmation with its `promptDuringFullSetup` flag. The rename asks for the new account name (`administratorAccount.defaultNewName` is the offered default) and always renames the existing built-in account, identified by its RID-500 SID rather than by name — it never creates a new account. Under `-NoPause` it uses the configured name and logs that it did so.
+2. Applies dark mode and shows file extensions. These and the next three steps run concurrently when `parallel.enabled` is set; steps that touch the same thing (both Explorer, for example) still run one at a time.
 3. Enables Windows long paths.
 4. Adds the Persian keyboard layout without removing existing layouts.
 5. Creates configured custom folders and their Defender exclusions.
@@ -117,7 +118,7 @@ The full setup workflow performs these actions:
 9. Installs configured applications: winget packages, direct installers, v2rayN, PowerShell 7, Windows Terminal, the PowerShell 7 `.ps1` open handler, and Brave extensions.
 10. Configures default browser and media player where Windows allows it.
 11. Sets 7-Zip archive associations for the current user.
-12. Changes the RDP port safely and configures the firewall.
+12. Changes the RDP port safely and configures the firewall, prompting for the port first. See the RDP note above for the ordering that keeps the session alive.
 13. Enables Windows Search Indexing.
 14. Installs the .NET and Visual C++ runtimes.
 15. Installs the EmptyStandbyList scheduled task. Disabled by default.
@@ -237,7 +238,7 @@ Logs are written under the resolved project `logs` directory:
 | --- | --- |
 | `Run-WinServerSetup_<timestamp>_UTC.log` | Launcher diagnostics, elevation flow, resolved paths, selected PowerShell host, Windows Terminal session detection, selected launcher route, forwarded switches, launch exit code, and launcher failures. |
 | `WinServerSetup-<timestamp>.log` | Console transcript. |
-| `WinServerSetup-structured-<timestamp>.log` | Structured task, command, output, warning, and summary log. |
+| `WinServerSetup_<yyyy-MM-dd_HH-mm-ss>_UTC.log` | Per-run diagnostic log: `[timestamp UTC] [LEVEL] [COMPONENT] message`, covering startup and shutdown, resolved paths, configuration load, each step's start and result, external commands and their exit codes, warnings, exceptions, and the final status. Created atomically, so a previous run's log is never overwritten. Secrets are redacted at every sink. |
 | `WinServerSetup-prefetch-<timestamp>.log` | Background app prefetch log. |
 | `rdp-blocker.log` | RDP brute-force blocker log. |
 | `sfc-result.log` | Post-reboot SFC result log. |
