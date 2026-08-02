@@ -1170,40 +1170,32 @@ function Install-RequestedWingetRuntime {
     foreach ($package in $Packages) { Install-WingetRuntimePackage -Name $package.Name -Id $package.Id }
 }
 
-function Install-DotNetDesktopRuntimes {
-    if (-not $Global:Config.runtimes.installDotNetDesktopRuntimes) { return }
+# The two .NET runtime families differ only in their winget id prefix and display label - same
+# config gate, same unsupported/supported split, same version numbers. Kept as one builder so a
+# new .NET release is added in one place instead of two that can silently drift apart.
+function Install-DotNetRuntimeFamily {
+    param(
+        [Parameter(Mandatory)][string]$ConfigKey,
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string]$IdPrefix
+    )
+    if (-not $Global:Config.runtimes.$ConfigKey) { return }
     $packages = @()
     if ($Global:Config.runtimes.includeUnsupportedDotNetVersions) {
-        $packages += @(
-            @{ Name = ".NET Desktop Runtime 5 x64 (unsupported)"; Id = "Microsoft.DotNet.DesktopRuntime.5" },
-            @{ Name = ".NET Desktop Runtime 6 x64 (unsupported)"; Id = "Microsoft.DotNet.DesktopRuntime.6" },
-            @{ Name = ".NET Desktop Runtime 7 x64 (unsupported)"; Id = "Microsoft.DotNet.DesktopRuntime.7" }
-        )
+        $packages += @(5, 6, 7 | ForEach-Object { @{ Name = "$Label $_ x64 (unsupported)"; Id = "$IdPrefix.$_" } })
     }
-    $packages += @(
-        @{ Name = ".NET Desktop Runtime 8 x64"; Id = "Microsoft.DotNet.DesktopRuntime.8" },
-        @{ Name = ".NET Desktop Runtime 9 x64"; Id = "Microsoft.DotNet.DesktopRuntime.9" },
-        @{ Name = ".NET Desktop Runtime 10 x64"; Id = "Microsoft.DotNet.DesktopRuntime.10" }
-    )
+    $packages += @(8, 9, 10 | ForEach-Object { @{ Name = "$Label $_ x64"; Id = "$IdPrefix.$_" } })
     Install-RequestedWingetRuntime -Packages $packages
 }
 
+function Install-DotNetDesktopRuntimes {
+    Install-DotNetRuntimeFamily -ConfigKey 'installDotNetDesktopRuntimes' `
+        -Label '.NET Desktop Runtime' -IdPrefix 'Microsoft.DotNet.DesktopRuntime'
+}
+
 function Install-DotNetCoreRuntimes {
-    if (-not $Global:Config.runtimes.installDotNetCoreRuntimes) { return }
-    $packages = @()
-    if ($Global:Config.runtimes.includeUnsupportedDotNetVersions) {
-        $packages += @(
-            @{ Name = ".NET Runtime 5 x64 (unsupported)"; Id = "Microsoft.DotNet.Runtime.5" },
-            @{ Name = ".NET Runtime 6 x64 (unsupported)"; Id = "Microsoft.DotNet.Runtime.6" },
-            @{ Name = ".NET Runtime 7 x64 (unsupported)"; Id = "Microsoft.DotNet.Runtime.7" }
-        )
-    }
-    $packages += @(
-        @{ Name = ".NET Runtime 8 x64"; Id = "Microsoft.DotNet.Runtime.8" },
-        @{ Name = ".NET Runtime 9 x64"; Id = "Microsoft.DotNet.Runtime.9" },
-        @{ Name = ".NET Runtime 10 x64"; Id = "Microsoft.DotNet.Runtime.10" }
-    )
-    Install-RequestedWingetRuntime -Packages $packages
+    Install-DotNetRuntimeFamily -ConfigKey 'installDotNetCoreRuntimes' `
+        -Label '.NET Runtime' -IdPrefix 'Microsoft.DotNet.Runtime'
 }
 
 # NOTE: ASP.NET Core Runtimes are intentionally NOT installed (item 31). The shipped

@@ -84,6 +84,10 @@ function Assert-ConfigNode {
         if ($Value -isnot [array]) {
             throw ("Config type mismatch at {0}: expected a JSON array, actual {1}." -f $Path, $actual)
         }
+        # -AllowPartial deliberately does NOT propagate into elements. Merge-ConfigObject replaces
+        # an overriding array wholesale rather than merging element by element, so a partial
+        # element would survive the merge with its other keys missing. Every element of an
+        # override array must therefore be complete. Do not "fix" this by threading the switch.
         for ($index = 0; $index -lt $Value.Count; $index++) {
             Assert-ConfigNode -Value $Value[$index] -Spec $Spec[0] -Path ("{0}[{1}]" -f $Path, $index)
         }

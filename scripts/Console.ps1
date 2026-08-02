@@ -240,7 +240,6 @@ function Initialize-ActiveTimer {
     if (-not $Global:OpStopwatch) { $Global:OpStopwatch = [System.Diagnostics.Stopwatch]::new() }
 }
 function Start-ActiveTimer    { Initialize-ActiveTimer; $Global:OpStopwatch.Reset(); $Global:OpStopwatch.Start() }
-function Suspend-ActiveTimer  { if ($Global:OpStopwatch -and $Global:OpStopwatch.IsRunning) { $Global:OpStopwatch.Stop() } }
 function Resume-ActiveTimer   { if ($Global:OpStopwatch -and -not $Global:OpStopwatch.IsRunning -and $Global:OpStopwatch.Elapsed -gt [TimeSpan]::Zero) { $Global:OpStopwatch.Start() } }
 function Stop-ActiveTimer     { if ($Global:OpStopwatch -and $Global:OpStopwatch.IsRunning) { $Global:OpStopwatch.Stop() } }
 function Get-ActiveTimerElapsed { if (-not $Global:OpStopwatch) { return [TimeSpan]::Zero }; return $Global:OpStopwatch.Elapsed }
@@ -329,7 +328,7 @@ function Invoke-RecordedSetupStep {
 function Read-AnyKeyThemed {
     param([string]$Prompt = "Press any key to continue...")
     $wasRunning = ($Global:OpStopwatch -and $Global:OpStopwatch.IsRunning)
-    Suspend-ActiveTimer
+    Stop-ActiveTimer
     try {
         Write-Themed $Prompt -Kind Prompt
         try {
@@ -351,7 +350,7 @@ function Read-HostThemed {
         [string]$DefaultValue = ""
     )
     $wasRunning = ($Global:OpStopwatch -and $Global:OpStopwatch.IsRunning)
-    Suspend-ActiveTimer
+    Stop-ActiveTimer
     try {
         Write-Themed ($Prompt + ": ") -Kind Prompt -NoNewline
         if (-not [string]::IsNullOrWhiteSpace($DefaultValue)) {

@@ -58,21 +58,10 @@ function Assert-Throws {
 # partition so extraction by name keeps working wherever a function lives. $mainScript is
 # searched first, so a -MainScript copy still shadows the on-disk original when replaying
 # against a deliberately defective build.
-$setupSourceNames = @('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance' |
-        ForEach-Object { "scripts\{0}.ps1" -f $_ })
-$setupSourceFiles = @(@($mainScript) + @($setupSourceNames | ForEach-Object { Join-Path $projectRoot $_ })) |
-    Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique
-
-# The retained source greps cover the same partition.
+$setupSourceFiles = @(Get-SetupSourceFile -ProjectRoot $projectRoot -MainScript $mainScript)
+$setupAsts = @(Get-SetupAst -Files $setupSourceFiles -Because 'its Windows Update path can be tested')
+# Raw text of the same partition, for the retained source assertions further down.
 $source = ($setupSourceFiles | ForEach-Object { Get-Content -LiteralPath $_ -Raw -Encoding UTF8 }) -join "`r`n"
-
-$setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
-        $tokens = $null
-        $parseErrors = $null
-        $fileAst = [System.Management.Automation.Language.Parser]::ParseFile($setupFile, [ref]$tokens, [ref]$parseErrors)
-        Assert-True ($parseErrors.Count -eq 0) "$setupFile must parse before its Windows Update path can be tested."
-        $fileAst
-    })
 
 foreach ($name in @('Invoke-WithPSGalleryTrust', 'Initialize-WindowsUpdateEnvironment',
         'Wait-WindowsUpdateJob', 'Invoke-WindowsUpdatePass', 'Invoke-SystemUpdate')) {
