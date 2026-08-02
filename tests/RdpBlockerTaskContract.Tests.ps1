@@ -46,7 +46,7 @@ foreach ($name in @('Get-TermServiceProcessId', 'Test-TermServiceOwnsTcpPort', '
         'Copy-TaskTargetToStaging', 'Save-StagedTaskConfig',
         'Get-TaskTrustManifestPath', 'Save-TaskTrustManifest', 'Get-TaskTrustManifest',
         'ConvertFrom-ScheduledTaskDuration', 'ConvertFrom-ScheduledTaskArgument', 'Test-BlockerTaskArgumentContract',
-        'Get-BlockerExecutionTimeLimitMinutes', 'New-BlockerTaskArgument', 'Test-RdpBlockerTaskHealth',
+        'Get-BlockerExecutionTimeLimitMinutes', 'New-BlockerTaskArgument', 'Get-BlockerDeadlineMarkerPath', 'Test-RdpBlockerTaskHealth',
         'Get-TrustedPrincipalSid', 'Install-RdpBruteforceBlocker')) {
     . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
 }
@@ -570,6 +570,27 @@ try {
     $script:UntrustedWriters[(Get-TaskTrustManifestPath -TaskName $taskName)] = @('BUILTIN\Users (S-1-5-32-545) : Modify')
     Assert-Equal $false (Test-RdpBlockerTaskHealth -TaskName $taskName) `
         "H-02: a writable trust manifest is not a trust boundary and must not be believed."
+
+    # ---- FU-04 A deadline marker means the last run was killed mid-pass. ----
+    # Task Scheduler cannot describe that outcome on its own: the process was ended from inside,
+    # so LastTaskResult only carries the exit code and the run still looks like it "ran". The
+    # marker outlives the run and is the durable evidence, so the health check has to read it.
+    $task = Reset-HealthyTask
+    $markerPath = Get-BlockerDeadlineMarkerPath
+    Assert-True (-not [string]::IsNullOrWhiteSpace($markerPath)) `
+        "FU-04: the health check must be able to derive a marker path; an empty one would silently disable this case."
+    $markerParent = Split-Path -Parent $markerPath
+    if (-not (Test-Path -LiteralPath $markerParent)) { Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $markerParent -Force | Out-Null }
+    Microsoft.PowerShell.Management\Set-Content -LiteralPath $markerPath -Encoding UTF8 `
+        -Value '[2026-01-01 00:00:00 UTC] [CRITICAL] [RDP-BLOCKER] The run exceeded maxRunSeconds (5s) inside a blocking call and was ended by the deadline guard.'
+    try {
+        Assert-Equal $false (Test-RdpBlockerTaskHealth -TaskName $taskName) `
+            "FU-04: a task whose last run was ended by its deadline guard must NOT report healthy while the marker stands - otherwise a control that keeps timing out looks fine."
+    } finally {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+    }
+    Assert-Equal $true (Test-RdpBlockerTaskHealth -TaskName $taskName) `
+        "FU-04: once the marker is gone - which only a successful run does - the task must report healthy again."
 
     # =========================================================================================
     # H-02 - the blocker is not the only SYSTEM task. The post-reboot SFC task runs as SYSTEM at

@@ -761,6 +761,119 @@ function Remove-ExpiredManagedRules {
     }
 }
 
+$script:BlockerDeadlineExitCode = 124
+
+function Initialize-DeadlineMarkerDirectory {
+    <#
+        FU-04: the watchdog runs inside a blocking call, so it cannot create directories or make
+        decisions - all it may do is write one file and end the process. The parent of that file
+        therefore has to exist, and be trustworthy, BEFORE the guard is armed.
+
+        This used to be left to Write-BlockerState, which only runs at the END of a successful
+        run. A run that blocked before reaching it hit a missing directory, the watchdog's write
+        failed into its own catch, and the only durable evidence of the timeout was lost.
+
+        Trust matters as much as existence: the marker is what makes a health check fail, so a
+        directory a non-administrator can write is a directory where the marker can simply be
+        deleted. Anything that cannot be proven safe throws, and the caller fails the run closed
+        rather than arming a guard whose evidence can be erased.
+
+        Declared self-contained (no module-level table, no dot-sourcing) because this script runs
+        as a standalone scheduled task in its own process, and because the suites AST-extract
+        single functions.
+    #>
+    param([Parameter(Mandatory)][string]$MarkerPath)
+
+    $parent = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($MarkerPath))
+    if ([string]::IsNullOrWhiteSpace($parent)) { throw "The deadline marker path has no parent directory: $MarkerPath" }
+
+    if (-not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+    }
+
+    # A reparse point anywhere in the chain means the marker could be redirected somewhere the
+    # health check never looks.
+    $probe = $parent
+    while (-not [string]::IsNullOrWhiteSpace($probe)) {
+        if (Test-Path -LiteralPath $probe) {
+            $item = Get-Item -LiteralPath $probe -Force -ErrorAction Stop
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Refusing to arm the deadline guard: a reparse point exists in the marker path chain at $probe"
+            }
+        }
+        $next = [System.IO.Path]::GetDirectoryName($probe)
+        if ([string]::IsNullOrWhiteSpace($next) -or $next -eq $probe) { break }
+        $probe = $next
+    }
+
+    # The account running the blocker must keep write access: the watchdog writes the marker from
+    # THIS process after the lockdown, so excluding it would recreate the silent-failure bug in a
+    # new form. Under the scheduled task that account is SYSTEM and this adds nothing. For any
+    # other account it is exactly the identity that owns the run, and no OTHER unprivileged
+    # principal gains anything - which is the property that actually matters: the marker must not
+    # be erasable by someone else to hide a timeout.
+    $selfSid = [string]([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    $trustedSids = @(
+        'S-1-5-18',      # LOCAL SYSTEM
+        'S-1-5-32-544',  # BUILTIN\Administrators
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464', # NT SERVICE\TrustedInstaller
+        $selfSid
+    )
+    # Built fresh and persisted through DirectoryInfo rather than Get-Acl/Set-Acl: Set-Acl
+    # round-trips the whole security descriptor including the SACL, which needs
+    # SeSecurityPrivilege and fails for any caller that does not hold it. Persisting a
+    # DirectorySecurity that carries only access rules writes the DACL section alone, which the
+    # owner may always do. The blocker runs as SYSTEM in production, but arming must not depend
+    # on a privilege it does not actually need.
+    $desired = New-Object System.Security.AccessControl.DirectorySecurity
+    $desired.SetAccessRuleProtection($true, $false)
+    foreach ($sid in (@('S-1-5-18', 'S-1-5-32-544', $selfSid) | Select-Object -Unique)) {
+        $desired.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+                    [System.Security.AccessControl.FileSystemRights]::FullControl,
+                    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+                    [System.Security.AccessControl.PropagationFlags]::None,
+                    [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    $parentInfo = New-Object System.IO.DirectoryInfo($parent)
+    # 5.1 exposes SetAccessControl as an instance method; .NET Core moved it to an extension type.
+    if ($parentInfo.PSObject.Methods['SetAccessControl']) { $parentInfo.SetAccessControl($desired) }
+    else { [System.IO.FileSystemAclExtensions]::SetAccessControl($parentInfo, $desired) }
+
+    # Re-read rather than assume the write took effect.
+    $verify = Get-Acl -LiteralPath $parent -ErrorAction Stop
+    foreach ($ace in $verify.Access) {
+        if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+        if (([string]$ace.FileSystemRights) -notmatch 'Write|Modify|FullControl|CreateFiles|Delete|ChangePermissions|TakeOwnership') { continue }
+        $sid = $null
+        try {
+            $sid = if ($ace.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) { $ace.IdentityReference.Value }
+                   else { $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
+        } catch { $sid = $null }
+        if ($sid -eq 'S-1-3-0') { continue }
+        if ($null -eq $sid -or $trustedSids -notcontains $sid) {
+            throw ("Refusing to arm the deadline guard: {0} is writable by {1}, so the deadline marker could be deleted." -f $parent, $ace.IdentityReference)
+        }
+    }
+
+    # Prove the marker itself is writable now, while a failure can still be reported, instead of
+    # discovering it inside the watchdog where nothing can be done about it.
+    #
+    # This is checked AFTER hardening on purpose: the watchdog writes from this same process once
+    # the directory is locked down, so pre-hardening writability proves nothing. The blocker runs
+    # as SYSTEM under its scheduled task and passes. A caller that is neither SYSTEM nor an
+    # administrator legitimately cannot arm a guard whose evidence it could not record, and gets a
+    # named failure instead of a guard that would fail silently at the worst moment.
+    $probeFile = "{0}.armprobe" -f $MarkerPath
+    try {
+        [System.IO.File]::WriteAllText($probeFile, 'arm probe')
+        [System.IO.File]::Delete($probeFile)
+    } catch {
+        throw ("Refusing to arm the deadline guard: {0} is hardened to SYSTEM and Administrators and this process cannot write the marker there ({1}). Run the blocker elevated, or as the SYSTEM scheduled task it is installed as." -f $parent, $_.Exception.Message)
+    }
+    return $parent
+}
+
 function Start-BlockerDeadlineGuard {
     <#
         FU-04: maxRunSeconds was only ever compared BETWEEN synchronous calls, so one blocking
@@ -780,24 +893,35 @@ function Start-BlockerDeadlineGuard {
     #>
     param(
         [Parameter(Mandatory)][double]$Seconds,
-        [Parameter(Mandatory)][string]$MarkerPath
+        [Parameter(Mandatory)][string]$MarkerPath,
+        [int]$TimeoutExitCode = 124
     )
-    # Self-cleaning: the marker means "the most recent armed run was killed", so a stale one from
-    # an earlier kill must not be mistaken for this run's outcome.
-    Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
+    # The parent must exist and be provably safe before the guard arms: the watchdog fires from
+    # inside a blocking call and can neither create a directory nor report a failure.
+    Initialize-DeadlineMarkerDirectory -MarkerPath $MarkerPath | Out-Null
+
+    # NOT cleared here. The marker means "a run was killed by its deadline and has not been
+    # superseded by a healthy one", so clearing it at arm time would erase the evidence at the
+    # start of the very next run - including a run that goes on to time out again, and including
+    # any health check that looks between arming and completion. Only a run that reaches the end
+    # successfully clears it; see Invoke-RdpBruteforceBlocker.
 
     $signal = New-Object System.Threading.ManualResetEventSlim($false)
     $worker = [powershell]::Create()
     # Deliberately self-contained: the script text is re-parsed in the watchdog's own runspace,
     # so it may only use .NET types and the arguments it is handed.
     $null = $worker.AddScript({
-            param($Completed, $WaitMilliseconds, $Path, $Budget)
+            param($Completed, $WaitMilliseconds, $Path, $Budget, $ExitCode)
             if ($Completed.Wait([int]$WaitMilliseconds)) { return }
             $line = "[{0}] [CRITICAL] [RDP-BLOCKER] The run exceeded maxRunSeconds ({1}s) inside a blocking call and was ended by the deadline guard." -f `
             ((Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")), $Budget
             try { [System.IO.File]::WriteAllText($Path, $line) } catch { $null = $_ }
-            [Environment]::Exit(0)
-        }).AddArgument($signal).AddArgument([int][math]::Max(1, [math]::Round($Seconds * 1000))).AddArgument($MarkerPath).AddArgument($Seconds)
+            # FU-04: a dedicated NON-ZERO code. This used to exit 0, so a blocker killed by its own
+            # deadline was recorded by Task Scheduler as LastTaskResult=0 and reported by installer
+            # verification as a successfully verified run - the timeout was indistinguishable from
+            # success, which is the worst possible outcome for a security control.
+            [Environment]::Exit([int]$ExitCode)
+        }).AddArgument($signal).AddArgument([int][math]::Max(1, [math]::Round($Seconds * 1000))).AddArgument($MarkerPath).AddArgument($Seconds).AddArgument($TimeoutExitCode)
     return [pscustomobject]@{ Signal = $signal; Worker = $worker; Handle = $worker.BeginInvoke() }
 }
 
@@ -851,7 +975,11 @@ function Invoke-RdpBruteforceBlocker {
         # FU-04: armed before the first call that can block - which includes the port
         # verification below, since a CIM or socket query can hang just as an event-log read can.
         if ($EnforceHardDeadline) {
-            $deadlineGuard = Start-BlockerDeadlineGuard -Seconds ([double]$limits['maxRunSeconds']) -MarkerPath ("{0}.deadline" -f $statePath)
+            # Arming can fail (missing, untrusted or redirected marker directory). That is not a
+            # reason to run unguarded: without the marker a timeout leaves no durable evidence, so
+            # this throws into the catch below and the run fails closed with a non-zero result.
+            $deadlineGuard = Start-BlockerDeadlineGuard -Seconds ([double]$limits['maxRunSeconds']) `
+                -MarkerPath ("{0}.deadline" -f $statePath) -TimeoutExitCode $script:BlockerDeadlineExitCode
         }
 
         # FU-02: resolve the port the machine is ACTUALLY serving RDP on before a single event is
@@ -1055,6 +1183,18 @@ function Invoke-RdpBruteforceBlocker {
                 Sort-Object -Property @{ Expression = { $_.Times.Count }; Descending = $true } |
                 ForEach-Object { [pscustomobject]@{ Ip = $_.Ip; Times = @($_.Times.ToArray()); Types = $_.Types; Users = $_.Users; Evidence = $_.Evidence } })
         Write-BlockerState -Path $statePath -LastRecordId $processedRecordId -Counters $persisted -Caps $caps -MaxBytes ([long]$limits['maxStateBytes'])
+
+        # FU-04: only a run that reaches here has completed successfully, so this is the one place
+        # a deadline marker left by an earlier killed run may be retired. A run that threw, that
+        # hit its own deadline, or that stopped early on a cap does not clear it - the control
+        # stays visibly unhealthy until it genuinely finishes a pass.
+        if (-not $caps.DeadlineExceeded) {
+            $marker = "{0}.deadline" -f $statePath
+            if (Test-Path -LiteralPath $marker) {
+                Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+                Write-LogLine "A previous run had been ended by its deadline guard; this run completed, so the deadline marker was cleared." "INFO"
+            }
+        }
         return 0
     } catch {
         Write-LogLine "Error: $($_.Exception.Message); stack=$($_.ScriptStackTrace)" "ERROR"
