@@ -680,6 +680,26 @@ function Save-StagedTaskConfig {
     return (ConvertTo-CanonicalPath $destination)
 }
 
+function Get-BlockerDeadlineMarkerPath {
+    <#
+        FU-04: where the blocker's deadline guard records that a run was killed mid-pass.
+
+        It has to derive the same path the blocker itself uses, from the same two sources in the
+        same order: rdpBruteforceBlocker.statePath when set, otherwise the project default. Any
+        drift between the two would make the health check watch a file nobody writes, which reads
+        as healthy for the wrong reason.
+    #>
+    $statePath = ''
+    if ($Global:Config -and $Global:Config.rdpBruteforceBlocker) {
+        $statePath = [string]$Global:Config.rdpBruteforceBlocker.statePath
+    }
+    if ([string]::IsNullOrWhiteSpace($statePath)) {
+        if ([string]::IsNullOrWhiteSpace($Global:ProjectRoot)) { return '' }
+        $statePath = Join-Path $Global:ProjectRoot 'state\rdp-blocker-state.json'
+    }
+    return ("{0}.deadline" -f $statePath)
+}
+
 function Get-TaskTrustManifestRoot {
     # The manifest records what the health check trusts, so it must not itself be writable by a
     # non-administrator. It lives beside the download cache and gets the same hardening.
@@ -865,6 +885,18 @@ function Test-RdpBlockerTaskHealth {
         $reasons.Add(("a run started at {0} has outlived its {1} limit; end that instance and re-run the RDP blocker step" -f $info.LastRunTime, $task.Settings.ExecutionTimeLimit)) | Out-Null
     }
     if ([string]$task.State -eq 'Disabled') { $reasons.Add("the task is disabled") | Out-Null }
+
+    # FU-04: a run killed by its own deadline guard leaves a marker beside the state file. Task
+    # Scheduler cannot describe that outcome on its own - the process was ended from inside, so
+    # LastTaskResult only carries the exit code - and the marker outlives the run, so it is the
+    # durable evidence that this control stopped mid-pass. Only a later run that completes
+    # successfully removes it.
+    $markerPath = Get-BlockerDeadlineMarkerPath
+    if (-not [string]::IsNullOrWhiteSpace($markerPath) -and (Test-Path -LiteralPath $markerPath)) {
+        $detail = ''
+        try { $detail = (Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop).Trim() } catch { $detail = '<marker unreadable>' }
+        $reasons.Add(("a previous run was ended by its deadline guard and no later run has completed since: {0}" -f $detail)) | Out-Null
+    }
     # 0 = success, 267011 (0x00041303) = has not yet run, 267009 (0x00041301) = currently running.
     $lastResult = [int]$info.LastTaskResult
     if ($lastResult -notin @(0, 267011, 267009)) { $reasons.Add(("the last run result was {0}" -f $lastResult)) | Out-Null }

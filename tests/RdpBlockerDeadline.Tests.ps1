@@ -218,8 +218,14 @@ exit 91
         Assert-True ($elapsed -ge ($deadlineSeconds - 1)) `
             ("FU-04: the run ended before its budget elapsed, so this case proved nothing about the deadline. Elapsed={0}s; child exit={1}; stderr={2}" -f `
                 [math]::Round($elapsed, 1), $child.ExitCode, (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue))
-        Assert-Equal 0 ([int]$child.ExitCode) `
-            ("FU-04: stopping on the deadline is a bounded outcome and must not report the scheduled task as failed. Child exit={0}; stderr={1}" -f `
+        # CORRECTED CONTRACT. This used to assert exit 0, on the reasoning that a bounded outcome
+        # should not report the task as failed. That was wrong: exit 0 made a run killed by its own
+        # deadline indistinguishable from a clean one - Task Scheduler recorded LastTaskResult=0
+        # and installer verification reported the timed-out blocker as successfully verified. A
+        # security control that stopped mid-pass must be visible, so the guard now exits with a
+        # dedicated non-zero code.
+        Assert-Equal 124 ([int]$child.ExitCode) `
+            ("FU-04: a run ended by its deadline guard must exit with the dedicated timeout code, never 0 - exit 0 let the timeout pass as success. Child exit={0}; stderr={1}" -f `
                 $child.ExitCode, (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue))
         Assert-True (Test-Path -LiteralPath $childMarker) `
             "FU-04: ending a run on its deadline must leave a detectable record, or a control that keeps timing out looks like a clean run."
