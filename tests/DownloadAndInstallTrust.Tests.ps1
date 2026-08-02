@@ -35,7 +35,8 @@ $setupAsts = @(Get-SetupAst -Files $setupSourceFiles -Because 'its install path 
 # Raw text of the same partition, for the retained source assertions further down.
 $main = ($setupSourceFiles | ForEach-Object { Get-Content -LiteralPath $_ -Raw -Encoding UTF8 }) -join "`r`n"
 
-foreach ($name in @('Resolve-InstallerExitCode', 'Test-DirectInstallerInstalled', 'Install-DirectInstaller')) {
+foreach ($name in @('Resolve-InstallerExitCode', 'Test-DirectInstallerInstalled', 'Resolve-InstallDirectory',
+        'Register-AppOutcome', 'Complete-DirectInstall', 'Install-DirectInstaller')) {
     . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
 }
 
@@ -71,10 +72,14 @@ Assert-True ($main -notmatch '\$proc\.ExitCode -eq 0 -or \$proc\.ExitCode -eq 30
     "The PowerShell 7 MSI path must no longer open-code an exit-code set that omits 1641."
 
 # ---- 2. An installer with no verification contract is never reported as installed. ----
-function Write-Info { param($Message) }
-function Write-Ok { param($Message) }
-function Write-Warn { param($Message) }
+# Captured rather than discarded: the outcome an operator reads ("installed", "updated in place",
+# "left unchanged") is the report this project makes about an application, so it is asserted.
+$script:Messages = New-Object System.Collections.Generic.List[string]
+function Write-Info { param($Message) $script:Messages.Add("INFO $Message") | Out-Null }
+function Write-Ok { param($Message) $script:Messages.Add("OK $Message") | Out-Null }
+function Write-Warn { param($Message) $script:Messages.Add("WARN $Message") | Out-Null }
 function Write-StructuredLog { param($Level, $Message) }
+function Get-Messages { return ($script:Messages -join ' | ') }
 
 # Stands in for the uninstall-registry scan. It reports whatever the fixture says is
 # currently registered, so "not installed yet" and "registered after the installer ran"
@@ -106,19 +111,42 @@ function Invoke-DownloadFile {
 $script:InstallerExitCode = 0
 $script:InstallerRan = $false
 $script:RegistryAfterInstall = $null
+
+# The uninstall-key record, with the location the application already occupies. $null models
+# "not installed yet"; a record whose InstallLocation is empty models an application whose
+# location cannot be resolved from the registry at all.
+$script:ExistingRecord = $null
+$script:RecordAfterInstall = $null
+function Get-InstalledAppRecord {
+    param([Parameter(Mandatory)][string]$NameLike)
+    if ($script:ExistingRecord) { return $script:ExistingRecord }
+    return
+}
+function New-AppRecord {
+    param([string]$Location)
+    return [pscustomobject]@{ DisplayName = 'Fixture App 1.0'; DisplayVersion = '1.0'; InstallLocation = $Location }
+}
+
 function Invoke-SilentExeInstall {
     param($Path, $Arguments, $TimeoutSeconds)
     $script:InstallerRan = $true
     $script:RegistryDisplayName = $script:RegistryAfterInstall
+    $script:ExistingRecord = $script:RecordAfterInstall
     return $script:InstallerExitCode
 }
 
 function Invoke-FixtureInstall {
-    param([int]$ExitCode, [string]$RegistryDisplayName)
+    param([int]$ExitCode, [string]$RegistryDisplayName, $ExistingRecord = $null, $RecordAfterInstall = $null)
     $script:InstallerExitCode = $ExitCode
     $script:RegistryAfterInstall = $RegistryDisplayName
     $script:RegistryDisplayName = $null
+    $script:ExistingRecord = $ExistingRecord
+    # An installer normally leaves the application registered where it already was, so the
+    # post-install record defaults to the pre-install one. A case that passes a different record
+    # models an update that relocated the application instead of updating it in place.
+    $script:RecordAfterInstall = if ($null -ne $RecordAfterInstall) { $RecordAfterInstall } else { $ExistingRecord }
     $script:InstallerRan = $false
+    $script:Messages.Clear()
     $script:PendingReboots.Clear()
     $Global:RunStats = [pscustomobject]@{
         InstalledApps = (New-Object System.Collections.Generic.List[string])
@@ -159,6 +187,107 @@ $stats = Invoke-FixtureInstall -ExitCode 1603 -RegistryDisplayName 'Fixture App 
 Assert-Equal 0 $stats.InstalledApps.Count "A fatal installer exit code must not be counted as installed even if the registry name matches."
 Assert-Equal 1 $stats.FailedApps.Count "A fatal installer exit code must be recorded as failed."
 
+# =============================================================================================
+# 3b. CHECK THEN UPDATE: an application that is already installed is updated WHERE IT LIVES.
+#
+# Before this, an already-installed direct installer was reported installed and skipped outright,
+# so it was never updated at all. Detecting it is only half the job: the update has to be aimed
+# at the directory the operator already has, and an update that lands somewhere else is a second
+# copy of the application, not an update.
+#
+# GetFullPath is applied to the fixture root as well as to the production result. $env:TEMP is an
+# 8.3 short path on some machines and GetFullPath expands it, so comparing an unexpanded fixture
+# path against an expanded result would fail for a reason that has nothing to do with the code.
+# =============================================================================================
+$locationRoot = [System.IO.Path]::GetFullPath((Join-Path $env:TEMP ("WinServerSetup-Location-{0}" -f ([guid]::NewGuid().ToString('N')))))
+$appDir = Join-Path $locationRoot 'App'
+$otherDir = Join-Path $locationRoot 'Other'
+try {
+    New-Item -ItemType Directory -Path $appDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $otherDir -Force | Out-Null
+    $appExe = Join-Path $appDir 'app.exe'
+    $uninstExe = Join-Path $otherDir 'unins000.exe'
+    Set-Content -LiteralPath $appExe -Value 'fixture' -Encoding ascii
+    Set-Content -LiteralPath $uninstExe -Value 'fixture' -Encoding ascii
+
+    # ---- 3b.1 Resolving the location an application already occupies. ----
+    # The fixture guard matters: both fallbacks below derive a directory, and if they derived it
+    # from the same place the cases could not tell them apart and would pass vacuously.
+    Assert-True ($appDir -ne $otherDir) "Fixture guard: the DisplayIcon and UninstallString candidates must resolve to DIFFERENT directories."
+    Assert-Equal $appDir (Resolve-InstallDirectory -Candidates @($appDir)) `
+        "InstallLocation is the direct answer when the installer wrote one."
+    Assert-Equal $appDir (Resolve-InstallDirectory -Candidates @('', ('"{0}",0' -f $appExe))) `
+        "With no InstallLocation, DisplayIcon's directory is the evidence - its icon index must be stripped."
+    Assert-Equal $otherDir (Resolve-InstallDirectory -Candidates @('', '', ('"{0}" /SILENT' -f $uninstExe))) `
+        "With neither, UninstallString's directory is the last evidence - its arguments must be stripped."
+    Assert-Equal $otherDir (Resolve-InstallDirectory -Candidates @((Join-Path $uninstExe 'nope'), $otherDir)) `
+        "A candidate that does not exist must not stop a later candidate that does."
+    Assert-Equal "" (Resolve-InstallDirectory -Candidates @('', $null, (Join-Path $locationRoot 'Missing\deeper\gone.exe'))) `
+        "A location that resolves nowhere must be reported as unknown, never guessed."
+    Assert-Equal "" (Resolve-InstallDirectory -Candidates @()) "No candidate at all must be reported as unknown."
+    # LOAD-BEARING, and found on a real machine rather than in a fixture: every MSI records
+    # UninstallString as "MsiExec.exe /X{GUID}", which is a RELATIVE path once the arguments come
+    # off. GetFullPath resolves it against the current directory, so this returned the folder the
+    # setup happened to be running from - a directory that exists and is completely unrelated.
+    # PowerShell 7-x64 resolved to the project folder before this was fixed.
+    Assert-Equal "" (Resolve-InstallDirectory -Candidates @('MsiExec.exe /X{6BB1DE85-6C58-4B23-9E00-BEC5E9C1EF39}')) `
+        "A relative candidate must never resolve against the current directory."
+    Assert-Equal "" (Resolve-InstallDirectory -Candidates @('unins000.exe')) `
+        "A bare file name is not evidence of an install location."
+    # ... and the rejection must not be a blanket one: a rooted path still resolves.
+    Assert-Equal $appDir (Resolve-InstallDirectory -Candidates @('MsiExec.exe /X{GUID}', $appDir)) `
+        "A rooted candidate after a rejected relative one must still resolve."
+
+    # ---- 3b.2 LOAD-BEARING: already installed means UPDATE IN PLACE, not skip. ----
+    $stats = Invoke-FixtureInstall -ExitCode 0 -RegistryDisplayName 'Fixture App 1.0' -ExistingRecord (New-AppRecord -Location $appDir)
+    Assert-True $script:InstallerRan `
+        ("An already-installed application must actually be updated; skipping it leaves it on its old version forever. Messages: {0}" -f (Get-Messages))
+    Assert-Equal 1 $stats.InstalledApps.Count ("An updated application must stay accounted for. Messages: {0}" -f (Get-Messages))
+    Assert-Equal 0 $stats.FailedApps.Count ("A verified in-place update must not be recorded as failed. Messages: {0}" -f (Get-Messages))
+    Assert-True ((Get-Messages) -match [regex]::Escape("updated in place - $appDir")) `
+        ("The update must be reported distinctly from a fresh install, and must name the existing location. Messages: {0}" -f (Get-Messages))
+    Assert-True ((Get-Messages) -notmatch 'installed and verified') `
+        ("An update must not be reported as a fresh install. Messages: {0}" -f (Get-Messages))
+
+    # ---- 3b.3 LOAD-BEARING: an update that did not stay put is a duplicate, not an update. ----
+    $stats = Invoke-FixtureInstall -ExitCode 0 -RegistryDisplayName 'Fixture App 1.0' `
+        -ExistingRecord (New-AppRecord -Location $appDir) -RecordAfterInstall (New-AppRecord -Location $otherDir)
+    Assert-Equal 0 $stats.InstalledApps.Count `
+        ("An application that moved to a different directory was not updated in place and must not be reported as installed. Messages: {0}" -f (Get-Messages))
+    Assert-Equal 1 $stats.FailedApps.Count ("A relocated update must be recorded as failed. Messages: {0}" -f (Get-Messages))
+    Assert-True ((Get-Messages) -match [regex]::Escape($appDir) -and (Get-Messages) -match [regex]::Escape($otherDir)) `
+        ("The relocation report must name both the old and the new location. Messages: {0}" -f (Get-Messages))
+
+    # ---- 3b.3b An update that FAILS must not fail the run: the application is still installed. ----
+    # Turning "we could not update it" into a failed app would exit 1 over a transient installer
+    # error for software that is present and working. M-08 is about a component that is genuinely
+    # ABSENT, and the case below that has nothing installed still fails.
+    $stats = Invoke-FixtureInstall -ExitCode 1603 -RegistryDisplayName 'Fixture App 1.0' -ExistingRecord (New-AppRecord -Location $appDir)
+    Assert-Equal 0 $stats.FailedApps.Count `
+        ("A failed update of an application that is already installed must not fail the run. Messages: {0}" -f (Get-Messages))
+    Assert-Equal 1 $stats.InstalledApps.Count `
+        ("An application whose update failed is still installed and must stay accounted for. Messages: {0}" -f (Get-Messages))
+    Assert-True ((Get-Messages) -match 'left unchanged') `
+        ("A failed update must still be reported. Messages: {0}" -f (Get-Messages))
+    # The same installer failure with nothing installed yet must still fail the run.
+    $stats = Invoke-FixtureInstall -ExitCode 1603 -RegistryDisplayName 'Fixture App 1.0'
+    Assert-Equal 1 $stats.FailedApps.Count `
+        ("M-08: an application that is NOT on the machine and whose install failed must still fail the run. Messages: {0}" -f (Get-Messages))
+
+    # ---- 3b.4 An unresolvable location means LEAVE IT ALONE, never install a second copy. ----
+    $stats = Invoke-FixtureInstall -ExitCode 0 -RegistryDisplayName 'Fixture App 1.0' -ExistingRecord (New-AppRecord -Location '')
+    Assert-True (-not $script:InstallerRan) `
+        ("With no resolvable install location the installer must not run: it would install a second copy at the default path. Messages: {0}" -f (Get-Messages))
+    Assert-Equal 1 $stats.InstalledApps.Count `
+        ("An application left untouched is still installed and must stay accounted for. Messages: {0}" -f (Get-Messages))
+    Assert-Equal 0 $stats.FailedApps.Count `
+        ("Declining to update is not a failed run. Messages: {0}" -f (Get-Messages))
+    Assert-True ((Get-Messages) -match 'left unchanged') `
+        ("An update that could not be attempted must say so. Messages: {0}" -f (Get-Messages))
+} finally {
+    Remove-Item -LiteralPath $locationRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # ---- 4. Trust wiring with no behavioral home elsewhere. ----
 # DownloadRuntime.Tests.ps1 drives the transport with the signature check stubbed out, so
 # these two remain source assertions: they only confirm the parameters are still threaded
@@ -173,4 +302,4 @@ foreach ($installer in @($config.directInstallers | Where-Object enabled)) {
     Assert-True (@($installer.allowedDownloadHosts).Count -gt 0) "$($installer.name) must constrain redirect/download hosts."
 }
 
-Write-Host "PASS installer exit-code rule, independent registry verification, and per-installer download trust contracts."
+Write-Host "PASS installer exit-code rule, independent registry verification, install-location resolution, update-in-place with its relocation guard, and per-installer download trust contracts."

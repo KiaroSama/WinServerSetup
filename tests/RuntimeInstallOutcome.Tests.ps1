@@ -67,6 +67,7 @@ $harness = @'
 function Reset-RuntimeRun {
     $Global:M08 = @{
         Messages            = New-Object System.Collections.Generic.List[string]
+        Commands            = New-Object System.Collections.Generic.List[string]
         PendingReboots      = New-Object System.Collections.Generic.List[string]
         InstalledIds        = New-Object System.Collections.Generic.List[string]
         WingetAvailable     = $true
@@ -96,7 +97,9 @@ function Reset-RuntimeRun {
 }
 
 function Set-RuntimeConfig {
-    param([hashtable]$Runtimes = @{})
+    # $UpgradeExisting drives winget.upgradeExistingPackages, which is the switch that decides
+    # whether an already-installed runtime is upgraded where it sits or left untouched.
+    param([hashtable]$Runtimes = @{}, [bool]$UpgradeExisting = $false)
     $values = @{
         installDotNetFramework35         = $false
         installDotNetFramework4Plus      = $false
@@ -110,7 +113,10 @@ function Set-RuntimeConfig {
         dotNetFramework481ExpectedSha256 = ''
     }
     foreach ($key in @($Runtimes.Keys)) { $values[$key] = $Runtimes[$key] }
-    $Global:Config = [pscustomobject]@{ runtimes = [pscustomobject]$values }
+    $Global:Config = [pscustomobject]@{
+        runtimes = [pscustomobject]$values
+        winget   = [pscustomobject]@{ upgradeExistingPackages = $UpgradeExisting }
+    }
 }
 
 function Get-M08Report {
@@ -139,6 +145,7 @@ function Invoke-LoggedCommand {
     param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @(), [string]$DisplayName = "")
     if ($Global:M08.WingetThrows) { throw "Simulated winget transport failure." }
     $arguments = @($Arguments)
+    $Global:M08.Commands.Add(($arguments -join ' ')) | Out-Null
     if ($Global:M08.WingetExitCode -eq 0 -and $Global:M08.WingetRegisters -and ($arguments -contains 'install')) {
         $index = [array]::IndexOf($arguments, '--id')
         if ($index -ge 0 -and ($index + 1) -lt $arguments.Count) {
@@ -242,9 +249,43 @@ Assert-Equal 1 $Global:RunStats.FailedApps.Count ("M-08: an exception while inst
 
 # An already-present runtime is still accounted for, so it can never look unattempted.
 Reset-RuntimeRun
+Set-RuntimeConfig -UpgradeExisting $false
 $Global:M08.InstalledIds.Add('Microsoft.DotNet.Runtime.9') | Out-Null
 Install-WingetRuntimePackage -Name '.NET Runtime 9 x64' -Id 'Microsoft.DotNet.Runtime.9'
 Assert-Equal 1 $Global:RunStats.InstalledApps.Count ("M-08: an already-installed runtime must still be recorded as installed. {0}" -f (Get-M08Report))
+Assert-Equal 0 $Global:M08.Commands.Count `
+    ("With upgrades disabled an installed runtime must be left completely alone. Commands: {0}" -f ($Global:M08.Commands -join ' ; '))
+
+# ---------------------------------------------------------------------------------------------
+# 1b. An already-installed runtime is UPGRADED where it sits, never installed a second time.
+# The runtime funnel used to record an installed runtime and return without ever trying to update
+# it, so a machine provisioned once kept its original runtime build for good.
+# ---------------------------------------------------------------------------------------------
+Reset-RuntimeRun
+Set-RuntimeConfig -UpgradeExisting $true
+$Global:M08.InstalledIds.Add('Microsoft.DotNet.Runtime.9') | Out-Null
+Install-WingetRuntimePackage -Name '.NET Runtime 9 x64' -Id 'Microsoft.DotNet.Runtime.9'
+$runtimeCommands = ($Global:M08.Commands -join ' ; ')
+Assert-Equal 1 $Global:M08.Commands.Count ("An installed runtime must produce exactly one winget call. Commands: {0}" -f $runtimeCommands)
+Assert-True ($runtimeCommands -match '^upgrade\b') ("An installed runtime must be upgraded, not reinstalled. Commands: {0}" -f $runtimeCommands)
+Assert-True ($runtimeCommands -match 'Microsoft\.DotNet\.Runtime\.9') "The upgrade must name the runtime it is upgrading."
+Assert-Equal 1 $Global:RunStats.InstalledApps.Count ("An upgraded runtime must stay accounted for. {0}" -f (Get-M08Report))
+Assert-Equal 0 $Global:RunStats.FailedApps.Count ("An applied runtime upgrade must not be recorded as failed. {0}" -f (Get-M08Report))
+Assert-True (($Global:M08.Messages -join ' | ') -match 'updated in place') `
+    ("An applied runtime upgrade must be reported distinctly from a fresh install. {0}" -f (Get-M08Report))
+
+# A failed upgrade of a runtime that is already present must not fail the run: the runtime is
+# there, only the update did not apply. Turning that into a failed app would fail a whole
+# provisioning run over a transient winget error.
+Reset-RuntimeRun
+Set-RuntimeConfig -UpgradeExisting $true
+$Global:M08.InstalledIds.Add('Microsoft.DotNet.Runtime.9') | Out-Null
+$Global:M08.WingetExitCode = 1
+Install-WingetRuntimePackage -Name '.NET Runtime 9 x64' -Id 'Microsoft.DotNet.Runtime.9'
+Assert-Equal 0 $Global:RunStats.FailedApps.Count ("A failed upgrade of a present runtime must not fail the run. {0}" -f (Get-M08Report))
+Assert-Equal 1 $Global:RunStats.InstalledApps.Count ("A runtime whose upgrade failed is still installed. {0}" -f (Get-M08Report))
+Assert-True (($Global:M08.Messages -join ' | ') -match 'exited with code 1') `
+    ("A failed upgrade must name the exit code that failed. {0}" -f (Get-M08Report))
 
 # =============================================================================================
 # 2. WinGet unavailable must fail every requested runtime, never skip them silently.
@@ -543,4 +584,4 @@ try {
     $Global:M08Modules = $null
 }
 
-Write-Host "PASS M-08 runtime install outcomes: every requested runtime is independently verified, and download, installer, winget, unavailable-winget and verification failures all reach the final exit code."
+Write-Host "PASS M-08 runtime install outcomes: every requested runtime is independently verified, an already-installed one is upgraded in place rather than reinstalled, and download, installer, winget, unavailable-winget and verification failures all reach the final exit code."

@@ -35,7 +35,7 @@ $mainScript = if ([string]::IsNullOrWhiteSpace($MainScript)) { Join-Path $projec
 $setupSourceFiles = @(Get-SetupSourceFile -ProjectRoot $projectRoot -MainScript $mainScript)
 $setupAsts = @(Get-SetupAst -Files $setupSourceFiles -Because 'its v2rayN path can be tested')
 
-foreach ($name in @('Test-UnsafeReplaceTarget', 'Install-V2RayN')) {
+foreach ($name in @('Test-UnsafeReplaceTarget', 'Register-AppOutcome', 'Install-V2RayN')) {
     . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
 }
 
@@ -240,6 +240,10 @@ try {
     Assert-Equal 0 @(Get-StageLeftovers).Count "Staging must be cleaned after a successful install."
     Assert-Equal 1 $Global:RunStats.InstalledApps.Count "M-08: a verified v2rayN install must be recorded as installed."
     Assert-Equal 0 $Global:RunStats.FailedApps.Count "M-08: a verified v2rayN install must not be recorded as failed."
+    Assert-True ((Get-Messages) -match 'installed and verified') `
+        ("A first install must be reported as an install, not an update. Messages: {0}" -f (Get-Messages))
+    Assert-True ((Get-Messages) -notmatch 'updated in place') `
+        ("Nothing was there to update on a first install. Messages: {0}" -f (Get-Messages))
 
     # ---- 3. LOAD-BEARING: an upgrade preserves user data and drops obsolete binaries. ----
     Reset-Run
@@ -259,6 +263,14 @@ try {
     Assert-Equal 'new-exe' (Get-Text (Join-Path $finalDir 'v2rayN.exe')) "The executable must be replaced by the new payload."
     Assert-Equal 0 @(Get-StageLeftovers).Count "Staging must be cleaned after an upgrade."
     Assert-Equal 0 @(Get-KeepLeftovers).Count "The preserve directory must be cleaned once its contents are restored."
+    # The update must land in the folder that was already there, and the run must say so - an
+    # update reported as a fresh install hides the fact that user data was carried across.
+    Assert-True ((Get-Messages) -match [regex]::Escape("updated in place - $finalDir")) `
+        ("An upgrade must be reported as an in-place update naming the existing folder. Messages: {0}" -f (Get-Messages))
+    Assert-Equal 1 @([System.IO.Directory]::GetDirectories($installRoot)).Count `
+        ("An update must not leave a second copy of the application beside the existing one. Directories: {0}" -f (@([System.IO.Directory]::GetDirectories($installRoot)) -join ', '))
+    Assert-Equal 1 $Global:RunStats.InstalledApps.Count "An updated v2rayN must stay accounted for."
+    Assert-Equal 0 $Global:RunStats.FailedApps.Count "A verified in-place update must not be recorded as failed."
 
     # ---- 4. The payload is located by the executable, not by the first top-level directory. ----
     Reset-Run
@@ -343,7 +355,7 @@ try {
     Assert-Equal 1 $script:SkipReasons.Count "A disabled v2rayN step must be recorded as skipped."
     Assert-True (-not (Test-Exists (Join-Path $installRoot 'V2rayN'))) "A disabled step must not create the install folder."
 
-    Write-Host "PASS v2rayN update preserves user data, drops stale binaries, resolves the payload by executable, and cleans staging on every path."
+    Write-Host "PASS v2rayN update preserves user data, drops stale binaries, resolves the payload by executable, reports an update in place distinctly from a first install, and cleans staging on every path."
 } finally {
     $Global:Config = $null
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $script:TestRoot -Recurse -Force -ErrorAction SilentlyContinue

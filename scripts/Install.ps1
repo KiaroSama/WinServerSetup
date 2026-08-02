@@ -7,6 +7,165 @@
 # call time, never at load time.
 
 # =============================================================================
+# SHARED: CHECK BEFORE INSTALLING, THEN UPDATE WHERE THE APPLICATION ALREADY LIVES
+#
+# Detecting that an application is already installed is only half the job. Skipping it outright
+# leaves it on the version it was first provisioned with, and installing it again without
+# aiming at the existing directory produces a second copy rather than an update. Every installer
+# below routes that decision through these helpers so the rule is defined once.
+# =============================================================================
+function Resolve-InstallDirectory {
+    <#
+        Turns uninstall-key values into the directory an application actually occupies.
+
+        InstallLocation is the direct answer when the installer wrote one. DisplayIcon and
+        UninstallString both point at a file inside the install folder, so their parent is the
+        next best evidence - DisplayIcon carries a trailing icon index and UninstallString
+        carries arguments, both of which have to come off first.
+
+        A candidate that does not resolve to a directory that exists is rejected rather than
+        guessed at: an "update in place" aimed at the wrong tree is worse than not updating.
+    #>
+    param([string[]]$Candidates = @())
+    foreach ($candidate in $Candidates) {
+        $value = ([string]$candidate).Trim()
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        if ($value.StartsWith('"')) {
+            $closing = $value.IndexOf('"', 1)
+            if ($closing -gt 0) { $value = $value.Substring(1, $closing - 1) } else { $value = $value.Trim('"') }
+        } else {
+            $comma = $value.LastIndexOf(',')
+            if ($comma -gt 0 -and $value.Substring($comma + 1) -match '^\s*-?\d+\s*$') { $value = $value.Substring(0, $comma) }
+            $switchStart = $value.IndexOf(' /')
+            if ($switchStart -gt 0) { $value = $value.Substring(0, $switchStart) }
+        }
+        $value = $value.Trim().TrimEnd('\')
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        # A RELATIVE candidate must be rejected before GetFullPath sees it. An MSI package records
+        # UninstallString as "MsiExec.exe /X{GUID}", which reduces to a bare file name once the
+        # arguments come off - GetFullPath then resolves it against the CURRENT directory and
+        # hands back a directory that genuinely exists and has nothing to do with the
+        # application. Measured on this machine: PowerShell 7-x64 resolved to the project folder.
+        # Only a drive-qualified or UNC path is evidence of where something is installed, so a
+        # root of "\" alone (current drive) is rejected too.
+        $root = ""
+        try { $root = [string][System.IO.Path]::GetPathRoot($value) } catch { $null = $_ }
+        if ($root.Length -le 1) { continue }
+        # GetFullPath on every path this project compares: it needs no existing path and maps an
+        # 8.3 short name and its long spelling to one form, which Resolve-Path does not.
+        $full = $null
+        try { $full = [System.IO.Path]::GetFullPath($value) } catch { $null = $_ }
+        if ([string]::IsNullOrWhiteSpace($full)) { continue }
+        if ([System.IO.Directory]::Exists($full)) { return $full.TrimEnd('\') }
+        $parent = [System.IO.Path]::GetDirectoryName($full)
+        if (-not [string]::IsNullOrWhiteSpace($parent) -and [System.IO.Directory]::Exists($parent)) { return $parent.TrimEnd('\') }
+    }
+    return ""
+}
+
+function Get-InstalledAppRecord {
+    <#
+        Detection WITH a location. Get-InstalledRegistryDisplayName answers only "is it
+        installed?", so an application it found could never be updated - there was nothing to
+        aim an update at. This reads the same three uninstall roots and returns the first match
+        as a record whose InstallLocation is empty when no evidence resolves to a real directory.
+    #>
+    param([Parameter(Mandatory)][string]$NameLike)
+    if ([string]::IsNullOrWhiteSpace($NameLike)) { return }
+    $roots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    foreach ($root in $roots) {
+        # `return` inside ForEach-Object exits one iteration, not the function. Emit the match
+        # and take the first outside the block, exactly as Get-InstalledRegistryDisplayName does.
+        $match = Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $properties = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                if ($properties -and $properties.DisplayName -like "*$NameLike*") { $properties }
+            } catch { $null = $_ }
+        } | Select-Object -First 1
+        if ($match) {
+            return [pscustomobject]@{
+                DisplayName     = [string]$match.DisplayName
+                DisplayVersion  = [string]$match.DisplayVersion
+                InstallLocation = (Resolve-InstallDirectory -Candidates @([string]$match.InstallLocation, [string]$match.DisplayIcon, [string]$match.UninstallString))
+            }
+        }
+    }
+    # Bare `return`, never `return $null`: a $null on the output stream corrupts a caller that
+    # invokes this as a bare statement.
+    return
+}
+
+function Register-AppOutcome {
+    <#
+        The single place an application's outcome becomes both a console line and a RunStats
+        entry, so every installer answers "was it already there, and did we update it where it
+        lives?" the same way.
+
+        Installed, Updated, AlreadyCurrent and Skipped all mean the application is present on
+        the machine, so all four keep it in InstalledApps - the existing counters and the M-08
+        contract that a requested component missing from the machine fails the run are unchanged.
+        Only Failed reaches FailedApps.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('Installed', 'Updated', 'AlreadyCurrent', 'Skipped', 'Failed')][string]$Outcome,
+        [string]$Detail = ""
+    )
+    $suffix = ""
+    if (-not [string]::IsNullOrWhiteSpace($Detail)) { $suffix = " - {0}" -f $Detail }
+    switch ($Outcome) {
+        'Installed'      { Write-Ok   ("{0}: installed and verified{1}" -f $Name, $suffix) }
+        'Updated'        { Write-Ok   ("{0}: updated in place{1}" -f $Name, $suffix) }
+        'AlreadyCurrent' { Write-Ok   ("{0}: already current{1}" -f $Name, $suffix) }
+        'Skipped'        { Write-Warn ("{0}: left unchanged{1}" -f $Name, $suffix) }
+        'Failed'         { Write-Warn ("{0}: install failed{1}" -f $Name, $suffix) }
+    }
+    if ($Outcome -eq 'Failed') { $null = $Global:RunStats.FailedApps.Add($Name) }
+    else { $null = $Global:RunStats.InstalledApps.Add($Name) }
+}
+
+function Update-WingetPackageInPlace {
+    <#
+        Check-then-update for a package winget already reports installed. winget upgrades a
+        package in the location it already occupies, so "in place" here means calling upgrade
+        instead of install - a second install is what produces a parallel copy.
+
+        Returns the outcome rather than recording it, because Windows Terminal owns its own
+        verification contract (wt.exe on disk) and must record the application exactly once,
+        after that check rather than before it.
+    #>
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Id)
+    $wingetConfig = $Global:Config.winget
+    $upgradeEnabled = $false
+    if ($wingetConfig -and ($wingetConfig.PSObject.Properties.Name -contains 'upgradeExistingPackages')) {
+        $upgradeEnabled = [bool]$wingetConfig.upgradeExistingPackages
+    }
+    if (-not $upgradeEnabled) {
+        return [pscustomobject]@{ Outcome = 'Skipped'; Detail = 'already installed, and winget.upgradeExistingPackages is off' }
+    }
+    try {
+        $result = Invoke-LoggedCommand -FilePath (Get-WingetExecutable) `
+            -Arguments @("upgrade", "--id", $Id, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget", "--silent") `
+            -DisplayName "winget upgrade $Name"
+        if ($result.ExitCode -eq 0) {
+            return [pscustomobject]@{ Outcome = 'Updated'; Detail = 'upgraded by winget where it was already installed' }
+        }
+        # Not a bare -ne 0: "no applicable upgrade found" is the normal answer for an
+        # already-current package and is a different outcome, not a failure.
+        if (Test-WingetUpgradeExitCode -ExitCode $result.ExitCode) {
+            return [pscustomobject]@{ Outcome = 'AlreadyCurrent'; Detail = 'winget reports no applicable upgrade' }
+        }
+        return [pscustomobject]@{ Outcome = 'Skipped'; Detail = ("upgrade check exited with code {0}" -f $result.ExitCode) }
+    } catch {
+        return [pscustomobject]@{ Outcome = 'Skipped'; Detail = ("upgrade check failed: {0}" -f $_.Exception.Message) }
+    }
+}
+
+# =============================================================================
 # SECTION 5: WINGET INSTALL (items 9 indirect)
 # =============================================================================
 function Install-WingetPackages {
@@ -33,16 +192,8 @@ function Install-WingetPackages {
 
         Write-Info "Checking package: $name ($id)"
         if (Test-WingetPackageInstalled -Id $id) {
-            Write-Ok "$name is already installed."
-            if ($Global:Config.winget.upgradeExistingPackages) {
-                try {
-                    $upgradeResult = Invoke-LoggedCommand -FilePath (Get-WingetExecutable) -Arguments @("upgrade", "--id", $id, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget", "--silent") -DisplayName "winget upgrade $name"
-                    # Not a bare -ne 0: "no applicable upgrade found" is the normal result for an
-                    # already-current package and must not be reported as a failure.
-                    if (-not (Test-WingetUpgradeExitCode -ExitCode $upgradeResult.ExitCode)) { Write-Warn "Upgrade check for $name exited with code $($upgradeResult.ExitCode)." }
-                } catch { Write-Warn "Upgrade failed for $name : $($_.Exception.Message)" }
-            }
-            $null = $Global:RunStats.InstalledApps.Add($name)
+            $update = Update-WingetPackageInPlace -Name $name -Id $id
+            Register-AppOutcome -Name $name -Outcome $update.Outcome -Detail $update.Detail
             continue
         }
 
@@ -57,8 +208,7 @@ function Install-WingetPackages {
             } elseif (Test-WingetPackageInstalled -Id $id) {
                 # M-08: exit code 0 is the installer's own claim. The package has to be detectable
                 # afterwards before the run may call it installed.
-                Write-Ok "$name installed and verified."
-                $null = $Global:RunStats.InstalledApps.Add($name)
+                Register-AppOutcome -Name $name -Outcome Installed
             } else {
                 Write-Warn "$name reported a successful install but is not detectable afterwards."
                 $null = $Global:RunStats.FailedApps.Add($name)
@@ -73,6 +223,45 @@ function Install-WingetPackages {
 # =============================================================================
 # SECTION 6: DIRECT INSTALLERS (items 10, 16, 25)
 # =============================================================================
+function Complete-DirectInstall {
+    <#
+        The single verdict for a direct installer that has just run, shared by the silent path
+        and both interactive fallbacks so the rule cannot drift between them.
+
+        When this was an update of an existing installation, the registry has to still place the
+        application in the directory it occupied before. An installer that ignored the existing
+        install and put a fresh copy somewhere else has produced a second copy, not an update,
+        and reporting that as a successful install would hide it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [string]$RegistryName = "",
+        [string]$UpdateTarget = "",
+        [switch]$Interactive
+    )
+    $recorded = $Name
+    if ($Interactive) { $recorded = "$Name (interactive)" }
+    if (-not (Test-DirectInstallerInstalled -Name $Name -RegistryName $RegistryName)) {
+        Register-AppOutcome -Name $Name -Outcome Failed -Detail "the installer reported success but independent registry verification failed"
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($UpdateTarget)) {
+        Register-AppOutcome -Name $recorded -Outcome Installed
+        return
+    }
+    $after = Get-InstalledAppRecord -NameLike $RegistryName
+    $location = ""
+    if ($after) { $location = [string]$after.InstallLocation }
+    # An installer that stopped publishing a location tells us nothing either way; only a
+    # location that resolved and MOVED is evidence of a relocation.
+    if ([string]::IsNullOrWhiteSpace($location) -or $location -ieq $UpdateTarget) {
+        Register-AppOutcome -Name $recorded -Outcome Updated -Detail $UpdateTarget
+        return
+    }
+    Register-AppOutcome -Name $Name -Outcome Failed `
+        -Detail ("the update did not stay in place: it moved from {0} to {1}, so the machine now carries two copies" -f $UpdateTarget, $location)
+}
+
 function Install-DirectInstaller {
     param([Parameter(Mandatory)][object]$Spec)
     if (-not $Spec.enabled) { return }
@@ -88,14 +277,27 @@ function Install-DirectInstaller {
     $allowedDownloadHosts = @($Spec.allowedDownloadHosts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     $allowedSignerSubjects = @($Spec.allowedSignerSubjects | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
+    # Check before installing. An application that is already here is updated in the directory it
+    # already occupies; the installer is re-run only once that directory is known, because
+    # running it blind would put a second copy at whatever default path the installer prefers.
+    $updateTarget = ""
     if (-not [string]::IsNullOrWhiteSpace($verifyName)) {
-        $existing = Get-InstalledRegistryDisplayName -NameLike $verifyName
+        $existing = Get-InstalledAppRecord -NameLike $verifyName
         if ($existing) {
-            Write-Ok "$name already installed (registry: $existing)."
-            $null = $Global:RunStats.InstalledApps.Add($name)
-            return
+            if ([string]::IsNullOrWhiteSpace($existing.InstallLocation)) {
+                Register-AppOutcome -Name $name -Outcome Skipped `
+                    -Detail ("already installed (registry: {0}), but its install location could not be resolved, so an update cannot be verified to stay in place" -f $existing.DisplayName)
+                return
+            }
+            $updateTarget = [string]$existing.InstallLocation
+            Write-Info ("{0} is already installed at {1}; updating it there." -f $name, $updateTarget)
         }
     }
+    # An update that cannot be carried out leaves the existing installation exactly as it was, so
+    # it is a warning rather than a failed run: the application is still on the machine. M-08 is
+    # about a requested component that is genuinely ABSENT, and that case still fails the run.
+    $attemptFailureOutcome = 'Failed'
+    if (-not [string]::IsNullOrWhiteSpace($updateTarget)) { $attemptFailureOutcome = 'Skipped' }
 
     if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = "${name}-installer.exe" -replace '\s','' }
 
@@ -129,8 +331,7 @@ function Install-DirectInstaller {
     $exePath  = Get-SafeDownloadCacheFilePath -FileName $fileName
 
     if (-not (Invoke-DownloadFile -Url $url -Destination $exePath -ExpectedSha256 $expectedSha256 -RequireValidSignature $requireValidSignature -AllowedHosts $allowedDownloadHosts -AllowedSignerSubjects $allowedSignerSubjects)) {
-        Write-Warn "$name download failed; skipping install."
-        $null = $Global:RunStats.FailedApps.Add($name)
+        Register-AppOutcome -Name $name -Outcome $attemptFailureOutcome -Detail "the installer download failed"
         return
     }
 
@@ -142,28 +343,21 @@ function Install-DirectInstaller {
         $silentResult = Resolve-InstallerExitCode -ExitCode $code
         if ($silentResult.Succeeded) {
             if ($silentResult.RebootPending) { Set-PendingReboot "$name installer returned $code" }
-            if (Test-DirectInstallerInstalled -Name $name -RegistryName $verifyName) {
-                Write-Ok "$name silent install succeeded and was verified."
-                $null = $Global:RunStats.InstalledApps.Add($name)
-            } else {
-                Write-Warn "$name installer returned success code $code, but independent registry verification failed."
-                $null = $Global:RunStats.FailedApps.Add($name)
-            }
+            Complete-DirectInstall -Name $name -RegistryName $verifyName -UpdateTarget $updateTarget
         } else {
             Write-Warn "$name installer exited with code $code."
             if ($Spec.fallbackInteractive) {
                 Write-Warn "Silent install may not be supported. Launching the installer interactively..."
                 $interactive = Start-Process -FilePath $exePath -Wait -PassThru -ErrorAction Stop
                 $interactiveResult = Resolve-InstallerExitCode -ExitCode $interactive.ExitCode
-                if ($interactiveResult.Succeeded -and (Test-DirectInstallerInstalled -Name $name -RegistryName $verifyName)) {
+                if ($interactiveResult.Succeeded) {
                     if ($interactiveResult.RebootPending) { Set-PendingReboot "$name interactive installer returned $($interactive.ExitCode)" }
-                    $null = $Global:RunStats.InstalledApps.Add("$name (interactive)")
+                    Complete-DirectInstall -Name $name -RegistryName $verifyName -UpdateTarget $updateTarget -Interactive
                 } else {
-                    Write-Warn "$name interactive install was not independently verified."
-                    $null = $Global:RunStats.FailedApps.Add($name)
+                    Register-AppOutcome -Name $name -Outcome $attemptFailureOutcome -Detail ("the interactive installer exited with code {0}" -f $interactive.ExitCode)
                 }
             } else {
-                $null = $Global:RunStats.FailedApps.Add($name)
+                Register-AppOutcome -Name $name -Outcome $attemptFailureOutcome -Detail ("the installer exited with code {0}" -f $code)
             }
         }
     } catch {
@@ -177,14 +371,13 @@ function Install-DirectInstaller {
             }
             # -and short-circuits, so the helper is never handed a null exit code.
             $fallbackSucceeded = ($null -ne $interactive) -and (Resolve-InstallerExitCode -ExitCode $interactive.ExitCode).Succeeded
-            if ($fallbackSucceeded -and (Test-DirectInstallerInstalled -Name $name -RegistryName $verifyName)) {
-                $null = $Global:RunStats.InstalledApps.Add("$name (interactive)")
+            if ($fallbackSucceeded) {
+                Complete-DirectInstall -Name $name -RegistryName $verifyName -UpdateTarget $updateTarget -Interactive
             } else {
-                Write-Warn "$name interactive fallback was not independently verified."
-                $null = $Global:RunStats.FailedApps.Add($name)
+                Register-AppOutcome -Name $name -Outcome $attemptFailureOutcome -Detail "the interactive fallback did not complete successfully"
             }
         } else {
-            $null = $Global:RunStats.FailedApps.Add($name)
+            Register-AppOutcome -Name $name -Outcome $attemptFailureOutcome -Detail "the silent install threw"
         }
     }
 
@@ -205,12 +398,8 @@ function Install-DirectInstaller {
             }
         } catch { Write-Warn "Could not configure Everything service: $($_.Exception.Message)" }
     }
-
-    if (-not [string]::IsNullOrWhiteSpace($verifyName)) {
-        $verified = Get-InstalledRegistryDisplayName -NameLike $verifyName
-        if ($verified) { Write-Ok "$name verified after install (registry: $verified)." }
-        else { Write-Warn "$name was not found in uninstall registry after install; verify manually if the installer used a per-user or portable layout." }
-    }
+    # No trailing registry re-check: Complete-DirectInstall already made the verified/failed call
+    # on every path above, and a second pass only reported the same fact a second time.
 }
 
 function Install-DirectInstallers {
@@ -274,6 +463,9 @@ function Install-V2RayN {
     $stage = $null
     $preserveDir = $null
     $exeRelative = $null
+    # Recorded before the payload is touched: once the folder has been emptied and refilled there
+    # is no way to tell an update of an existing install from a first install.
+    $updatingExisting = Test-Path -LiteralPath $finalDir
 
     $repo   = [string]$settings.githubRepo
     $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
@@ -314,7 +506,7 @@ function Install-V2RayN {
         $payloadRoot = Split-Path -Parent $stagedExe.FullName
         $exeRelative = $stagedExe.FullName.Substring($payloadRoot.Length).TrimStart('\')
 
-        if (Test-Path -LiteralPath $finalDir) {
+        if ($updatingExisting) {
             if (Test-UnsafeReplaceTarget -Path $finalDir) { throw "Refusing to replace an unsafe install path: $finalDir" }
             Write-Info "Existing $finalFolder folder found; replacing the application payload and keeping user data."
 
@@ -372,7 +564,10 @@ function Install-V2RayN {
         $null = $Global:RunStats.FailedApps.Add("v2rayN")
         return
     }
-    $null = $Global:RunStats.InstalledApps.Add("v2rayN")
+    # v2rayN is a portable payload, so its install folder IS its location of record: an update
+    # replaces the binaries in the folder that was already there and keeps the user data.
+    if ($updatingExisting) { Register-AppOutcome -Name "v2rayN" -Outcome Updated -Detail $finalDir }
+    else { Register-AppOutcome -Name "v2rayN" -Outcome Installed -Detail $finalDir }
     $workDir = Split-Path -Parent $exeFull
 
     if ($settings.createDesktopShortcut) {
@@ -423,8 +618,7 @@ function Install-LatestPowerShellFromGitHub {
     try { $latestVer = [version](([string]$release.tag_name).TrimStart("v")) } catch { Write-StructuredLog -Level WARN -Message ("Could not parse PowerShell release tag '{0}': {1}" -f $release.tag_name, $_.Exception.Message) }
     $currentVer = Get-PowerShellCoreVersion
     if ($currentVer -and $latestVer -and -not $s.forceInstall -and $currentVer -ge $latestVer) {
-        Write-Ok "PowerShell $currentVer already current vs GitHub latest $latestVer."
-        $null = $Global:RunStats.InstalledApps.Add("PowerShell 7")
+        Register-AppOutcome -Name "PowerShell 7" -Outcome AlreadyCurrent -Detail ("installed {0}, GitHub latest {1}" -f $currentVer, $latestVer)
         return
     }
 
@@ -466,9 +660,12 @@ function Install-LatestPowerShellFromGitHub {
         if ($msiResult.Succeeded) {
             if ($msiResult.RebootPending) { Set-PendingReboot "PowerShell 7 installer requested reboot" }
             # M-08: pwsh.exe on disk is the independent evidence; the MSI exit code is not.
-            if (Get-PowerShell7ExePath) {
-                Write-Ok "PowerShell installer completed and pwsh.exe was found."
-                $null = $Global:RunStats.InstalledApps.Add("PowerShell 7")
+            $installedPwsh = Get-PowerShell7ExePath
+            if ($installedPwsh) {
+                # The MSI is a major upgrade of the same product, so an existing PowerShell 7 is
+                # replaced where it already sits rather than installed alongside itself.
+                if ($currentVer) { Register-AppOutcome -Name "PowerShell 7" -Outcome Updated -Detail ([string]$installedPwsh) }
+                else { Register-AppOutcome -Name "PowerShell 7" -Outcome Installed -Detail ([string]$installedPwsh) }
             } else {
                 Write-Warn "PowerShell installer reported success but pwsh.exe was not found afterwards."
                 $null = $Global:RunStats.FailedApps.Add("PowerShell 7")
@@ -499,9 +696,15 @@ function Install-WindowsTerminal {
     }
 
     $pkg = [string]$s.packageId; if ([string]::IsNullOrWhiteSpace($pkg)) { $pkg = "Microsoft.WindowsTerminal" }
+    # Carried to the single recording point below rather than recorded here: wt.exe on disk is
+    # this component's verification contract, so the outcome is only booked once that check ran.
+    $outcome = 'Installed'
+    $outcomeDetail = ""
     if (Test-WingetPackageInstalled -Id $pkg) {
-        Write-Ok "Windows Terminal already installed."
-        try { [void](Invoke-LoggedCommand -FilePath (Get-WingetExecutable) -Arguments @("upgrade", "--id", $pkg, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--silent", "--source", "winget") -DisplayName "winget upgrade Windows Terminal") } catch { Write-Warn "Windows Terminal upgrade check failed: $($_.Exception.Message)" }
+        Write-Ok "Windows Terminal is already installed."
+        $update = Update-WingetPackageInPlace -Name "Windows Terminal" -Id $pkg
+        $outcome = $update.Outcome
+        $outcomeDetail = $update.Detail
     } else {
         $wingetInstallArgs = @("install", "--id", $pkg, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget")
         if ($s.interactiveInstaller) { $wingetInstallArgs += "--interactive" } else { $wingetInstallArgs += "--silent" }
@@ -528,7 +731,7 @@ function Install-WindowsTerminal {
         $null = $Global:RunStats.FailedApps.Add("Windows Terminal")
         return
     }
-    $null = $Global:RunStats.InstalledApps.Add("Windows Terminal")
+    Register-AppOutcome -Name "Windows Terminal" -Outcome $outcome -Detail $outcomeDetail
     if ($s.setAsDefaultTerminal)              { Set-WindowsTerminalAsDefault }
     if ($s.setPowerShell7AsDefaultProfile)    { Set-WindowsTerminalPowerShell7Default }
 }
@@ -972,8 +1175,7 @@ function Install-DotNetFramework35 {
     Write-Info "Installing .NET Framework 3.5 feature."
 
     if ($true -eq (Test-DotNetFramework35Enabled)) {
-        Write-Ok ".NET Framework 3.5 is already enabled."
-        $null = $Global:RunStats.InstalledApps.Add($runtimeName)
+        Register-AppOutcome -Name $runtimeName -Outcome AlreadyCurrent -Detail "the Windows feature is already enabled"
         return
     }
 
@@ -1032,8 +1234,7 @@ function Install-DotNetFramework4Plus {
     $requiredRelease = 533320
     $rv = Get-DotNetFrameworkReleaseValue
     if ($rv -ge $requiredRelease) {
-        Write-Ok ".NET Framework 4.8.1+ already installed (release $rv)."
-        $null = $Global:RunStats.InstalledApps.Add($runtimeName)
+        Register-AppOutcome -Name $runtimeName -Outcome AlreadyCurrent -Detail ("NDP v4 release {0}" -f $rv)
         return
     }
     $url = [string]$Global:Config.runtimes.dotNetFramework481OfflineUrl
@@ -1131,8 +1332,10 @@ function Install-WingetRuntimePackage {
     param([Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][string]$Id)
     try {
         if (Test-WingetPackageInstalled -Id $Id) {
-            Write-Ok "$Name already installed."
-            $null = $Global:RunStats.InstalledApps.Add($Name)
+            # Check then update: recording an installed runtime and returning left every machine
+            # on the runtime build it was first provisioned with, for good.
+            $update = Update-WingetPackageInPlace -Name $Name -Id $Id
+            Register-AppOutcome -Name $Name -Outcome $update.Outcome -Detail $update.Detail
             return
         }
         $runtimeResult = Invoke-LoggedCommand -FilePath (Get-WingetExecutable) -Arguments @("install", "--id", $Id, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--source", "winget", "--silent") -DisplayName "winget runtime $Name"
@@ -1140,8 +1343,7 @@ function Install-WingetRuntimePackage {
             Write-Warn "$Name install exit code $($runtimeResult.ExitCode)."
             $null = $Global:RunStats.FailedApps.Add($Name)
         } elseif (Test-WingetPackageInstalled -Id $Id) {
-            Write-Ok "$Name installed and verified."
-            $null = $Global:RunStats.InstalledApps.Add($Name)
+            Register-AppOutcome -Name $Name -Outcome Installed
         } else {
             Write-Warn "$Name reported a successful install but is not detectable afterwards."
             $null = $Global:RunStats.FailedApps.Add($Name)
