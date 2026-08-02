@@ -51,12 +51,36 @@ function Wait-ProcessWithStatus {
     # TimeSpan and returns the line to show.
     # A Refresh() failure breaks the loop rather than being swallowed: the handle is gone, so
     # continuing would poll a dead object every 2s forever.
+    #
+    # Every process wait in the download/install path routes through here - the app-download
+    # prefetch child and every installer alike - so the deadline belongs here rather than at each
+    # call site, where one omission would silently restore an unbounded wait. A handle that simply
+    # never exits used to spin here with no bound at all, so one hung installer blocked -Full
+    # setup forever.
+    #
+    # The default is deliberately generous: a large runtime installer on a slow link is slow, not
+    # hung. This is a ceiling that guarantees termination, not an expected duration.
     param(
         [Parameter(Mandatory)][object]$Process,
         [Parameter(Mandatory)][datetime]$Started,
-        [Parameter(Mandatory)][scriptblock]$StatusFormat
+        [Parameter(Mandatory)][scriptblock]$StatusFormat,
+        [int]$TimeoutSeconds = 3600
     )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while (-not $Process.HasExited) {
+        if ((Get-Date) -ge $deadline) {
+            Clear-StatusInPlace
+            # taskkill /T because Process.Kill($true) does not exist on the .NET Framework that
+            # Windows PowerShell 5.1 runs on, and killing only the parent would leave an
+            # installer's own children running. 2>$null, not 2>&1: merging a native command's
+            # stderr into the success stream raises a terminating NativeCommandError on 5.1.
+            try { & taskkill.exe /PID $Process.Id /T /F 2>$null | Out-Null } catch { $null = $_ }
+            Write-StructuredLog -Level ERROR -Message ("Process {0} exceeded {1}s; process tree terminated." -f $Process.Id, $TimeoutSeconds)
+            # No throw: both callers already inspect ExitCode, and a terminated process reports a
+            # non-zero one - so the existing failure handling applies without a second path.
+            try { $Process.Refresh() } catch { $null = $_ }
+            return
+        }
         Write-StatusInPlace (& $StatusFormat ((Get-Date) - $Started))
         Start-Sleep -Seconds 2
         try { $Process.Refresh() } catch { break }

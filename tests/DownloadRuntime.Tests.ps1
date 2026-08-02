@@ -195,7 +195,36 @@ try {
     Assert-Equal 1 $script:StatusLines.Count "The status line must be written once before the handle failure ends the wait."
     Assert-True ($null -ne $elapsedSeen) "The status formatter must receive the elapsed TimeSpan."
 
-    Write-Host "PASS download path completes over a real transport, validates the final redirected URI on this host, and ends the status wait on a dead process handle."
+    # ---- 5. A process that never exits must be terminated at the deadline, tree and all. ----
+    # This is the wait that both the app-download prefetch and every installer route through. A
+    # healthy handle that simply never exits used to spin here forever, so one hung installer or
+    # one hung prefetch child blocked -Full setup with no deadline at all.
+    # A REAL process is used: a fake object would let the deadline branch call taskkill against
+    # whatever unrelated process happens to hold that pid. cmd.exe spawning ping gives a genuine
+    # two-level tree, so /T is proven rather than assumed.
+    $script:StatusLines.Clear()
+    # 30s of runtime against a 3s budget: long enough that only the deadline can end the wait
+    # early, short enough that replaying this suite against a build with the deadline removed
+    # costs 30s rather than hanging.
+    $hung = Start-Process -FilePath $env:ComSpec -ArgumentList @('/c', 'ping -n 30 127.0.0.1 > nul') -WindowStyle Hidden -PassThru
+    try {
+        $null = $hung.Handle
+        $bounded = [Diagnostics.Stopwatch]::StartNew()
+        Wait-ProcessWithStatus -Process $hung -Started (Get-Date) -TimeoutSeconds 3 -StatusFormat {
+            param($elapsed) "hung [{0:hh\:mm\:ss}]" -f $elapsed
+        }
+        $bounded.Stop()
+        Assert-True ($bounded.Elapsed.TotalSeconds -lt 15) `
+            ("A process that never exits must be ended at its deadline, not waited on forever. Took {0:n1}s." -f $bounded.Elapsed.TotalSeconds)
+        $hung.Refresh()
+        Assert-Equal $true $hung.HasExited `
+            "The deadline must terminate the process, not merely stop watching it - a hung installer left running is worse than a hung wait."
+    } finally {
+        try { if (-not $hung.HasExited) { & taskkill.exe /PID $hung.Id /T /F 2>$null | Out-Null } } catch { $null = $_ }
+        try { $hung.Dispose() } catch { $null = $_ }
+    }
+
+    Write-Host "PASS download path completes over a real transport, validates the final redirected URI on this host, ends the status wait on a dead process handle, and terminates a process that outruns its deadline."
 } finally {
     # Stopping the listener aborts the pending GetContext, so the worker loop exits at once.
     try { $listener.Stop() } catch { $null = $_ }

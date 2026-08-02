@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **A hung installer or prefetch child no longer blocks setup forever.** `Wait-ProcessWithStatus` — the single wait every download and installer routes through — looped on `HasExited` with no deadline. It now takes a `-TimeoutSeconds` ceiling (default one hour; a slow installer on a slow link is slow, not hung) and on expiry terminates the whole process tree with `taskkill /T /F` and logs it. Both callers already treat a non-zero exit code as failure, so the existing handling applies unchanged. The deadline lives in the shared helper rather than at each call site, where one omission would silently restore an unbounded wait.
+- **Relocation no longer deletes the original directory while the original process is still running.** The deferred cleanup script waited with `Wait-Process -Id … -Timeout 60` under `$ErrorActionPreference = 'SilentlyContinue'`. `Wait-Process -Timeout` raises a *non-terminating* error on expiry, so it was swallowed and the intended `catch` fallback never ran. Liveness is now observed after the wait, and a parent that is still running is one of the conditions that refuses the deletion outright.
+- **An unsafe relocation source/target pair is refused before the copy, not after it.** The existing guard against a nested pair, an identical pair or a drive root lived only in the cleanup script — which does not exist until `robocopy /E` has already run. A target nested inside the source was therefore copied into itself and merely refused afterwards, leaving a duplicated, recursed tree with no way to undo it. The same verdict now gates the copy itself.
+
+### Changed
+
+- The Windows Update install poll is its own function, `Wait-WindowsUpdateJob`, taking its budget as a parameter. Behaviour is unchanged — `windowsUpdate.jobTimeoutMinutes` is still validated as whole minutes with a 1-minute floor applied at the call site — but the timeout branch is now exercised by a real test instead of a source-text assertion. It previously cost 60 seconds of real `Stopwatch` time to reach, which was this project's last documented coverage gap.
+
 ### Security
 
 - **`FU-04` follow-up — the health check and the staged task now watch the same deadline marker.** With the default empty `statePath`, the staged blocker runs from `%ProgramData%\WinServerSetup\tasks` and derives its state directory from where it *itself* lives, so it wrote its marker under `%ProgramData%\WinServerSetup\state`. `Get-BlockerDeadlineMarkerPath` instead recomputed that default from `$Global:ProjectRoot`, the checkout path — so the health check watched a file nobody writes and could report healthy while a real deadline marker still stood.

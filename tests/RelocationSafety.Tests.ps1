@@ -14,6 +14,7 @@
 # -MainScript targets an alternate copy so these tests can be replayed against a deliberately
 # defective build to prove they still fail. CI and local runs use the default.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Stub signatures mirror production collaborators so parameter binding matches.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'Start-Process is shadowed deliberately so the relocation copy can be observed without running robocopy.')]
 param([string]$MainScript = "")
 
 $ErrorActionPreference = "Stop"
@@ -157,13 +158,14 @@ try {
     # If anyone edits the here-string near WinServerSetup.ps1:915-923, THIS MIRROR MUST BE
     # UPDATED TO MATCH. The fragment assertions in (a) are what will catch that drift.
     # =========================================================================================
-    $guardStart = $source.IndexOf('`$unsafe = -not `$src')
+    $guardStart = $source.IndexOf('`$unsafe = `$parentStillRunning')
     Assert-True ($guardStart -ge 0) "The deferred cleanup script must still compute an `$unsafe verdict before deleting anything."
     $guardEnd = $source.IndexOf('Refusing to remove unsafe relocation source', $guardStart)
     Assert-True ($guardEnd -gt $guardStart) "The `$unsafe verdict must still be enforced by a throw."
     $guardBlock = $source.Substring($guardStart, $guardEnd - $guardStart)
 
     $requiredGuardFragments = @(
+        '`$parentStillRunning',
         '[string]::Equals(`$src, `$root, [System.StringComparison]::OrdinalIgnoreCase)',
         '[string]::Equals(`$src, `$dst, [System.StringComparison]::OrdinalIgnoreCase)',
         '`$dst.StartsWith(`$src + ''\'', [System.StringComparison]::OrdinalIgnoreCase)',
@@ -179,12 +181,14 @@ try {
     }
 
     function Test-UnsafeRelocationSourceMirror {
-        param([string]$SourcePath, [string]$TargetPath, [string]$MarkerTarget, [string]$MarkerToken, [string]$ReadinessToken)
+        param([string]$SourcePath, [string]$TargetPath, [string]$MarkerTarget, [string]$MarkerToken, [string]$ReadinessToken,
+            [bool]$ParentStillRunning = $false)
         $src = [System.IO.Path]::GetFullPath($SourcePath).TrimEnd('\')
         $dst = [System.IO.Path]::GetFullPath($TargetPath).TrimEnd('\')
         $root = [System.IO.Path]::GetPathRoot($src).TrimEnd('\')
         $markerTarget = [System.IO.Path]::GetFullPath($MarkerTarget).TrimEnd('\')
-        return (-not $src -or -not $dst -or [string]::Equals($src, $root, [System.StringComparison]::OrdinalIgnoreCase) -or
+        return ($ParentStillRunning -or
+            -not $src -or -not $dst -or [string]::Equals($src, $root, [System.StringComparison]::OrdinalIgnoreCase) -or
             [string]::Equals($src, $dst, [System.StringComparison]::OrdinalIgnoreCase) -or
             $dst.StartsWith($src + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
             $src.StartsWith($dst + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
@@ -219,6 +223,57 @@ try {
         "A marker token that does not match this run must block cleanup."
     Assert-Equal $true (Test-UnsafeRelocationSourceMirror -SourcePath $guardSource -TargetPath $guardTarget -MarkerTarget $otherTarget -MarkerToken $guardToken -ReadinessToken $guardToken) `
         "A marker naming a different target than the one being kept must block cleanup."
+    Assert-Equal $true (Test-UnsafeRelocationSourceMirror -SourcePath $guardSource -TargetPath $guardTarget -MarkerTarget $guardTarget -MarkerToken $guardToken -ReadinessToken $guardToken -ParentStillRunning $true) `
+        "A parent that outlived its 60s wait must block cleanup. Wait-Process -Timeout raises a NON-terminating error, so under SilentlyContinue the old catch never ran and the source was deleted with the original process still live."
+
+    # =========================================================================================
+    # The unsafe pair must be rejected BEFORE the copy, not after it.
+    # =========================================================================================
+    # The $unsafe guard above is real, but it runs in the deferred cleanup script - which only
+    # exists after robocopy /E has already run. A target nested inside the source therefore got
+    # copied into itself first and was refused only at cleanup, leaving a duplicated/recursed
+    # tree behind and no way to undo it. The same verdict has to gate the copy itself.
+    . ([scriptblock]::Create((Import-FunctionUnderTest 'Invoke-SelfRelocateIfNeeded' $setupAsts)))
+    function Write-StartupLine { param($State, $Label, $Value, $ValueKind) }
+    function Ensure-Directory { param($Path) if (-not (Test-Path -LiteralPath $Path)) { Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $Path -Force | Out-Null } }
+    function Start-Process {
+        param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $WindowStyle, [switch]$NoNewWindow, $ErrorAction)
+        $script:CopyAttempts.Add([string]$FilePath) | Out-Null
+        throw "COPY-ATTEMPTED: $FilePath"
+    }
+
+    $relocateSource = New-TestProjectDirectory (Join-Path $testRoot 'relocate-src')
+    $unsafePairs = @(
+        @{ Target = (Join-Path $relocateSource 'inner'); Why = 'a target nested inside the source makes robocopy /E copy the tree into itself' }
+        @{ Target = ([System.IO.Path]::GetPathRoot($relocateSource).TrimEnd('\')); Why = 'a drive root as the target would later make the source undeletable and mixes the project into the volume root' }
+    )
+    $Global:NoRelocate = $false
+    foreach ($pair in $unsafePairs) {
+        $script:CopyAttempts = New-Object System.Collections.Generic.List[string]
+        $Global:ProjectRoot = $relocateSource
+        $Global:Config = [pscustomobject]@{
+            selfRelocate      = [pscustomobject]@{ enabled = $true }
+            targetProjectRoot = [string]$pair.Target
+        }
+        $rejected = $false
+        try { Invoke-SelfRelocateIfNeeded | Out-Null } catch { $rejected = ($_.Exception.Message -notlike 'COPY-ATTEMPTED*') }
+        Assert-Equal 0 $script:CopyAttempts.Count `
+            ("Relocation must refuse this pair before copying anything: {0}. Attempted: {1}" -f $pair.Why, ($script:CopyAttempts -join ', '))
+        Assert-Equal $true $rejected `
+            ("An unsafe relocation pair must fail loudly rather than proceed: {0}" -f $pair.Why)
+    }
+
+    # The same guard must not reject a legitimate relocation - a rule that refuses everything
+    # would pass the two cases above while disabling the feature entirely.
+    $script:CopyAttempts = New-Object System.Collections.Generic.List[string]
+    $Global:ProjectRoot = $relocateSource
+    $Global:Config = [pscustomobject]@{
+        selfRelocate      = [pscustomobject]@{ enabled = $true }
+        targetProjectRoot = (Join-Path $testRoot 'relocate-dst')
+    }
+    try { Invoke-SelfRelocateIfNeeded | Out-Null } catch { $null = $_ }
+    Assert-Equal 1 $script:CopyAttempts.Count `
+        "A sibling target is a legitimate relocation and must still reach the copy - otherwise the guard has simply disabled relocation."
 
     # ---- Retained source greps: cheap smoke checks over the parent/child argument contract,
     #      which is exercised only by a real relocation. ----
@@ -229,7 +284,7 @@ try {
     Assert-True ($source -match 'Refusing to remove unsafe relocation source') "Cleanup must reject root, missing-project, nested, or unverified source paths."
     Assert-True ($source -match 'ReadinessToken') "Cleanup must independently verify the readiness token before deleting the source."
 
-    Write-Host "PASS relocation readiness handshake runs for real; the deferred-cleanup guard is covered by a labelled MIRROR (see the MIRROR block) because it lives in a generated here-string."
+    Write-Host "PASS relocation readiness handshake runs for real, an unsafe source/target pair is refused BEFORE the copy, and the deferred-cleanup guard - including the parent-still-running condition - is covered by a labelled MIRROR (see the MIRROR block) because it lives in a generated here-string."
 } finally {
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
