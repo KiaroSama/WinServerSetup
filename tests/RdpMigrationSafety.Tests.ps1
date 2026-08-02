@@ -38,7 +38,7 @@ $setupAsts = @(Get-SetupAst -Files $setupSourceFiles -Because 'its RDP migration
 $source = ($setupSourceFiles | ForEach-Object { Get-Content -LiteralPath $_ -Raw -Encoding UTF8 }) -join "`r`n"
 
 foreach ($name in @('Get-TermServiceProcessId', 'Test-TermServiceOwnsTcpPort', 'Wait-TermServiceTcpPort', 'Restore-RdpPort',
-        'Test-TcpPortListening', 'Ensure-RdpFirewallRule', 'Configure-RdpPortAndFirewall',
+        'Test-TcpPortListening', 'Ensure-RdpFirewallRule', 'Read-RdpTargetPort', 'Configure-RdpPortAndFirewall',
         'Get-ManagedFirewallRuleState', 'Restore-ManagedFirewallRuleState', 'Invoke-RdpMigrationRollback',
         'Invoke-RdpServicePortActivation', 'Get-RdpRegistryPortNumber')) {
     . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
@@ -208,6 +208,25 @@ $script:NewRuleThrows    = $false
 $script:RemoveRuleThrows = $false
 $script:VerifyRuleBroken = $false
 $script:BackupCount      = 0
+# One ORDERED record of the three event kinds whose relative order is the anti-lockout contract:
+# the new port's allow rule, the PortNumber write, the service restart, and the old port's block
+# rule. Kept separate from $script:FirewallCalls, which only ever sees firewall operations.
+$script:Timeline         = New-Object System.Collections.Generic.List[string]
+# Scripted operator answers for the port prompt, consumed one per Read-HostThemed call.
+$script:PromptAnswers    = New-Object System.Collections.Generic.Queue[string]
+$script:PromptCount      = 0
+$script:PromptThrows     = $false
+
+function Read-HostThemed {
+    # Mirrors scripts\Console.ps1: a blank answer yields the offered default.
+    param([Parameter(Mandatory)][string]$Prompt, [string]$DefaultValue = "")
+    $script:PromptCount++
+    if ($script:PromptThrows) { throw "Cannot read from the host: the input stream is redirected." }
+    if ($script:PromptAnswers.Count -eq 0) { throw "The suite ran out of scripted prompt answers (prompt: $Prompt)." }
+    $answer = [string]$script:PromptAnswers.Dequeue()
+    if ([string]::IsNullOrWhiteSpace($answer) -and -not [string]::IsNullOrWhiteSpace($DefaultValue)) { return $DefaultValue }
+    return $answer
+}
 
 function Wait-TermServiceTcpPort {
     param([int]$Port, [int]$TimeoutSeconds = 30)
@@ -223,6 +242,7 @@ function Get-NetTCPConnection {
 function Restart-Service {
     param([string]$Name, [switch]$Force, $ErrorAction)
     $script:RestartCount++
+    $script:Timeline.Add('SVC-RESTART') | Out-Null
     if ($script:RestartFails) { throw "Service '$Name' could not be restarted." }
     # The service releases whatever it held and binds the port scripted for this restart. A
     # scripted 0 models "the registry value was rejected and nothing came back up".
@@ -238,7 +258,10 @@ function Get-ItemProperty {
 function Set-ItemProperty {
     param([string]$Path, [string]$Name, $Type, $Value, $ErrorAction)
     $script:SetItemPropertyCalls.Add([pscustomobject]@{ Path = $Path; Name = $Name; Type = [string]$Type; Value = $Value }) | Out-Null
-    if ($Name -eq 'PortNumber') { $script:RegistryPort = [int]$Value }
+    if ($Name -eq 'PortNumber') {
+        $script:RegistryPort = [int]$Value
+        $script:Timeline.Add("REG-PORT $Value") | Out-Null
+    }
 }
 function Backup-RdpRegistryKey { $script:BackupCount++; return 'TestDrive:\backup.reg' }
 function Set-StepSkipped { param([string]$Reason) }
@@ -258,6 +281,7 @@ function Get-NetFirewallRule {
 function New-NetFirewallRule {
     param([string]$DisplayName, [string]$Direction, [string]$Protocol, $LocalPort, [string]$Action, [string]$Profile, $ErrorAction)
     $script:FirewallCalls.Add("NEW $DisplayName") | Out-Null
+    $script:Timeline.Add("FW-NEW $DisplayName") | Out-Null
     if ($script:NewRuleThrows) { throw "The parameter is incorrect." }
     $script:FirewallRules[$DisplayName] = [pscustomobject]@{
         DisplayName = $DisplayName; Enabled = 'True'; Action = $Action; Direction = $Direction
@@ -342,11 +366,26 @@ function Reset-MigrationState {
     $script:FirewallRules    = $Rules
     $script:FirewallCalls.Clear()
     $script:BackupCount      = 0
+    $script:Timeline.Clear()
+    # The migration-mechanics cases below are not about the prompt, so they run the noninteractive
+    # path and take the configured port. The prompt cases opt back in explicitly.
+    $Global:NoPause          = $true
+    $script:PromptAnswers    = New-Object System.Collections.Generic.Queue[string]
+    $script:PromptCount      = 0
+    $script:PromptThrows     = $false
 }
 function Invoke-MigrationExpectingFailure {
     $migrationError = $null
     try { Configure-RdpPortAndFirewall } catch { $migrationError = [string]$_.Exception.Message }
     Assert-True ($null -ne $migrationError) "M-10: a failed migration must throw instead of returning quietly."
+    # FAIL OPEN - the single most important property of this whole file, asserted here rather than
+    # per case so it covers every present and future failure injection. Whatever failed, and at
+    # whatever stage, the port the operator is currently connected on must still be reachable. A
+    # block rule for the previous port surviving a failed migration IS the lockout.
+    Assert-Equal 0 (@($script:FirewallRules.Keys | Where-Object { $_ -like 'WinServerSetup Block Old RDP TCP *' }).Count) `
+        ("FAIL-OPEN: a failed migration must never leave the previous RDP port blocked. Failure: {0}" -f $migrationError)
+    Assert-Equal 0 (@($script:Timeline | Where-Object { $_ -like 'FW-NEW WinServerSetup Block Old RDP TCP *' }).Count) `
+        ("FAIL-OPEN: a failed migration must never even attempt to block the previous RDP port. Failure: {0}" -f $migrationError)
     return $migrationError
 }
 
@@ -450,6 +489,131 @@ $failure = Invoke-MigrationExpectingFailure
 Assert-True ($failure -match 'rollback failed') ("M-10: a failed rollback must be reported as such. Got: {0}" -f $failure)
 Assert-True ($failure -match 'Access is denied') ("M-10: the rollback failure must carry the underlying reason. Got: {0}" -f $failure)
 
+# =============================================================================================
+# ORDER-1: the anti-lockout ORDERING, asserted as an order and not as a set of side effects.
+#
+# Every case above proves that some individual step happened. None of them proves the sequence,
+# and the sequence is the whole contract: the new port must be reachable BEFORE the old one is
+# closed. Reordering the block ahead of the restart, or ahead of the allow rule, keeps every
+# other assertion in this file green while stranding the operator.
+# =============================================================================================
+$Global:Config = New-RdpMigrationConfig
+Reset-MigrationState -RegistryPort 3389 -Listeners @{ 3389 = @(4321) } -RestartBinds @(5801)
+Configure-RdpPortAndFirewall
+# NOT named $timeline: PowerShell variable names are case-insensitive, so a local $timeline at
+# script scope IS $script:Timeline and would replace the List with a fixed-size array.
+$orderLog = @($script:Timeline)
+$allowNew = [array]::IndexOf($orderLog, 'FW-NEW WinServerSetup RDP TCP 5801')
+$regWrite = [array]::IndexOf($orderLog, 'REG-PORT 5801')
+$restart  = [array]::IndexOf($orderLog, 'SVC-RESTART')
+$blockOld = [array]::IndexOf($orderLog, 'FW-NEW WinServerSetup Block Old RDP TCP 3389')
+$shown    = ($orderLog -join ' -> ')
+Assert-True ($allowNew -ge 0) ("ORDER: the new port's inbound allow rule must be created. Timeline: {0}" -f $shown)
+Assert-True ($regWrite -ge 0) ("ORDER: PortNumber must be written. Timeline: {0}" -f $shown)
+Assert-True ($restart -ge 0)  ("ORDER: TermService must be restarted. Timeline: {0}" -f $shown)
+Assert-True ($blockOld -ge 0) ("ORDER: the previous port must eventually be blocked. Timeline: {0}" -f $shown)
+Assert-True ($allowNew -lt $regWrite) `
+    ("ORDER: the new port must be allowed through the firewall BEFORE the service is moved onto it. Timeline: {0}" -f $shown)
+Assert-True ($regWrite -lt $restart) `
+    ("ORDER: PortNumber must be written before the restart that makes it take effect. Timeline: {0}" -f $shown)
+Assert-True ($restart -lt $blockOld) `
+    ("ORDER: the previous port may only be blocked AFTER the restart that binds the new one. Timeline: {0}" -f $shown)
+Assert-Equal ($orderLog.Count - 1) $blockOld `
+    ("ORDER: blocking the previous port must be the LAST action of the migration. Timeline: {0}" -f $shown)
+
+# =============================================================================================
+# PROMPT: the operator is asked which port to use before anything is touched (item 4).
+#
+# The configured rdp.newPort is an offered default, not a decision. Every case below drives the
+# real Configure-RdpPortAndFirewall with a scripted answer.
+# =============================================================================================
+
+# ---- PROMPT.1 The ANSWERED port is the one that gets migrated to - registry, allow rule, and
+#      the block rule that names the actual previous registry port.
+#
+#      The machine starts ON the configured port deliberately. Ignoring the answer would then be
+#      an entirely successful no-op migration, so this case is caught by the assertions below
+#      rather than by a downstream "did not bind" failure that would fire whatever the cause. ----
+$Global:Config = New-RdpMigrationConfig -NewPort 5801
+Reset-MigrationState -RegistryPort 5801 -Listeners @{ 5801 = @(4321) } -RestartBinds @(5999)
+$Global:NoPause = $false
+$script:PromptAnswers.Enqueue('5999')
+Configure-RdpPortAndFirewall
+Assert-Equal 1 $script:PromptCount "PROMPT: an interactive migration must ask for the port exactly once."
+Assert-Equal 5999 $script:RegistryPort "PROMPT: the answered port must be the one written to the registry, not the configured default."
+Assert-True ($script:FirewallRules.ContainsKey('WinServerSetup RDP TCP 5999')) "PROMPT: the allow rule must be created for the ANSWERED port."
+Assert-Equal $false ($script:FirewallRules.ContainsKey('WinServerSetup RDP TCP 5801')) "PROMPT: no rule may be published for the configured port the operator overrode."
+Assert-True ($script:FirewallRules.ContainsKey('WinServerSetup Block Old RDP TCP 5801')) "PROMPT: the previous port must still be blocked once the answered port is verified."
+Assert-Equal 5999 ([int]$Global:Config.rdp.newPort) `
+    "PROMPT: the chosen port must become this run's effective rdp.newPort, or the very next step (the blocker's port-agreement check) refuses."
+
+# ---- PROMPT.2 Pressing Enter accepts the configured value. ----
+$Global:Config = New-RdpMigrationConfig -NewPort 5801
+Reset-MigrationState -RegistryPort 3389 -Listeners @{ 3389 = @(4321) } -RestartBinds @(5801)
+$Global:NoPause = $false
+$script:PromptAnswers.Enqueue('')
+Configure-RdpPortAndFirewall
+Assert-Equal 1 $script:PromptCount "PROMPT: an empty answer must still have gone through the prompt."
+Assert-Equal 5801 $script:RegistryPort "PROMPT: an empty answer must fall back to the configured port."
+
+# ---- PROMPT.3 A non-numeric or out-of-range answer must re-ask, never be coerced. '0' and
+#      '70000' both cast to a plausible-looking int; only a range check rejects them. ----
+$Global:Config = New-RdpMigrationConfig -NewPort 5801
+Reset-MigrationState -RegistryPort 3389 -Listeners @{ 3389 = @(4321) } -RestartBinds @(5999)
+$Global:NoPause = $false
+foreach ($bad in @('not-a-port', '70000', '0')) { $script:PromptAnswers.Enqueue($bad) | Out-Null }
+$script:PromptAnswers.Enqueue('5999') | Out-Null
+Configure-RdpPortAndFirewall
+Assert-Equal 4 $script:PromptCount "PROMPT: each invalid answer must produce another prompt."
+Assert-Equal 5999 $script:RegistryPort "PROMPT: only the valid answer may reach the registry."
+Assert-Equal 0 (@($script:SetItemPropertyCalls | Where-Object { $_.Name -eq 'PortNumber' -and [int]$_.Value -ne 5999 }).Count) `
+    "PROMPT: an invalid answer must never be written to PortNumber."
+
+# ---- PROMPT.4 A port another process already holds is refused at the prompt, so the operator
+#      gets to correct it instead of the migration aborting after the fact. ----
+$Global:Config = New-RdpMigrationConfig -NewPort 5801
+Reset-MigrationState -RegistryPort 3389 -Listeners @{ 3389 = @(4321); 6000 = @(9999) } -RestartBinds @(5999)
+$Global:NoPause = $false
+$script:PromptAnswers.Enqueue('6000') | Out-Null
+$script:PromptAnswers.Enqueue('5999') | Out-Null
+Configure-RdpPortAndFirewall
+Assert-Equal 2 $script:PromptCount "PROMPT: a port held by another listener must be re-asked, not accepted."
+Assert-Equal 5999 $script:RegistryPort "PROMPT: the occupied port must never reach the registry."
+Assert-Equal $false ($script:FirewallRules.ContainsKey('WinServerSetup RDP TCP 6000')) "PROMPT: no rule may be published for an occupied port."
+
+# ---- PROMPT.5 An unattended run (-NoPause) must never block on the prompt. ----
+$Global:Config = New-RdpMigrationConfig -NewPort 5801
+Reset-MigrationState -RegistryPort 3389 -Listeners @{ 3389 = @(4321) } -RestartBinds @(5801)
+Configure-RdpPortAndFirewall
+Assert-Equal 0 $script:PromptCount "PROMPT: a -NoPause run must not prompt at all."
+Assert-Equal 5801 $script:RegistryPort "PROMPT: a -NoPause run must migrate to the configured port."
+
+# ---- PROMPT.6 A host with no readable console must fall back to the configured value and SAY
+#      so, rather than throwing and leaving the step failed. ----
+$Global:Config = New-RdpMigrationConfig -NewPort 5801
+Reset-MigrationState -RegistryPort 3389 -Listeners @{ 3389 = @(4321) } -RestartBinds @(5801)
+$Global:NoPause = $false
+$script:PromptThrows = $true
+Configure-RdpPortAndFirewall
+Assert-Equal 1 $script:PromptCount "PROMPT: the unreadable console must have been attempted once."
+Assert-Equal 5801 $script:RegistryPort "PROMPT: an unreadable console must fall back to the configured port, not fail the migration."
+Assert-True ((($script:Warnings) -join "`n") -match '5801') "PROMPT: the fallback must be logged with the port it fell back to."
+
+# ---- PROMPT.7 Answers that never become valid abort with NOTHING touched. This is the prompt's
+#      own fail-open case: no registry write, no restart, and not one firewall call. ----
+$Global:Config = New-RdpMigrationConfig -NewPort 5801
+Reset-MigrationState -RegistryPort 3389 -Listeners @{ 3389 = @(4321) }
+$Global:NoPause = $false
+foreach ($bad in @('0', '-1', '65536', 'nope', '3389abc')) { $script:PromptAnswers.Enqueue($bad) | Out-Null }
+$failure = Invoke-MigrationExpectingFailure
+Assert-True ($failure -match 'no RDP settings were changed') ("PROMPT: the abort must state that nothing was changed. Got: {0}" -f $failure)
+Assert-Equal 3389 $script:RegistryPort "PROMPT: an abandoned prompt must leave PortNumber alone."
+Assert-Equal 0 $script:RestartCount "PROMPT: an abandoned prompt must not restart TermService."
+Assert-Equal 0 $script:FirewallCalls.Count `
+    ("PROMPT: the prompt must run before any firewall work, so an abort touches nothing. Calls: {0}" -f ($script:FirewallCalls -join ' | '))
+Assert-Equal 0 $script:Timeline.Count "PROMPT: an abandoned prompt must produce no migration events at all."
+$Global:NoPause = $true
+
 # ---- Retained source greps: cheap smoke checks over call sites that are not directly invoked
 #      here (Configure-RdpPortAndFirewall drives real registry and firewall APIs). ----
 Assert-True ($source -match 'function\s+Test-TermServiceOwnsTcpPort') "RDP verification must prove TermService owns the listener."
@@ -465,4 +629,4 @@ Assert-True ($source -match 'Invoke-RdpMigrationRollback -FirewallState') `
 Assert-True ($source -notmatch '(?m)^\s*Restore-RdpPort -RegistryPath \$rdpPath') `
     "M-10: Configure-RdpPortAndFirewall must not roll the registry back on its own and leave the firewall rule behind."
 
-Write-Host "PASS RDP listener ownership, the collision guard, the bounded wait, every rollback branch, the M-09 three-branch activation (including an idempotent rerun) and the M-10 firewall rollback all execute correctly against mocked Windows APIs."
+Write-Host "PASS RDP listener ownership, the collision guard, the bounded wait, every rollback branch, the M-09 three-branch activation (including an idempotent rerun), the M-10 firewall rollback, the allow-before-move / block-last ordering and the operator port prompt all execute correctly against mocked Windows APIs."

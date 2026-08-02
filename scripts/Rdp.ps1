@@ -292,11 +292,58 @@ function Ensure-RdpFirewallRule {
     }
 }
 
+function Read-RdpTargetPort {
+    <#
+        The operator picks the port BEFORE anything is enabled, written, restarted or published.
+        rdp.newPort is the offered default, not the decision.
+
+        Validating here rather than downstream is deliberate: a typo or an occupied port costs a
+        re-prompt instead of a registry write plus a rollback, and abandoning the prompt leaves
+        the machine exactly as it was found - current port still bound, still open, still
+        reachable.
+
+        A run that cannot ask keeps the configured value and says so. -NoPause is an unattended
+        provisioning run, and a host with no readable console (redirected input, a -NonInteractive
+        child) would otherwise throw here and fail a step that had a perfectly good default.
+    #>
+    param([Parameter(Mandatory)][int]$ConfiguredPort)
+
+    if ($Global:NoPause) {
+        Write-Info ("Noninteractive run: keeping the configured RDP port {0} without prompting." -f $ConfiguredPort)
+        return $ConfiguredPort
+    }
+    $maxAttempts = 5
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $answer = ''
+        try {
+            $answer = [string](Read-HostThemed -Prompt 'Which TCP port should Remote Desktop listen on' -DefaultValue ([string]$ConfiguredPort))
+        } catch {
+            Write-Warn ("No console is available to choose an RDP port ({0}); keeping the configured {1}." -f $_.Exception.Message, $ConfiguredPort)
+            return $ConfiguredPort
+        }
+        $port = 0
+        if (-not [int]::TryParse($answer.Trim(), [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+            Write-Warn ("'{0}' is not a TCP port number; enter a value between 1 and 65535." -f $answer)
+            continue
+        }
+        # Refused here rather than after the migration starts, so the operator can correct it.
+        if ((Test-TcpPortListening -Port $port) -and -not (Test-TermServiceOwnsTcpPort -Port $port)) {
+            Write-Warn ("TCP {0} is already held by another listener; choose a port nothing else is using." -f $port)
+            continue
+        }
+        return $port
+    }
+    throw ("No usable RDP port was chosen after {0} attempts; no RDP settings were changed." -f $maxAttempts)
+}
+
 function Configure-RdpPortAndFirewall {
     $s = $Global:Config.rdp
     if (-not $s.enabled) { Set-StepSkipped "disabled in config"; return }
-    $newPort = [int]$s.newPort
-    if ($newPort -lt 1 -or $newPort -gt 65535) { throw "Invalid RDP port: $newPort" }
+    $configuredPort = [int]$s.newPort
+    if ($configuredPort -lt 1 -or $configuredPort -gt 65535) { throw "Invalid RDP port: $configuredPort" }
+    # Asked first, before Step 1 touches anything at all: an abandoned or invalid prompt must be
+    # able to abort without a single registry, firewall or service change to undo.
+    $newPort = Read-RdpTargetPort -ConfiguredPort $configuredPort
 
     $rdpPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
     $previousPort = Get-RdpRegistryPortNumber -RegistryPath $rdpPath
@@ -357,6 +404,12 @@ function Configure-RdpPortAndFirewall {
         }
         throw ("RDP port migration failed ({0}); RDP was rolled back to TCP {1}." -f $failureReason, $previousPort)
     }
+
+    # The registry now holds the operator's choice, so rdp.newPort has to as well: everything
+    # downstream in this run reasons about it, and Assert-RdpPortAgreement would otherwise refuse
+    # to install the brute-force blocker with "config, registry and listener disagree". In-memory
+    # only - the tracked config file is never rewritten.
+    $s.newPort = $newPort
 
     # Only reachable once TermService demonstrably owns the new port, so blocking the old one
     # cannot strand the operator. A deferred (reboot-pending) change deliberately stops above.
