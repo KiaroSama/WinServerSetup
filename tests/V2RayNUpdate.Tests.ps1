@@ -32,18 +32,8 @@ $mainScript = if ([string]::IsNullOrWhiteSpace($MainScript)) { Join-Path $projec
 # partition so extraction by name keeps working wherever a function lives. $mainScript is
 # searched first, so a -MainScript copy still shadows the on-disk original when replaying
 # against a deliberately defective build.
-$setupSourceNames = @('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance' |
-        ForEach-Object { "scripts\{0}.ps1" -f $_ })
-$setupSourceFiles = @(@($mainScript) + @($setupSourceNames | ForEach-Object { Join-Path $projectRoot $_ })) |
-    Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique
-
-$setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
-        $tokens = $null
-        $parseErrors = $null
-        $fileAst = [System.Management.Automation.Language.Parser]::ParseFile($setupFile, [ref]$tokens, [ref]$parseErrors)
-        Assert-True ($parseErrors.Count -eq 0) "$setupFile must parse before its v2rayN path can be tested."
-        $fileAst
-    })
+$setupSourceFiles = @(Get-SetupSourceFile -ProjectRoot $projectRoot -MainScript $mainScript)
+$setupAsts = @(Get-SetupAst -Files $setupSourceFiles -Because 'its v2rayN path can be tested')
 
 foreach ($name in @('Test-UnsafeReplaceTarget', 'Install-V2RayN')) {
     . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))

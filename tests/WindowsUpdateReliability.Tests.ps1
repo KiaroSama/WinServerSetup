@@ -15,16 +15,16 @@
     Install-Module, Install-WindowsUpdate and Start-Job are replaced, and Install-WindowsUpdate is
     a tripwire that fails the suite if it is ever reached.
 
-    DOCUMENTED GAP - the wall-clock timeout trip is not exercised.
-    Invoke-WindowsUpdatePass measures elapsed time with a real System.Diagnostics.Stopwatch (a
-    static .NET factory that cannot be shadowed from PowerShell) and clamps
-    windowsUpdate.jobTimeoutMinutes to a minimum of one MINUTE. Reaching the
-    `Stop-Job` + throw branch therefore costs at least 60 s of real time, which is more than this
-    suite's entire budget. What is covered instead: that the poll loop re-reads job state from
-    Get-Job on every iteration and sleeps between polls (a stale-state regression would spin
-    forever, and the Start-Sleep stub bounds that into a failure rather than a hang), plus a
-    retained source assertion for the timeout guard itself. The timeout branch is the one part of
-    this file still verified by text.
+    The wall-clock timeout trip IS exercised (this used to be a documented gap).
+    Elapsed time is measured with a real System.Diagnostics.Stopwatch - a static .NET factory
+    that cannot be shadowed from PowerShell - and config validates windowsUpdate.jobTimeoutMinutes
+    as whole minutes with a 1-minute floor, so reaching the `Stop-Job` + throw branch through
+    Invoke-WindowsUpdatePass costs at least 60 s of real time. The bounded poll is therefore its
+    own function, Wait-WindowsUpdateJob, taking the budget as a [double] parameter: the trip runs
+    here in milliseconds while production still applies the 1-minute floor at the call site.
+    Also covered: the loop re-reads job state from Get-Job on every iteration and sleeps between
+    polls (a stale-state regression would spin forever, and the Start-Sleep stub bounds that into
+    a failure rather than a hang).
 #>
 # The Windows Update surface is mocked by shadowing cmdlets with functions; the mock signatures
 # mirror the real cmdlets - including parameters this file never reads - so the code under test
@@ -58,24 +58,13 @@ function Assert-Throws {
 # partition so extraction by name keeps working wherever a function lives. $mainScript is
 # searched first, so a -MainScript copy still shadows the on-disk original when replaying
 # against a deliberately defective build.
-$setupSourceNames = @('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance' |
-        ForEach-Object { "scripts\{0}.ps1" -f $_ })
-$setupSourceFiles = @(@($mainScript) + @($setupSourceNames | ForEach-Object { Join-Path $projectRoot $_ })) |
-    Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique
-
-# The retained source greps cover the same partition.
+$setupSourceFiles = @(Get-SetupSourceFile -ProjectRoot $projectRoot -MainScript $mainScript)
+$setupAsts = @(Get-SetupAst -Files $setupSourceFiles -Because 'its Windows Update path can be tested')
+# Raw text of the same partition, for the retained source assertions further down.
 $source = ($setupSourceFiles | ForEach-Object { Get-Content -LiteralPath $_ -Raw -Encoding UTF8 }) -join "`r`n"
 
-$setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
-        $tokens = $null
-        $parseErrors = $null
-        $fileAst = [System.Management.Automation.Language.Parser]::ParseFile($setupFile, [ref]$tokens, [ref]$parseErrors)
-        Assert-True ($parseErrors.Count -eq 0) "$setupFile must parse before its Windows Update path can be tested."
-        $fileAst
-    })
-
 foreach ($name in @('Invoke-WithPSGalleryTrust', 'Initialize-WindowsUpdateEnvironment',
-        'Invoke-WindowsUpdatePass', 'Invoke-SystemUpdate')) {
+        'Wait-WindowsUpdateJob', 'Invoke-WindowsUpdatePass', 'Invoke-SystemUpdate')) {
     . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
 }
 
@@ -494,15 +483,52 @@ try {
     # ---- Nothing in this suite may have reached a real install. ----
     Assert-Equal 0 $script:RealInstallAttempts "No test may invoke the real Install-WindowsUpdate."
 
-    # ---- Retained source assertions. These cover the documented gap only: the timeout branch
-    #      needs 60 s of real wall time (see the header), so it is still verified by text. The old
-    #      `ResultCode|Result` grep is deliberately NOT retained - it matched unconditionally and
-    #      therefore asserted nothing. ----
-    Assert-True ($source -match 'jobTimeoutMinutes') "The Windows Update job needs a configurable finite timeout."
-    Assert-True ($source -match 'Stop-Job[\s\S]{0,300}timed out') "A timed-out Windows Update job must be stopped and failed."
+    # =========================================================================================
+    # The wall-clock timeout actually trips, stops the job, and reports the budget it exceeded.
+    # =========================================================================================
+    # This used to be the file's DOCUMENTED GAP. Config validates jobTimeoutMinutes as whole
+    # minutes with a 1-minute floor, so reaching this branch through Invoke-WindowsUpdatePass
+    # costs 60 s of real Stopwatch time. The bounded poll is now its own function taking a
+    # [double] budget, so the trip is exercised directly in milliseconds. The 1-minute floor is
+    # unchanged and still applied by the caller - only the test budget is sub-minute.
+    Reset-UpdateState
+    $script:JobState = 'Running'
+    $stuckJob = [pscustomobject]@{ Id = 4242; State = 'Running' }
+    $timedOut = $null
+    # Budget 0, not a small non-zero one. Start-Sleep is stubbed here, so a sub-millisecond
+    # budget races the stub's own 25-call ceiling and the winner differs per host - it did, and
+    # 5.1 hit the ceiling first. Elapsed time is always greater than zero at the first check, so
+    # a zero budget reaches this branch deterministically on both hosts. Production cannot pass
+    # zero: config validates jobTimeoutMinutes as int 1..1440 and the call site floors it at 1,
+    # which the retained source assertion below covers.
+    $timeoutClock = [Diagnostics.Stopwatch]::StartNew()
+    try { Wait-WindowsUpdateJob -Job $stuckJob -TimeoutMinutes 0 -PassNumber 2 | Out-Null } catch { $timedOut = $_.Exception.Message }
+    $timeoutClock.Stop()
+    Assert-True ($null -ne $timedOut) `
+        "A Windows Update job that never leaves Running must trip its wall-clock budget - without it, one stuck job blocks the whole update step indefinitely."
+    Assert-True ($timedOut -match 'timed out after') `
+        ("The timeout must say it timed out and name the budget it exceeded. Got: {0}" -f $timedOut)
+    Assert-True ($script:StopJobCalls -ge 1) `
+        "The job must be STOPPED on timeout, not merely abandoned - an orphaned PSWindowsUpdate job keeps installing after the step reported failure."
+    Assert-True ($timeoutClock.Elapsed.TotalSeconds -lt 20) `
+        ("The timeout trip must be governed by the budget passed in. Took {0:n1}s." -f $timeoutClock.Elapsed.TotalSeconds)
+
+    # A job that finishes must be returned in its FINAL state, not the stale object handed in.
+    Reset-UpdateState
+    foreach ($state in @('Running', 'Completed')) { $script:JobStateQueue.Add($state) | Out-Null }
+    $finishedJob = Wait-WindowsUpdateJob -Job ([pscustomobject]@{ Id = 4243; State = 'Running' }) -TimeoutMinutes 120 -PassNumber 1
+    Assert-Equal 'Completed' ([string]$finishedJob.State) `
+        "The poll must return the re-read job; returning the stale input object would make the caller's state check inspect a job that was still Running."
+
+    # ---- One retained source assertion: the behavioural cases above call Wait-WindowsUpdateJob
+    #      with a budget of their own, so they cannot prove that PRODUCTION still passes a finite
+    #      one from config rather than polling forever. The old `ResultCode|Result` grep is
+    #      deliberately NOT retained - it matched unconditionally and therefore asserted nothing. ----
+    Assert-True ($source -match 'Wait-WindowsUpdateJob[\s\S]{0,120}-TimeoutMinutes \$WindowsUpdateJobTimeoutMinutes') `
+        "The install pass must still pass its configured finite budget to the bounded poll."
 
     Assert-True ($suiteClock.Elapsed.TotalSeconds -lt 30) ("This suite must stay fast; it took {0:n1}s." -f $suiteClock.Elapsed.TotalSeconds)
-    Write-Host ("PASS Windows Update restores PSGallery policy through the finally on both paths, installs the module only under temporary trust, treats a failed scan as a failure rather than 'no updates', inspects per-update results, and refuses to claim a fully updated machine without a successful final scan. GAP: the job timeout branch is still asserted from source text - tripping it needs 60s of real time because jobTimeoutMinutes is clamped to a 1-minute minimum and measured with a real Stopwatch ({0:n1}s)." -f $suiteClock.Elapsed.TotalSeconds)
+    Write-Host ("PASS Windows Update restores PSGallery policy through the finally on both paths, installs the module only under temporary trust, treats a failed scan as a failure rather than 'no updates', inspects per-update results, refuses to claim a fully updated machine without a successful final scan, and trips its wall-clock budget on a stuck job - stopping it rather than abandoning it ({0:n1}s)." -f $suiteClock.Elapsed.TotalSeconds)
 } finally {
     $Global:Config = $previousConfig
 }

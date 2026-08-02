@@ -712,6 +712,22 @@ function Invoke-SelfRelocateIfNeeded {
         return $false
     }
 
+    # The deferred cleanup script refuses a nested or root pair, but it only runs AFTER robocopy
+    # has copied - so a target inside the source was copied into itself first and merely left
+    # behind as a duplicated, recursed tree. The same verdict has to gate the copy itself.
+    # GetFullPath on BOTH sides, never mixed with the Resolve-Path above: it expands 8.3 short
+    # names while Resolve-Path preserves them, so comparing one of each silently mismatches.
+    $comparableSource = [System.IO.Path]::GetFullPath($currentFull).TrimEnd('\')
+    $comparableTarget = [System.IO.Path]::GetFullPath($targetFull).TrimEnd('\')
+    $sourceRoot = [System.IO.Path]::GetPathRoot($comparableSource).TrimEnd('\')
+    $targetRoot = [System.IO.Path]::GetPathRoot($comparableTarget).TrimEnd('\')
+    if ([string]::Equals($comparableSource, $sourceRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($comparableTarget, $targetRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $comparableTarget.StartsWith($comparableSource + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+        $comparableSource.StartsWith($comparableTarget + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw ("Refusing to relocate: '{0}' and '{1}' are the same tree, one contains the other, or one is a drive root." -f $comparableSource, $comparableTarget)
+    }
+
     Write-StartupLine -State "RUN" -Label "Relocating project to" -Value $targetFull -ValueKind "StartupPath"
     $parent = Split-Path -Parent $target
     Ensure-Directory $parent
@@ -779,14 +795,22 @@ param(
     [Parameter(Mandatory = `$true)][string]`$ReadinessToken
 )
 `$ErrorActionPreference = 'SilentlyContinue'
-try { Wait-Process -Id `$ParentProcessId -Timeout 60 } catch { Start-Sleep -Seconds 5 }
+# Wait-Process -Timeout raises a NON-terminating error on expiry, and SilentlyContinue swallows
+# it - so the catch never ran and this script proceeded to delete the source with the parent
+# still live. Liveness is therefore OBSERVED afterwards rather than inferred from an exception,
+# and a parent that is still running is one of the unsafe conditions below.
+Wait-Process -Id `$ParentProcessId -Timeout 60
+`$parentStillRunning = `$null -ne (Get-Process -Id `$ParentProcessId -ErrorAction SilentlyContinue)
 try {
     `$src = [System.IO.Path]::GetFullPath(`$SourcePath).TrimEnd('\')
     `$dst = [System.IO.Path]::GetFullPath(`$TargetPath).TrimEnd('\')
     `$root = [System.IO.Path]::GetPathRoot(`$src).TrimEnd('\')
     `$marker = Get-Content -LiteralPath `$ReadinessPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
     `$markerTarget = [System.IO.Path]::GetFullPath([string]`$marker.TargetPath).TrimEnd('\')
-    `$unsafe = -not `$src -or -not `$dst -or [string]::Equals(`$src, `$root, [System.StringComparison]::OrdinalIgnoreCase) -or
+    # ponytail: pid-only liveness, so a recycled pid keeps the source instead of deleting it.
+    # That is the safe direction; capture the parent's StartTime too if it ever matters.
+    `$unsafe = `$parentStillRunning -or
+        -not `$src -or -not `$dst -or [string]::Equals(`$src, `$root, [System.StringComparison]::OrdinalIgnoreCase) -or
         [string]::Equals(`$src, `$dst, [System.StringComparison]::OrdinalIgnoreCase) -or
         `$dst.StartsWith(`$src + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
         `$src.StartsWith(`$dst + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
@@ -794,7 +818,7 @@ try {
         -not (Test-Path -LiteralPath (Join-Path `$dst 'WinServerSetup.ps1')) -or
         [string]`$marker.Token -ne `$ReadinessToken -or
         -not [string]::Equals(`$markerTarget, `$dst, [System.StringComparison]::OrdinalIgnoreCase)
-    if (`$unsafe) { throw 'Refusing to remove unsafe relocation source because path or readiness verification failed.' }
+    if (`$unsafe) { throw 'Refusing to remove unsafe relocation source because the original process is still running, or path or readiness verification failed.' }
     Remove-Item -LiteralPath `$src -Recurse -Force -ErrorAction Stop
     Remove-Item -LiteralPath `$ReadinessPath -Force -ErrorAction SilentlyContinue
     Add-Content -LiteralPath `$RelocateLog -Encoding utf8 -Value ("[{0}] [OK] Removed original source folder: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `$src)

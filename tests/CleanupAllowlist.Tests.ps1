@@ -19,18 +19,8 @@ $mainScript = if ([string]::IsNullOrWhiteSpace($MainScript)) { Join-Path $projec
 
 . (Join-Path $PSScriptRoot '_Common.ps1')
 
-$setupSourceNames = @('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance' |
-        ForEach-Object { "scripts\{0}.ps1" -f $_ })
-$setupSourceFiles = @(@($mainScript) + @($setupSourceNames | ForEach-Object { Join-Path $projectRoot $_ })) |
-    Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique
-
-$setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
-        $tokens = $null
-        $parseErrors = $null
-        $fileAst = [System.Management.Automation.Language.Parser]::ParseFile($setupFile, [ref]$tokens, [ref]$parseErrors)
-        Assert-True ($parseErrors.Count -eq 0) "$setupFile must parse before cleanup safety can be tested."
-        $fileAst
-    })
+$setupSourceFiles = @(Get-SetupSourceFile -ProjectRoot $projectRoot -MainScript $mainScript)
+$setupAsts = @(Get-SetupAst -Files $setupSourceFiles -Because 'cleanup safety can be tested')
 
 $script:Failures = New-Object System.Collections.Generic.List[string]
 function Write-Fail { param($Message) $script:Failures.Add([string]$Message) | Out-Null }

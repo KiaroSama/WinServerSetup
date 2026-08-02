@@ -27,6 +27,48 @@ function Assert-Equal {
     if ($Expected -ne $Actual) { throw ("{0} Expected={1}; Actual={2}" -f $Message, $Expected, $Actual) }
 }
 
+<#
+    The setup partition every suite parses to lift functions out of.
+
+    WinServerSetup.ps1 dot-sources its function library from scripts\, so extraction by name has
+    to search that whole partition. $MainScript is searched FIRST so a suite replaying against a
+    deliberately defective copy still shadows the on-disk original.
+
+    Returns paths, not ASTs, because five suites also join the raw text for their retained source
+    assertions. Wrap the call in @() - PowerShell enumerates a collection on return, so a tree
+    reduced to one file would otherwise yield a bare string.
+#>
+function Get-SetupSourceFile {
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [string]$MainScript = ""
+    )
+    $entry = if ([string]::IsNullOrWhiteSpace($MainScript)) { Join-Path $ProjectRoot 'WinServerSetup.ps1' } else { $MainScript }
+    $names = @('WinServerSetup.ps1') + @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance' |
+            ForEach-Object { "scripts\{0}.ps1" -f $_ })
+    return @(@($entry) + @($names | ForEach-Object { Join-Path $ProjectRoot $_ })) |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique
+}
+
+<#
+    Parses those files and fails the suite before any assertion runs if one of them does not
+    parse - otherwise a syntax error surfaces as a confusing "must define <Name>" much later.
+    Wrap the call in @() for the same reason as above.
+#>
+function Get-SetupAst {
+    param(
+        [Parameter(Mandatory)][string[]]$Files,
+        [string]$Because = "its behaviour can be tested"
+    )
+    return @(foreach ($file in $Files) {
+            $tokens = $null
+            $parseErrors = $null
+            $fileAst = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$parseErrors)
+            Assert-True ($parseErrors.Count -eq 0) "$file must parse before $Because."
+            $fileAst
+        })
+}
+
 function Import-FunctionUnderTest {
     param(
         [Parameter(Mandatory)][string]$Name,

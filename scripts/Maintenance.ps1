@@ -33,6 +33,40 @@ function Initialize-WindowsUpdateEnvironment {
     Add-WUServiceManager -MicrosoftUpdate -Confirm:$false -ErrorAction Stop | Out-Null
 }
 
+function Wait-WindowsUpdateJob {
+    <#
+        The bounded poll for the PSWindowsUpdate install job. Re-reads job state every cycle
+        rather than trusting the object handed in, and returns the FINAL job so the caller
+        inspects the state it actually ended in.
+
+        It takes the budget as a [double] parameter instead of reading config, which is what
+        makes the timeout branch testable: windowsUpdate.jobTimeoutMinutes is validated as whole
+        minutes with a 1-minute floor, so reaching this trip through the caller costs 60s of real
+        Stopwatch time. That floor is unchanged and still applied at the call site - only a test
+        may pass a sub-minute budget.
+
+        A stuck job is STOPPED, not abandoned: an orphaned PSWindowsUpdate job keeps installing
+        after the step has already reported failure.
+    #>
+    param(
+        [Parameter(Mandatory)]$Job,
+        [Parameter(Mandatory)][double]$TimeoutMinutes,
+        [int]$PassNumber = 1
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $current = $Job
+    while ($current.State -eq 'Running') {
+        if ($sw.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
+            Stop-Job -Job $current -ErrorAction SilentlyContinue
+            throw "Windows Update job timed out after $TimeoutMinutes minutes."
+        }
+        Write-StatusInPlace ("Pass {0}: downloading/installing updates... elapsed {1:hh\:mm\:ss}" -f $PassNumber, $sw.Elapsed)
+        Start-Sleep -Seconds 2
+        $current = Get-Job -Id $current.Id
+    }
+    return $current
+}
+
 function Invoke-WindowsUpdatePass {
     param([int]$PassNumber)
     Write-Info "Windows Update pass ${PassNumber}: scanning..."
@@ -61,18 +95,9 @@ function Invoke-WindowsUpdatePass {
             Import-Module PSWindowsUpdate -Force
             Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -Verbose:$false -Confirm:$false
         }
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $WindowsUpdateJobTimeoutMinutes = [int]$Global:Config.windowsUpdate.jobTimeoutMinutes
         if ($WindowsUpdateJobTimeoutMinutes -lt 1) { $WindowsUpdateJobTimeoutMinutes = 120 }
-        while ($wuJob.State -eq 'Running') {
-            if ($sw.Elapsed.TotalMinutes -ge $WindowsUpdateJobTimeoutMinutes) {
-                Stop-Job -Job $wuJob -ErrorAction SilentlyContinue
-                throw "Windows Update job timed out after $WindowsUpdateJobTimeoutMinutes minutes."
-            }
-            Write-StatusInPlace ("Pass {0}: downloading/installing updates... elapsed {1:hh\:mm\:ss}" -f $PassNumber, $sw.Elapsed)
-            Start-Sleep -Seconds 2
-            $wuJob = Get-Job -Id $wuJob.Id
-        }
+        $wuJob = Wait-WindowsUpdateJob -Job $wuJob -TimeoutMinutes $WindowsUpdateJobTimeoutMinutes -PassNumber $PassNumber
         Clear-StatusInPlace
         $wuOutput = @()
         $jobErrors = @()
