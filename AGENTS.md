@@ -76,7 +76,7 @@ The runner's summary line reports both a suite count and a failure count
 (`HOST=...  SUITES=n  FAILED=0`). Gate on `FAILED=0`; the suite count grows as suites
 are added, so do not treat any particular number as the pass condition.
 
-Shared test helpers live in `tests\_Common.ps1` — `Assert-True`, `Assert-Equal`,
+Shared test helpers live in `tests\_Common.ps1` — `Assert-True`, `Assert-Equal`, `Assert-Contains`,
 `Get-SetupSourceFile`, `Get-SetupAst` and `Import-FunctionUnderTest`. Dot-source it
 **after** `$projectRoot` (and `$mainScript`, where the suite takes a `-MainScript`
 override) and **before** the first assertion:
@@ -106,6 +106,14 @@ $setupAsts = @(Get-SetupAst -Files $setupSourceFiles -Because 'its download path
 the raw text for retained source assertions. `-Because` completes the sentence
 "`<file>` must parse before …", which is what a suite reports if the partition itself
 fails to parse.
+
+**Adding a module to `scripts\` means adding it to `Get-SetupSourceFile`'s list too**,
+or every AST-based suite silently stops seeing the functions that moved into it. The
+dot-source block in `WinServerSetup.ps1` and the module list inside
+`Invoke-SetupStepWaveConcurrently` (the runspace has no session state of its own) need
+the same addition. A handful of suites still build the list themselves rather than
+calling `Get-SetupSourceFile`; `grep` for the module names before assuming one place
+covers it.
 
 ## PowerShell 5.1 traps
 

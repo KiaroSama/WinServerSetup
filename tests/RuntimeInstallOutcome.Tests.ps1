@@ -42,6 +42,11 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $installModule = if ([string]::IsNullOrWhiteSpace($InstallScript)) { Join-Path $projectRoot "scripts\Install.ps1" } else { $InstallScript }
 $downloadModule = Join-Path $projectRoot "scripts\Download.ps1"
+# The runtime installers moved to scripts\Runtimes.ps1 when Install.ps1 was split by
+# responsibility; -InstallScript still redirects only the file it names.
+$runtimesModule = Join-Path $projectRoot "scripts\Runtimes.ps1"
+# M-08.f covers the PowerShell 7 and Windows Terminal installers, which moved to AppIntegration.ps1.
+$appIntegrationModule = Join-Path $projectRoot "scripts\AppIntegration.ps1"
 $consoleModule = Join-Path $projectRoot "scripts\Console.ps1"
 
 . (Join-Path $PSScriptRoot '_Common.ps1')
@@ -54,7 +59,7 @@ $consoleAst = [System.Management.Automation.Language.Parser]::ParseFile($console
 Assert-True ($parseErrors.Count -eq 0) "M-08: scripts\Console.ps1 must parse before the exit-code path can be tested."
 $recordedStepText = Import-FunctionUnderTest 'Invoke-RecordedSetupStep' @($consoleAst)
 
-$Global:M08Modules = @{ Download = $downloadModule; Install = $installModule }
+$Global:M08Modules = @{ Download = $downloadModule; Install = $installModule; Runtimes = $runtimesModule; AppIntegration = $appIntegrationModule }
 
 # ---------------------------------------------------------------------------------------------
 # Shared harness. Dot-sourced in-process below and embedded verbatim into the end-to-end child
@@ -63,6 +68,8 @@ $Global:M08Modules = @{ Download = $downloadModule; Install = $installModule }
 $harness = @'
 . $Global:M08Modules.Download
 . $Global:M08Modules.Install
+. $Global:M08Modules.Runtimes
+. $Global:M08Modules.AppIntegration
 
 function Reset-RuntimeRun {
     $Global:M08 = @{
@@ -520,10 +527,12 @@ $childTemplate = @'
 param(
     [Parameter(Mandatory)][string]$Scenario,
     [Parameter(Mandatory)][string]$DownloadModule,
-    [Parameter(Mandatory)][string]$InstallModule
+    [Parameter(Mandatory)][string]$InstallModule,
+    [Parameter(Mandatory)][string]$RuntimesModule,
+    [Parameter(Mandatory)][string]$AppIntegrationModule
 )
 $ErrorActionPreference = 'Stop'
-$Global:M08Modules = @{ Download = $DownloadModule; Install = $InstallModule }
+$Global:M08Modules = @{ Download = $DownloadModule; Install = $InstallModule; Runtimes = $RuntimesModule; AppIntegration = $AppIntegrationModule }
 __HARNESS__
 __RECORDED_STEP__
 
@@ -573,7 +582,7 @@ try {
     Set-Content -LiteralPath $childPath -Value $childScript -Encoding UTF8
     foreach ($case in $endToEndCases) {
         & $hostExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $childPath `
-            -Scenario $case.Scenario -DownloadModule $downloadModule -InstallModule $installModule | Out-Null
+            -Scenario $case.Scenario -DownloadModule $downloadModule -InstallModule $installModule -RuntimesModule $runtimesModule -AppIntegrationModule $appIntegrationModule | Out-Null
         Assert-Equal $case.ExpectedExitCode $LASTEXITCODE `
             ("M-08 [{0}]: {1}." -f $case.Scenario, $case.Why)
     }

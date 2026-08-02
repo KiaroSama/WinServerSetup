@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Two oversized modules split by responsibility, proven a pure move.** `scripts\Install.ps1` had grown to ~1450 lines spanning application installation, shell/default-handler integration and runtime installation; `scripts\Rdp.ps1` to ~1120 spanning port migration and the SYSTEM scheduled-task trust machinery. They are now:
+
+  | Module | Responsibility |
+  |---|---|
+  | `scripts\Install.ps1` | The shared check-then-update decision, winget packages, direct installers, v2rayN |
+  | `scripts\AppIntegration.ps1` | Apps that are installed *and* wired into the shell: PowerShell 7, Windows Terminal, Brave, 7-Zip, default apps |
+  | `scripts\Runtimes.ps1` | .NET Framework, .NET desktop/core and Visual C++ runtimes |
+  | `scripts\Rdp.ps1` | Listener checks, the port prompt, and the port migration with its firewall rule and rollback |
+  | `scripts\RdpBlockerTask.ps1` | Installing and health-checking the blocker SYSTEM task: trust validation, staging, manifest, health contract |
+
+  `Test-DirectInstallerInstalled` moved from `Rdp.ps1` to `Install.ps1`, where it had always belonged — it verifies a direct installer and has nothing to do with RDP. The structured-log assertions likewise moved out of `tests\MenuAndLauncher.Tests.ps1` into `tests\StructuredLogging.Tests.ps1`; splitting them surfaced that three of them hardcoded the old suite's filename while asserting on call-stack-derived component attribution, so they were silently pinned to their own location — they now derive it from `$PSCommandPath`.
+
+  Verified as a pure move the same way the original module split was: every `FunctionDefinitionAst` body across all non-test `.ps1`, normalised and compared as a multiset — 1044 definitions before and after, with exactly one deliberate difference (`Invoke-SetupStepWaveConcurrently`, whose module list had to learn the new files).
+
+  `scripts\Block-RdpBruteforce.ps1` (1211 lines) is deliberately **not** split: it is a standalone script the scheduled task runs as its own process, with top-level statements and intentionally private helper copies. `scripts\Core.ps1` (851) is left alone too — a 6% overage whose tail mixes relocation, download helpers and the project-wide `ConvertTo-CanonicalPath`, with no clean boundary to cut on.
+
 ### Added
 
 - **Applications that are already installed are now updated where they are, instead of installed again.** Setup checks for an existing installation first — winget's own package list for winget packages, and the registry uninstall roots for direct installers — and resolves the directory it is actually installed in from `InstallLocation`, `DisplayIcon` or `UninstallString`. An already-present application is upgraded in that directory rather than dropped into the project's default path as a second copy. When the location cannot be resolved from real evidence the existing installation is left alone and the reason is logged: an "update in place" aimed at the wrong tree is worse than not updating at all. A direct installer that reports success but relocated the application is treated as a failure, because that is a duplicate rather than an update.
