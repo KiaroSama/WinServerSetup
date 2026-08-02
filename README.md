@@ -75,7 +75,7 @@ Full setup:
 .\Run-WinServerSetup.ps1 -Full
 ```
 
-Full setup without pause prompts:
+Full setup unattended (no interactive questions):
 
 ```powershell
 .\Run-WinServerSetup.ps1 -Full -NoPause
@@ -98,7 +98,7 @@ Run from the current folder without self-relocation:
 | Switch | Description |
 | --- | --- |
 | `-Full` | Run the full workflow without showing the menu. |
-| `-NoPause` | Skip interactive `Press any key to continue...` prompts. |
+| `-NoPause` | Run unattended: skip every interactive question. The menu returns to itself after each action without waiting for a keypress regardless of this switch; `-NoPause` additionally makes the RDP port and Administrator-name prompts fall back to their configured values, and suppresses the pause on the "run as Administrator" failure. |
 | `-NoColor` | Disable colored terminal output. |
 | `-NoReboot` | Do not restart automatically even if a reboot is pending. |
 | `-NoRelocate` | Do not move the project to `C:\portable\Scripts\WinServerSetup`. |

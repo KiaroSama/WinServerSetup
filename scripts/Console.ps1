@@ -57,7 +57,7 @@ function Test-AnsiSupported {
 function Write-Themed {
     param(
         [Parameter(Mandatory, Position=0)][AllowEmptyString()][string]$Message,
-        [ValidateSet('Success','Error','Warning','Info','Prompt','Default','Section','Status','Summary','SummaryDim','Banner','BannerRule','MenuHeader','StartupLabel','StartupValue','StartupPath','StartupOk','StartupDim','StartupNote','Plain')]
+        [ValidateSet('Success','Error','Warning','Info','Prompt','Default','Section','Status','Summary','SummaryDim','Banner','BannerRule','MenuHeader','MenuNumber','MenuDefault','ExitHint','StartupLabel','StartupValue','StartupPath','StartupOk','StartupDim','StartupNote','Plain')]
         [string]$Kind = 'Plain',
         [switch]$NoNewline
     )
@@ -181,12 +181,28 @@ function Write-Section {
 
 # Menu style: light-blue option number, plain label.
 function Write-Option {
+    <#
+        One menu line: "  <n>. <label>", with an optional green "[<n>]" marking the default.
+
+        Two spaces and a LEFT-aligned number, not a right-aligned column. The numbers run 1..30
+        with a couple of "5b"-style keys among them, and right-aligning those pushed the single
+        digits away from their labels for no gain - the eye follows the label, and the number is
+        just the key you press.
+    #>
     param(
         [Parameter(Mandatory)][string]$Number,
-        [Parameter(Mandatory)][string]$Label
+        [Parameter(Mandatory)][string]$Label,
+        [switch]$IsDefault
     )
-    Write-Themed ("{0,3}. " -f $Number) -Kind StartupLabel -NoNewline
-    Write-Host $Label
+    Write-Host "  " -NoNewline
+    Write-Themed ("{0}. " -f $Number) -Kind MenuNumber -NoNewline
+    if ($IsDefault) {
+        Write-Host $Label -NoNewline
+        Write-Host " " -NoNewline
+        Write-Themed ("[{0}]" -f $Number) -Kind MenuDefault
+    } else {
+        Write-Host $Label
+    }
 }
 
 # In-place status line (overwrites previous line, no spinner spam).
@@ -568,16 +584,26 @@ function Read-AnyKeyThemed {
 function Read-HostThemed {
     param(
         [Parameter(Mandatory)][string]$Prompt,
-        [string]$DefaultValue = ""
+        [string]$DefaultValue = "",
+        # Optional trailing hint, e.g. "0=back". Rendered in its own dim colour so it reads as
+        # a way out rather than as part of the question.
+        [string]$Hint = ""
     )
     $wasRunning = ($Global:OpStopwatch -and $Global:OpStopwatch.IsRunning)
     Stop-ActiveTimer
     try {
-        Write-Themed ($Prompt + ": ") -Kind Prompt -NoNewline
+        # "<prompt> [<default>]<hint>: " - the default sits BEFORE the colon, where it reads as
+        # part of the question rather than as something already typed after it.
+        Write-Themed $Prompt -Kind Prompt -NoNewline
         if (-not [string]::IsNullOrWhiteSpace($DefaultValue)) {
-            Write-Themed ("[{0}]" -f $DefaultValue) -Kind Default -NoNewline
             Write-Host " " -NoNewline
+            Write-Themed ("[{0}]" -f $DefaultValue) -Kind Default -NoNewline
         }
+        if (-not [string]::IsNullOrWhiteSpace($Hint)) {
+            Write-Host " " -NoNewline
+            Write-Themed $Hint -Kind ExitHint -NoNewline
+        }
+        Write-Host ": " -NoNewline
         $value = Read-Host
         if ([string]::IsNullOrWhiteSpace($value) -and -not [string]::IsNullOrWhiteSpace($DefaultValue)) {
             return $DefaultValue

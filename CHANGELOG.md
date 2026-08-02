@@ -4,6 +4,10 @@
 
 ### Changed
 
+- **The menu no longer waits for a keypress after every action.** Each action returned to a `Press any key to continue...` prompt before the menu redrew, which meant two keystrokes for every task. The menu now returns to itself immediately. Nothing is lost: the console is never cleared, so the completed task's output — and the error text on a failure — stays on screen directly above the menu. The pause on the "run this script as Administrator" failure is deliberately kept, because that path ends in `exit 1` and a double-clicked window would otherwise close before the message could be read.
+
+- **Menu and prompt styling aligned with the operator's other console tools.** Options render as `  1. Label` with a left-aligned light-blue number and a plain label, rather than a right-aligned three-column number; the default option carries a green `[1]` marker; and prompts read `Selection [1] 0=exit: ` — the default now sits *before* the colon, where it reads as part of the question instead of as something already typed after it. `Read-HostThemed` gained an optional `-Hint` for the way out. Three colour kinds were added (`MenuNumber`, `MenuDefault`, `ExitHint`), each with both an ANSI and a `ConsoleColor` fallback like every existing kind.
+
 - **Two oversized modules split by responsibility, proven a pure move.** `scripts\Install.ps1` had grown to ~1450 lines spanning application installation, shell/default-handler integration and runtime installation; `scripts\Rdp.ps1` to ~1120 spanning port migration and the SYSTEM scheduled-task trust machinery. They are now:
 
   | Module | Responsibility |
