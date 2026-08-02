@@ -65,6 +65,25 @@ function Assert-ConfigNode {
             $name = ([string]$key).TrimEnd('?')
             $allowed[$name] = $true
             $childPath = if ($Path) { "$Path.$name" } else { $name }
+
+            # A key nothing reads any more cannot just be deleted from the schema: unknown
+            # properties are rejected outright, so an operator whose local override still
+            # carries it would have their entire run fail on upgrade. 'retired' accepts it,
+            # skips type and range validation because no consumer is left to care, names it
+            # so it eventually gets removed - and DROPS it from the object.
+            #
+            # Dropping is what makes retirement work end to end, not just here:
+            # Merge-ConfigObject rejects an override property with no counterpart in the base,
+            # and a retired key has none, because it is gone from the tracked config too. A
+            # validator that merely tolerated the key would still fail two steps later.
+            if (($Spec[$key] -is [string]) -and ([string]$Spec[$key] -eq 'retired')) {
+                if ($Value.PSObject.Properties.Name -contains $name) {
+                    Write-Warning ("Config property {0} is retired and no longer has any effect; remove it." -f $childPath)
+                    $Value.PSObject.Properties.Remove($name)
+                }
+                continue
+            }
+
             if ($Value.PSObject.Properties.Name -notcontains $name) {
                 if ($AllowPartial -or ([string]$key).EndsWith('?')) { continue }
                 throw "Missing required config property: $childPath"
@@ -165,14 +184,14 @@ function Assert-ConfigSchema {
         autoReboot        = @{ enabled = 'bool'; countdownSeconds = 'int:0..86400'; scheduleSfcAfterReboot = 'bool' }
         activation        = @{ enabled = 'bool'; productKey = 'string'; kmsServer = 'string' }
         windowsUpdate     = @{
-            enabled = 'bool'; usePSWindowsUpdateModule = 'bool'; autoReboot = 'bool'
+            enabled = 'bool'; usePSWindowsUpdateModule = 'bool'; autoReboot = 'retired'
             maxPasses = 'int:1..20'; jobTimeoutMinutes = 'int:1..1440'
         }
         appearance        = @{ darkMode = 'bool'; restartExplorer = 'bool'; showFileExtensions = 'bool' }
         filesystem        = @{ enableLongPaths = 'bool' }
         keyboard          = @{ addPersianLayout = 'bool' }
         rdp               = @{
-            enabled = 'bool'; newPort = 'int:1..65535'; oldPort = 'int:1..65535'
+            enabled = 'bool'; newPort = 'int:1..65535'; oldPort = 'retired'
             blockOldPort = 'bool'; restartRemoteDesktopService = 'bool'; verifyListening = 'bool'
         }
         indexing          = @{ enabled = 'bool' }
@@ -237,7 +256,7 @@ function Assert-ConfigSchema {
         windowsTerminal   = @{
             enabled = 'bool'; packageId = 'string'; interactiveInstaller = 'bool'
             setAsDefaultTerminal = 'bool'; setPowerShell7AsDefaultProfile = 'bool'
-            openSettingsAfterInstall = 'bool'
+            openSettingsAfterInstall = 'retired'
         }
         customFolders     = @{
             enabled = 'bool'; portablePath = 'string'; scriptsPath = 'string'
@@ -283,6 +302,7 @@ function Assert-WinServerSetupConfig {
 }
 
 function Import-WinServerSetupConfig {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$BasePath,
         [string]$LocalPath = ""

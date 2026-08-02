@@ -38,8 +38,32 @@ try {
 
     $config = Import-WinServerSetupConfig -BasePath $basePath -LocalPath $localPath
     Assert-Equal 5901 $config.rdp.newPort "Local override did not replace the RDP port."
-    Assert-Equal 3389 $config.rdp.oldPort "Local override destroyed sibling defaults."
+    Assert-Equal $true $config.rdp.blockOldPort "Local override destroyed sibling defaults."
     Assert-Equal $true $config.activation.enabled "Local activation override was not applied."
+
+    # ---- Retired keys: accepted, ignored, and reported. ----
+    # A key that nothing reads any more cannot simply be deleted from the schema: unknown
+    # properties are rejected outright, so an operator whose WinServerSetup.config.local.json
+    # still carries it would have their whole run fail on an upgrade. Retirement keeps the
+    # override loading and tells them to remove it.
+    '{ "rdp": { "oldPort": 3389 } }' | Set-Content -LiteralPath $localPath -Encoding UTF8
+    $retiredWarnings = @()
+    $retiredConfig = Import-WinServerSetupConfig -BasePath $basePath -LocalPath $localPath -WarningVariable retiredWarnings -WarningAction SilentlyContinue
+    Assert-Equal $true ($null -ne $retiredConfig) "A retired key in an existing override must not fail the run."
+    Assert-Equal $true ([bool](@($retiredWarnings) -match 'rdp\.oldPort')) `
+        "A retired key must be reported by name so the operator knows to remove it. Warnings: $(@($retiredWarnings) -join '; ')"
+
+    # A retired key is not a free pass for anything else in the same section.
+    '{ "rdp": { "oldPort": 3389, "stillUnknown": true } }' | Set-Content -LiteralPath $localPath -Encoding UTF8
+    Assert-Throws { Import-WinServerSetupConfig $basePath $localPath } 'unknown config property.*rdp.stillUnknown' `
+        "Retiring one key must not make its siblings permissive."
+
+    # Absent is the normal case and must stay silent.
+    '{ "rdp": { "newPort": 5901 } }' | Set-Content -LiteralPath $localPath -Encoding UTF8
+    $quietWarnings = @()
+    Import-WinServerSetupConfig -BasePath $basePath -LocalPath $localPath -WarningVariable quietWarnings -WarningAction SilentlyContinue | Out-Null
+    Assert-Equal $false ([bool](@($quietWarnings) -match 'retired')) `
+        "An override that does not carry a retired key must produce no retirement warning. Warnings: $(@($quietWarnings) -join '; ')"
 
     '{ "rdp": { "unexpectedNestedKey": true } }' | Set-Content -LiteralPath $localPath -Encoding UTF8
     Assert-Throws { Import-WinServerSetupConfig $basePath $localPath } 'unknown config property.*rdp.unexpectedNestedKey' "Unknown nested properties must be rejected."

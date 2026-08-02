@@ -23,7 +23,6 @@
   "windowsUpdate": {
     "enabled": true,
     "usePSWindowsUpdateModule": true,
-    "autoReboot": false,
     "maxPasses": 4,
     "jobTimeoutMinutes": 120
   },
@@ -41,7 +40,6 @@
   "rdp": {
     "enabled": true,
     "newPort": 5801,
-    "oldPort": 3389,
     "blockOldPort": true,
     "restartRemoteDesktopService": true,
     "verifyListening": true
@@ -267,8 +265,7 @@
     "packageId": "Microsoft.WindowsTerminal",
     "interactiveInstaller": false,
     "setAsDefaultTerminal": true,
-    "setPowerShell7AsDefaultProfile": true,
-    "openSettingsAfterInstall": false
+    "setPowerShell7AsDefaultProfile": true
   },
   "customFolders": {
     "enabled": true,

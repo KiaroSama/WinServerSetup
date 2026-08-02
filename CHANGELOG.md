@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Config keys can now be retired instead of deleted.** A key nothing reads any more could not simply be removed from the schema: unknown properties are rejected outright, so an operator whose `WinServerSetup.config.local.json` still carried it would have their entire run fail on upgrade. A key marked `retired` is accepted, dropped, and reported by name so it eventually gets cleaned up — and it is dropped rather than merely tolerated, because the merge step rejects an override property with no counterpart in the tracked config. Retiring one key does not make its siblings permissive. `rdp.oldPort`, `windowsUpdate.autoReboot` and `windowsTerminal.openSettingsAfterInstall` are the first three: all three were declared and never read. (`defaultApps.openSettingsAfterInstall` is a different key and is still live.)
+
 ### Fixed
 
 - **A hung installer or prefetch child no longer blocks setup forever.** `Wait-ProcessWithStatus` — the single wait every download and installer routes through — looped on `HasExited` with no deadline. It now takes a `-TimeoutSeconds` ceiling (default one hour; a slow installer on a slow link is slow, not hung) and on expiry terminates the whole process tree with `taskkill /T /F` and logs it. Both callers already treat a non-zero exit code as failure, so the existing handling applies unchanged. The deadline lives in the shared helper rather than at each call site, where one omission would silently restore an unbounded wait.
