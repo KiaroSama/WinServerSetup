@@ -55,8 +55,8 @@ function Assert-Equal {
 
 Assert-Contains `
     -Text $main `
-    -Pattern 'Read-HostThemed\s+-Prompt\s+"Select"\s+-DefaultValue\s+"1"' `
-    -Message "Main menu must show Select with default [1] and submit option 1 when Enter is pressed."
+    -Pattern 'Read-HostThemed\s+-Prompt\s+"Selection"\s+-DefaultValue\s+"1"\s+-Hint\s+"0=exit"' `
+    -Message "Main menu must prompt Selection with default [1] and an exit hint, and submit option 1 when Enter is pressed."
 
 $menuBlockMatch = [regex]::Match(
     $main,
@@ -70,7 +70,7 @@ Assert-True `
 
 Assert-Contains `
     -Text $main `
-    -Pattern '(?s)function\s+Write-Option.*?-Kind\s+StartupLabel\s+-NoNewline\s+Write-Host\s+\$Label' `
+    -Pattern '(?s)function\s+Write-Option.*?-Kind\s+MenuNumber\s+-NoNewline' `
     -Message "Write-Option must render a light-blue option number followed by a plain label."
 
 Assert-Contains `

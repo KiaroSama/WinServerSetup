@@ -83,6 +83,9 @@ $Global:WinServerSetupColors = @{
     Banner       = 'Magenta'
     BannerRule   = 'Magenta'
     MenuHeader   = 'Cyan'
+    MenuNumber   = 'Cyan'
+    MenuDefault  = 'Green'
+    ExitHint     = 'DarkCyan'
     StartupLabel = 'Cyan'
     StartupValue = 'Yellow'
     StartupPath  = 'White'
@@ -99,6 +102,13 @@ $Global:WinServerSetupAnsiColors = @{
     Banner       = "$([char]27)[1m$([char]27)[38;2;255;50;115m"
     BannerRule   = "$([char]27)[38;2;255;50;115m"
     MenuHeader   = "$([char]27)[1m$([char]27)[38;5;117m"
+    # The menu number carries the same light blue as the header without the bold, so the
+    # numbers read as one column and the labels stay plain - the label is the content, the
+    # number is only the key you press. The default marker is green because it is the one
+    # thing on the line that is a VALUE rather than a label.
+    MenuNumber   = "$([char]27)[38;5;117m"
+    MenuDefault  = "$([char]27)[92m"
+    ExitHint     = "$([char]27)[38;5;32m"
     StartupLabel = "$([char]27)[38;5;117m"
     StartupValue = "$([char]27)[38;5;229m"
     StartupPath  = "$([char]27)[38;5;159m"
@@ -440,7 +450,7 @@ function Show-MainMenu {
     while ($true) {
         Write-Host ""
         Write-Themed "WinServerSetup Main menu:" -Kind MenuHeader
-        Write-Option -Number "1"  -Label "Run full setup"
+        Write-Option -Number "1"  -Label "Run full setup" -IsDefault
         Write-Option -Number "2"  -Label "Windows Update (multi-pass)"
         Write-Option -Number "3"  -Label "Activation from config only"
         Write-Option -Number "4"  -Label "Apply dark mode + taskbar"
@@ -475,51 +485,50 @@ function Show-MainMenu {
         Write-Option -Number "0"  -Label "Back / Exit"
         Write-Host ""
 
-        $choice = Read-HostThemed -Prompt "Select" -DefaultValue "1"
+        $choice = Read-HostThemed -Prompt "Selection" -DefaultValue "1" -Hint "0=exit"
         try {
             switch ($choice) {
-                "1"  { Invoke-FullSetupWithActiveTimer | Out-Null;                                                               Pause-IfNeeded }
-                "2"  { Invoke-Timed -Name "Windows Update (multi-pass)"             -Action { Invoke-SystemUpdate };                           Pause-IfNeeded }
-                "3"  { Invoke-Timed -Name "Activation from config"                  -Action { Invoke-ActivationIfConfigured };                 Pause-IfNeeded }
-                "4"  { Invoke-Timed -Name "Apply dark mode"                         -Action { Set-WindowsDarkMode };                           Pause-IfNeeded }
-                "5"  { Invoke-Timed -Name "Show file extensions"                    -Action { Enable-FileExtensions };                         Pause-IfNeeded }
-                "5b" { Invoke-Timed -Name "Enable Windows long paths"                -Action { Enable-LongPathSupport };                       Pause-IfNeeded }
-                "6"  { Invoke-Timed -Name "Add Persian keyboard layout"             -Action { Add-PersianKeyboardLayout };                     Pause-IfNeeded }
-                "7"  { Invoke-Timed -Name "Install applications"                    -Action { Install-Applications };                          Pause-IfNeeded }
-                "8"  { Invoke-Timed -Name "Install Brave extensions"                -Action { Install-BraveExtensions };                       Pause-IfNeeded }
-                "9"  { Invoke-Timed -Name "Configure default browser/player"        -Action { Configure-DefaultApps };                         Pause-IfNeeded }
-                "9b" { Invoke-Timed -Name "7-Zip as default for compressed files"   -Action { Set-SevenZipAsDefault };                         Pause-IfNeeded }
-                "10" { Invoke-Timed -Name "Configure RDP port and firewall"         -Action { Configure-RdpPortAndFirewall };                  Pause-IfNeeded }
-                "11" { Invoke-Timed -Name "Enable Search Indexing"                  -Action { Enable-SearchIndexing };                         Pause-IfNeeded }
-                "12" { Invoke-Timed -Name ".NET + Visual C++ runtimes"              -Action { Install-Runtimes };                              Pause-IfNeeded }
-                "13" { Invoke-Timed -Name "Empty Cache task"                        -Action { Install-EmptyStandbyList };                      Pause-IfNeeded }
-                "14" { Invoke-Timed -Name "Windows Update bandwidth / QoS"          -Action { Configure-WindowsUpdateBandwidthPolicies };      Pause-IfNeeded }
-                "15" { Invoke-Timed -Name "RDP brute-force blocker"                 -Action { Install-RdpBruteforceBlocker };                  Pause-IfNeeded }
-                "16" { Invoke-Timed -Name "Disable startup apps"                    -Action { Disable-ConfiguredStartupApps };                 Pause-IfNeeded }
-                "17" { Invoke-Timed -Name "Remove Appx packages"                    -Action { Remove-ConfiguredAppxPackages };                 Pause-IfNeeded }
-                "18" { Invoke-Timed -Name "Remove Windows capabilities"             -Action { Remove-ConfiguredWindowsCapabilities };          Pause-IfNeeded }
-                "19" { Invoke-Timed -Name "Replace Edge with Brave on taskbar"      -Action { Replace-EdgeTaskbarPinWithBrave };               Pause-IfNeeded }
-                "20" { Invoke-Timed -Name "Pin folders to Quick Access"             -Action { Add-ConfiguredQuickAccessPins };                 Pause-IfNeeded }
-                "21" { Invoke-Timed -Name "Custom folders / Defender exclusions"    -Action { Configure-CustomFoldersAndDefenderExclusions }; Pause-IfNeeded }
-                "22" { Invoke-Timed -Name "Clean temp and cache"                    -Action { Clear-WinServerSetupTempAndCache };              Pause-IfNeeded }
-                "23" { Invoke-Timed -Name "Health check"                            -Action { Invoke-HealthCheck };                            Pause-IfNeeded }
-                "24" { Show-FinalSummary; Pause-IfNeeded }
-                "25" { Invoke-Timed -Name "Schedule post-reboot SFC"                -Action { Register-PostRebootSfcTask };                    Pause-IfNeeded }
-                "26" { Restart-AfterSetup; Pause-IfNeeded }
+                "1"  { Invoke-FullSetupWithActiveTimer | Out-Null }
+                "2"  { Invoke-Timed -Name "Windows Update (multi-pass)"             -Action { Invoke-SystemUpdate } }
+                "3"  { Invoke-Timed -Name "Activation from config"                  -Action { Invoke-ActivationIfConfigured } }
+                "4"  { Invoke-Timed -Name "Apply dark mode"                         -Action { Set-WindowsDarkMode } }
+                "5"  { Invoke-Timed -Name "Show file extensions"                    -Action { Enable-FileExtensions } }
+                "5b" { Invoke-Timed -Name "Enable Windows long paths"                -Action { Enable-LongPathSupport } }
+                "6"  { Invoke-Timed -Name "Add Persian keyboard layout"             -Action { Add-PersianKeyboardLayout } }
+                "7"  { Invoke-Timed -Name "Install applications"                    -Action { Install-Applications } }
+                "8"  { Invoke-Timed -Name "Install Brave extensions"                -Action { Install-BraveExtensions } }
+                "9"  { Invoke-Timed -Name "Configure default browser/player"        -Action { Configure-DefaultApps } }
+                "9b" { Invoke-Timed -Name "7-Zip as default for compressed files"   -Action { Set-SevenZipAsDefault } }
+                "10" { Invoke-Timed -Name "Configure RDP port and firewall"         -Action { Configure-RdpPortAndFirewall } }
+                "11" { Invoke-Timed -Name "Enable Search Indexing"                  -Action { Enable-SearchIndexing } }
+                "12" { Invoke-Timed -Name ".NET + Visual C++ runtimes"              -Action { Install-Runtimes } }
+                "13" { Invoke-Timed -Name "Empty Cache task"                        -Action { Install-EmptyStandbyList } }
+                "14" { Invoke-Timed -Name "Windows Update bandwidth / QoS"          -Action { Configure-WindowsUpdateBandwidthPolicies } }
+                "15" { Invoke-Timed -Name "RDP brute-force blocker"                 -Action { Install-RdpBruteforceBlocker } }
+                "16" { Invoke-Timed -Name "Disable startup apps"                    -Action { Disable-ConfiguredStartupApps } }
+                "17" { Invoke-Timed -Name "Remove Appx packages"                    -Action { Remove-ConfiguredAppxPackages } }
+                "18" { Invoke-Timed -Name "Remove Windows capabilities"             -Action { Remove-ConfiguredWindowsCapabilities } }
+                "19" { Invoke-Timed -Name "Replace Edge with Brave on taskbar"      -Action { Replace-EdgeTaskbarPinWithBrave } }
+                "20" { Invoke-Timed -Name "Pin folders to Quick Access"             -Action { Add-ConfiguredQuickAccessPins } }
+                "21" { Invoke-Timed -Name "Custom folders / Defender exclusions"    -Action { Configure-CustomFoldersAndDefenderExclusions } }
+                "22" { Invoke-Timed -Name "Clean temp and cache"                    -Action { Clear-WinServerSetupTempAndCache } }
+                "23" { Invoke-Timed -Name "Health check"                            -Action { Invoke-HealthCheck } }
+                "24" { Show-FinalSummary }
+                "25" { Invoke-Timed -Name "Schedule post-reboot SFC"                -Action { Register-PostRebootSfcTask } }
+                "26" { Restart-AfterSetup }
                 # $null = ... : these return structured result objects, which Invoke-Timed would
                 # otherwise format-print to the console. Their outcome is already reported by the
                 # Write-Ok/Write-Warn calls inside the functions themselves.
-                "27" { Invoke-Timed -Name "Rename built-in Administrator" -Action { $null = Rename-BuiltinAdministratorAccount }; Pause-IfNeeded }
-                "28" { Invoke-Timed -Name "Disable local account lockout" -Action { $null = Disable-LocalAccountLockoutPolicy -RunGpupdate:([bool]$Global:Config.accountLockout.runGpupdate) }; Pause-IfNeeded }
-                "29" { Invoke-Timed -Name "Restore built-in Administrator name" -Action { $null = Restore-BuiltinAdministratorName }; Pause-IfNeeded }
-                "30" { Invoke-Timed -Name "Restore local account lockout policy" -Action { $null = Restore-LocalAccountLockoutPolicy }; Pause-IfNeeded }
+                "27" { Invoke-Timed -Name "Rename built-in Administrator" -Action { $null = Rename-BuiltinAdministratorAccount } }
+                "28" { Invoke-Timed -Name "Disable local account lockout" -Action { $null = Disable-LocalAccountLockoutPolicy -RunGpupdate:([bool]$Global:Config.accountLockout.runGpupdate) } }
+                "29" { Invoke-Timed -Name "Restore built-in Administrator name" -Action { $null = Restore-BuiltinAdministratorName } }
+                "30" { Invoke-Timed -Name "Restore local account lockout policy" -Action { $null = Restore-LocalAccountLockoutPolicy } }
                 "0"  { return }
                 default { Write-Warn "Invalid option." }
             }
         } catch {
             Stop-ActiveTimer
             Write-Fail $_.Exception.Message
-            Pause-IfNeeded
         }
     }
 }
