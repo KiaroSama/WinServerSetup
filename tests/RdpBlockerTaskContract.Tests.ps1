@@ -43,7 +43,7 @@ $setupAsts = @(foreach ($setupFile in $setupSourceFiles) {
 foreach ($name in @('Get-TermServiceProcessId', 'Test-TermServiceOwnsTcpPort', 'Test-TcpPortListening',
         'Get-Sha256Hex', 'ConvertTo-CanonicalPath', 'Get-RdpRegistryPortNumber', 'Test-RdpPortAgreement',
         'Assert-RdpPortAgreement', 'Test-TrustedTaskTargetPath', 'Assert-TrustedTaskTarget',
-        'Copy-TaskTargetToStaging', 'Save-StagedTaskConfig',
+        'Copy-TaskTargetToStaging', 'Resolve-StagedBlockerStatePath', 'Save-StagedTaskConfig',
         'Get-TaskTrustManifestPath', 'Save-TaskTrustManifest', 'Get-TaskTrustManifest',
         'ConvertFrom-ScheduledTaskDuration', 'ConvertFrom-ScheduledTaskArgument', 'Test-BlockerTaskArgumentContract',
         'Get-BlockerExecutionTimeLimitMinutes', 'New-BlockerTaskArgument', 'Get-BlockerDeadlineMarkerPath', 'Test-RdpBlockerTaskHealth',
@@ -576,9 +576,30 @@ try {
     # so LastTaskResult only carries the exit code and the run still looks like it "ran". The
     # marker outlives the run and is the durable evidence, so the health check has to read it.
     $task = Reset-HealthyTask
-    $markerPath = Get-BlockerDeadlineMarkerPath
+    $markerPath = Get-BlockerDeadlineMarkerPath -TaskName $taskName
     Assert-True (-not [string]::IsNullOrWhiteSpace($markerPath)) `
         "FU-04: the health check must be able to derive a marker path; an empty one would silently disable this case."
+
+    # THE PATH-MISMATCH REGRESSION. The checkout ($Global:ProjectRoot = <root>\project) and the
+    # staging root (<root>\staging) are deliberately different here, and the source statePath is
+    # empty. The staged blocker derives its own project root from where IT lives, so it writes
+    # <root>\state\... - while anything recomputing a default from the checkout would say
+    # <root>\project\state\..., a file nobody writes. The health check would then report healthy
+    # with a real deadline marker still standing. The earlier version of this suite could not
+    # catch that, because its blocker root and $Global:ProjectRoot were the same directory.
+    $stagedProjectRoot = Split-Path -Parent $script:StagingRoot
+    $expectedStagedState = ConvertTo-CanonicalPath (Join-Path $stagedProjectRoot 'state\rdp-blocker-state.json')
+    $checkoutState = ConvertTo-CanonicalPath (Join-Path $Global:ProjectRoot 'state\rdp-blocker-state.json')
+    Assert-True ($expectedStagedState -ne $checkoutState) `
+        "FU-04 harness: the staged root and the checkout root must differ, or this case cannot distinguish them at all."
+    Assert-Equal ($expectedStagedState + '.deadline') $markerPath `
+        "FU-04: the marker path must follow the STAGED task's own root, not the checkout. Recomputing it from `$Global:ProjectRoot is exactly the drift that let a timed-out control report healthy."
+    Assert-Equal $expectedStagedState ([string](Get-TaskTrustManifest -TaskName $taskName).StatePath) `
+        "FU-04: the absolute state path must be RECORDED in the trust manifest at registration, so the health check reads it instead of recomputing a default."
+    $stagedConfigStatePath = [string]((Get-Content -LiteralPath $stagedConfig -Raw -Encoding UTF8 | ConvertFrom-Json).rdpBruteforceBlocker.statePath)
+    Assert-Equal $expectedStagedState $stagedConfigStatePath `
+        "FU-04: the staged config must state the same absolute path, so the task itself and the health check cannot drift apart."
+
     $markerParent = Split-Path -Parent $markerPath
     if (-not (Test-Path -LiteralPath $markerParent)) { Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $markerParent -Force | Out-Null }
     Microsoft.PowerShell.Management\Set-Content -LiteralPath $markerPath -Encoding UTF8 `

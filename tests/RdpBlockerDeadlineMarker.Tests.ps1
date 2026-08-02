@@ -224,14 +224,14 @@ exit [int]$code
     Assert-Equal $true $verificationRejected `
         "FU-04: installer verification must FAIL on the deadline exit code; with exit 0 it reported a timed-out blocker as successfully verified."
 
-    # ---- 4b: task health must surface the marker. ----
-    . ([scriptblock]::Create((Import-FunctionUnderTest 'Get-BlockerDeadlineMarkerPath' $setupAsts)))
-    $Global:ProjectRoot = $testRoot
-    $Global:Config = [pscustomobject]@{ rdpBruteforceBlocker = [pscustomobject]@{ statePath = '' } }
-    Assert-Equal $expectedMarker (Get-BlockerDeadlineMarkerPath) `
-        "FU-04: the health check must derive the SAME marker path the blocker writes, from the same two sources in the same order - otherwise it watches a file nobody writes and reads as healthy for the wrong reason."
-    Assert-Equal $true (Test-Path -LiteralPath (Get-BlockerDeadlineMarkerPath)) `
-        "FU-04: the health check must see the marker this run left behind."
+    # ---- 4b: the marker this run wrote is where the blocker's own default puts it. ----
+    # The health check's side of this is covered in tests\RdpBlockerTaskContract.Tests.ps1, which
+    # has the manifest and scheduled-task harness. It is deliberately NOT re-derived here from
+    # $Global:ProjectRoot: this suite runs the blocker with its project root and the checkout set
+    # to the same sandbox, so such an assertion passes whether or not the two agree - which is
+    # exactly how the earlier version of this file hid the path-mismatch defect.
+    Assert-Equal $true (Test-Path -LiteralPath $expectedMarker) `
+        "FU-04: the marker must sit under the state directory the blocker itself derives from its own location."
 
     # ---- 5: a later healthy run clears it. ----
     $env:FU04_BLOCK = $null
