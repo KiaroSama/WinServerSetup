@@ -14,9 +14,20 @@ function Test-ValidLocalAccountName {
     return $Name -notmatch '["/\\\[\]:;|=,+*?<>@]'
 }
 
+# The built-in Administrator is S-1-5-21-<machine>-500 on every Windows install. Matching the
+# whole SID shape rather than a '-500' suffix is what makes the rename target unambiguous: a
+# suffix test also accepts principals like S-1-5-80-...-500, and the Select-Object -First 1 below
+# would then hand the rename to whichever one the enumeration happened to return first. Names are
+# localised and renameable - which is the whole point of this feature - so they are never used to
+# identify the account.
+function Test-BuiltinAdministratorSid {
+    param([AllowEmptyString()][string]$Sid)
+    return $Sid -match '^S-1-5-21-\d+-\d+-\d+-500$'
+}
+
 function Get-BuiltinAdministratorAccount {
     $account = Get-CimInstance -ClassName Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction Stop |
-        Where-Object { [string]$_.SID -match '-500$' } | Select-Object -First 1
+        Where-Object { Test-BuiltinAdministratorSid ([string]$_.SID) } | Select-Object -First 1
     if (-not $account) { throw "The built-in RID-500 local Administrator account was not found." }
     return $account
 }
@@ -144,12 +155,22 @@ function Rename-BuiltinAdministratorAccount {
     # -NoPause/-Full must never block on a prompt - least of all a hidden one.
     $interactive = -not $Global:NoPause
 
+    # The new name is an operator decision, so the configured value is only ever OFFERED as the
+    # prompt default - never applied on its own while a console is available to ask.
     if ([string]::IsNullOrWhiteSpace($NewName)) {
-        if (-not $interactive) {
+        $configuredName = [string]$Global:Config.administratorAccount.defaultNewName
+        if ($interactive) {
+            $NewName = Read-HostThemed -Prompt 'New name for the built-in Administrator account' -DefaultValue $configuredName
+        } elseif ([string]::IsNullOrWhiteSpace($configuredName)) {
             Write-Warn "Skipped the Administrator rename: no name is configured and noninteractive mode cannot prompt for one."
             return $result
+        } else {
+            # No console to ask, so configuration is the only remaining source. Skipping instead
+            # would leave a provisioning run half-done, so it is applied and the substitution is
+            # logged rather than passing for an operator decision.
+            $NewName = $configuredName
+            Write-Warn ("Noninteractive mode cannot prompt, so the rename used the configured name '{0}'." -f $configuredName)
         }
-        $NewName = Read-HostThemed -Prompt 'New name for the built-in Administrator account' -DefaultValue ([string]$Global:Config.administratorAccount.defaultNewName)
     }
     if (-not (Test-ValidLocalAccountName $NewName)) { throw "The requested local account name is invalid or longer than 20 characters." }
     if ([string]::Equals($originalName, $NewName, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -213,7 +234,7 @@ function Rename-BuiltinAdministratorAccount {
     }
 
     $verified = Get-BuiltinAdministratorAccount
-    if ([string]$verified.SID -ne $sid -or [string]$verified.SID -notmatch '-500$') { throw "Rename verification failed: the RID-500 SID changed. Recovery record: $backup" }
+    if ([string]$verified.SID -ne $sid -or -not (Test-BuiltinAdministratorSid ([string]$verified.SID))) { throw "Rename verification failed: the RID-500 SID changed. Recovery record: $backup" }
     if ([string]$verified.Name -ne $NewName) { throw "Rename verification failed: the account is named '$($verified.Name)'. Recovery record: $backup" }
     if ([bool]$verified.Disabled) { throw "Rename verification failed: the renamed account is disabled. Recovery record: $backup" }
     $membership = Test-LocalAdministratorsMembership -Sid $sid
@@ -410,7 +431,9 @@ function Invoke-ConfiguredAccountSecurity {
     }
     if ($rename.enabled) {
         $proceed = -not $rename.promptDuringFullSetup -or (Read-HostThemed -Prompt 'Rename the built-in Administrator account now? [y/N]' -DefaultValue 'N') -match '^(?i)y(es)?$'
-        if ($proceed) { $null = Rename-BuiltinAdministratorAccount -NewName ([string]$rename.defaultNewName) }
+        # No -NewName: the rename asks the operator for the name and offers defaultNewName as the
+        # prompt default. Passing the configured value here would apply it without ever asking.
+        if ($proceed) { $null = Rename-BuiltinAdministratorAccount }
     }
     if ($lockout.disableLocalAccountLockout) {
         $proceed = -not $lockout.promptDuringFullSetup -or (Read-HostThemed -Prompt 'Disable machine-local account lockout now? [y/N]' -DefaultValue 'N') -match '^(?i)y(es)?$'

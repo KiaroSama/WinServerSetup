@@ -56,7 +56,8 @@ $Global:RunStats = [pscustomobject]@{
     SkippedTasks   = New-Object System.Collections.Generic.List[string]
 }
 $Global:CurrentStepSkipReason = $null
-function Write-StructuredLog { param($Level, $Message) }
+$Global:CapturedLog = New-Object System.Collections.Generic.List[string]
+function Write-StructuredLog { param($Level, $Message) $Global:CapturedLog.Add(("{0} {1}" -f $Level, $Message)) | Out-Null }
 function Write-Fail { param($Message) }
 '@
 
@@ -225,4 +226,53 @@ $startupText = Get-FunctionText 'Disable-StartupEntry'
     Assert-True ($shortcutLog -match 'WARN Could not remove startup shortcut.*MyStartupApp\.lnk') "A failed shortcut delete must name the shortcut."
 }
 
-Write-Host "PASS failed steps exit non-zero and emit nothing, config-disabled steps are Skipped, registry lookup returns a scalar, and failed startup removals are not counted."
+# ---- O5: every recorded step must leave a reconstructable trail: start, outcome, duration. ----
+# The console summary only survives while the window is open, so the step trail has to reach the
+# file log too - and a failure has to carry enough detail to diagnose without a repro.
+$Global:CapturedLog.Clear()
+$null = Invoke-RecordedSetupStep -Name "timed step" -Action { }
+$completedLog = $Global:CapturedLog -join "`n"
+Assert-True ($completedLog -match 'TASK Started: timed step') "A recorded step must log that it started."
+Assert-True ($completedLog -match 'TASK Completed: timed step; durationMs=\d+') "A completed step must log how long it took; without a duration a slow run cannot be diagnosed."
+
+$Global:CapturedLog.Clear()
+$null = Invoke-RecordedSetupStep -Name "skipped step" -Action { Set-StepSkipped "disabled in config"; return }
+$skippedLog = $Global:CapturedLog -join "`n"
+Assert-True ($skippedLog -match 'TASK Skipped: skipped step; disabled in config; durationMs=\d+') "A skipped step must log its reason and its duration."
+
+$Global:CapturedLog.Clear()
+$emitted = @(Invoke-RecordedSetupStep -Name "exploding step" -Action { throw (New-Object System.InvalidOperationException("kaboom detail")) })
+$failedLog = $Global:CapturedLog -join "`n"
+Assert-Equal 0 $emitted.Count "Recording the failure detail must not start emitting into the output stream."
+Assert-True ($failedLog -match 'ERROR Failed: exploding step; durationMs=\d+') "A failed step must log its duration alongside the failure."
+Assert-True ($failedLog -match 'type=System\.InvalidOperationException') "A failed step must record the exception type, not only its message."
+Assert-True ($failedLog -match 'kaboom detail') "A failed step must record the exception message."
+Assert-True ($failedLog -match 'errorId=') "A failed step must record the fully qualified error id."
+Assert-True ($failedLog -match 'stack=\S') "A failed step must record a stack trace; a message alone rarely locates the fault."
+
+# ---- O6: menu-driven steps go through Invoke-Timed, which recorded nothing at all. ----
+$timedText = Get-FunctionText 'Invoke-Timed'
+& {
+    function Start-ActiveTimer { }
+    function Stop-ActiveTimer { }
+    function Write-ActiveTimerSummary { param([string]$Name = "") }
+    function Write-Host { param([Parameter(Position = 0)]$Object, [switch]$NoNewline, $ForegroundColor) }
+    . ([scriptblock]::Create($timedText))
+
+    $Global:CapturedLog.Clear()
+    Invoke-Timed -Name "menu step" -Action { }
+    $timedLog = $Global:CapturedLog -join "`n"
+    Assert-True ($timedLog -match 'TASK Started: menu step') "A menu-driven step must log that it started."
+    Assert-True ($timedLog -match 'TASK Completed: menu step; durationMs=\d+') "A menu-driven step must log its outcome and duration."
+
+    $Global:CapturedLog.Clear()
+    $timedError = $null
+    try { Invoke-Timed -Name "menu boom" -Action { throw "menu failure" } } catch { $timedError = [string]$_.Exception.Message }
+    Assert-True ($null -ne $timedError) "Invoke-Timed must keep rethrowing so the menu's own handler still reports the failure."
+    $timedFailLog = $Global:CapturedLog -join "`n"
+    Assert-True ($timedFailLog -match 'ERROR Failed: menu boom; durationMs=\d+') "A failed menu-driven step must log its duration."
+    Assert-True ($timedFailLog -match 'menu failure') "A failed menu-driven step must log the exception message."
+    Assert-True ($timedFailLog -match 'stack=\S') "A failed menu-driven step must log a stack trace."
+}
+
+Write-Host "PASS failed steps exit non-zero and emit nothing, config-disabled steps are Skipped, registry lookup returns a scalar, failed startup removals are not counted, and every recorded or timed step logs its start, outcome, duration and full failure detail."

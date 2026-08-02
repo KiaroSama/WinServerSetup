@@ -137,24 +137,250 @@ function Install-Applications {
     Install-BraveExtensions
 }
 
+function Get-ParallelStepBudget {
+    # A ceiling, clamped to at least one: a budget of zero would schedule nothing at all.
+    param([int]$Requested)
+    if ($Requested -lt 1) { return 1 }
+    return $Requested
+}
+
+function Split-ParallelStepWave {
+    <#
+        Groups steps into waves that may run concurrently.
+
+        A step declares the RESOURCES it touches. Two steps claiming the same resource never
+        share a wave, however large the budget. The concrete case is Explorer: both the dark
+        mode and file-extension steps restart it, and running them together races a process
+        kill against a process start - the loser leaves the operator with no shell.
+
+        Greedy and order-preserving: a step joins the first wave that has room and no conflict,
+        so declared order survives and an unresourced step is never pushed into a wave of its
+        own.
+
+        Returns a FLAT array of { Wave = <int>; Step = <step> }, not an array of arrays.
+        PowerShell writes a returned collection to the pipeline element by element, so a
+        nested result is flattened on the way out and cannot be reassembled; wrapping the
+        inner arrays in a unary comma to prevent that throws "Argument types do not match" on
+        both hosts. A flat projection with an explicit wave index sidesteps the whole problem.
+        Wrap the call in @() - the outer collection is still enumerated on return.
+    #>
+    param(
+        [Parameter(Mandatory)][object[]]$Steps,
+        [int]$MaxParallel = 1
+    )
+    $budget = Get-ParallelStepBudget -Requested $MaxParallel
+    $counts = New-Object System.Collections.Generic.List[int]
+    $claims = New-Object System.Collections.Generic.List[object]
+    $assignments = New-Object System.Collections.Generic.List[object]
+
+    foreach ($step in $Steps) {
+        $resources = @(@($step.Resources) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        $target = -1
+        for ($i = 0; $i -lt $counts.Count; $i++) {
+            if ($counts[$i] -ge $budget) { continue }
+            $conflict = $false
+            foreach ($resource in $resources) { if ($claims[$i].ContainsKey([string]$resource)) { $conflict = $true; break } }
+            if ($conflict) { continue }
+            $target = $i
+            break
+        }
+        if ($target -lt 0) {
+            $counts.Add(0) | Out-Null
+            $claims.Add(@{}) | Out-Null
+            $target = $counts.Count - 1
+        }
+        $counts[$target] = $counts[$target] + 1
+        foreach ($resource in $resources) { $claims[$target][[string]$resource] = $true }
+        $assignments.Add([pscustomobject]@{ Wave = $target; Step = $step }) | Out-Null
+    }
+    return $assignments.ToArray()
+}
+
+function Invoke-ParallelSetupSteps {
+    <#
+        Runs independent setup steps concurrently and merges their outcomes into
+        $Global:RunStats in DECLARED order, so the final summary is byte-identical to what a
+        sequential run would have produced. Completion order must not leak into the report.
+
+        Only the CONFIGURATION half of setup is eligible. The install half is deliberately not
+        parallelised: Windows Installer serialises every MSI behind a machine-global
+        `_MSIExecute` mutex and a second concurrent install returns 1618 rather than waiting,
+        so parallel installs would buy nothing and start reporting spurious failures. The
+        download half is already parallel, in Start-ApplicationDownloadPrefetch.
+
+        A budget of one is the degenerate sequential case and is executed inline - no runspace,
+        no marshalling. That is also the fallback whenever the parallel path cannot start: this
+        is new concurrency in a script that also changes RDP ports and administrator accounts,
+        and it must never turn a working sequential run into a broken parallel one.
+    #>
+    param(
+        [Parameter(Mandatory)][object[]]$Steps,
+        [int]$MaxParallel = 1
+    )
+    $budget = Get-ParallelStepBudget -Requested $MaxParallel
+    $assignments = @(Split-ParallelStepWave -Steps $Steps -MaxParallel $budget)
+
+    foreach ($waveIndex in @($assignments | ForEach-Object { $_.Wave } | Select-Object -Unique | Sort-Object)) {
+        $waveSteps = @($assignments | Where-Object { $_.Wave -eq $waveIndex } | ForEach-Object { $_.Step })
+        # Ordered slots, filled by whichever worker finishes first, drained in declared order.
+        $outcomes = New-Object 'object[]' $waveSteps.Count
+
+        if ($budget -le 1 -or $waveSteps.Count -le 1) {
+            for ($i = 0; $i -lt $waveSteps.Count; $i++) {
+                $outcomes[$i] = Invoke-IsolatedSetupStep -Step $waveSteps[$i]
+            }
+        } else {
+            $outcomes = @(Invoke-SetupStepWaveConcurrently -Steps $waveSteps)
+        }
+
+        foreach ($outcome in $outcomes) {
+            if ($null -eq $outcome) { continue }
+            $null = $Global:RunStats.StartedTasks.Add([string]$outcome.Name)
+            switch ([string]$outcome.Outcome) {
+                'Skipped' {
+                    $null = $Global:RunStats.SkippedTasks.Add(("{0} ({1})" -f $outcome.Name, $outcome.SkipReason))
+                    Write-StructuredLog -Level TASK -Message ("Skipped: {0}; {1}" -f $outcome.Name, $outcome.SkipReason)
+                }
+                'Failed' {
+                    $null = $Global:RunStats.FailedTasks.Add([string]$outcome.Name)
+                    Write-StructuredLog -Level ERROR -Message ("Failed: {0}; {1}" -f $outcome.Name, $outcome.Error)
+                    Write-Fail ("{0} failed: {1}" -f $outcome.Name, $outcome.Error)
+                }
+                default {
+                    $null = $Global:RunStats.CompletedTasks.Add([string]$outcome.Name)
+                    Write-StructuredLog -Level TASK -Message ("Completed: {0}" -f $outcome.Name)
+                }
+            }
+        }
+    }
+}
+
+function Invoke-IsolatedSetupStep {
+    # Runs one step and reports its outcome as data rather than by mutating shared state, so
+    # the same shape works inline and across a runspace boundary.
+    param([Parameter(Mandatory)][object]$Step)
+    $Global:CurrentStepSkipReason = $null
+    try {
+        $null = & $Step.Action
+        if (-not [string]::IsNullOrWhiteSpace($Global:CurrentStepSkipReason)) {
+            return [pscustomobject]@{ Name = [string]$Step.Name; Outcome = 'Skipped'; SkipReason = [string]$Global:CurrentStepSkipReason; Error = '' }
+        }
+        return [pscustomobject]@{ Name = [string]$Step.Name; Outcome = 'Completed'; SkipReason = ''; Error = '' }
+    } catch {
+        return [pscustomobject]@{ Name = [string]$Step.Name; Outcome = 'Failed'; SkipReason = ''; Error = [string]$_.Exception.Message }
+    } finally {
+        $Global:CurrentStepSkipReason = $null
+    }
+}
+
+function Invoke-SetupStepWaveConcurrently {
+    <#
+        One runspace per step. Each rehydrates the globals and dot-sources the module library,
+        because a fresh runspace shares nothing with this session - the modules are the whole
+        function library and $Global:Config drives every step's behaviour.
+
+        Anything that goes wrong establishing the pool degrades to inline execution rather than
+        failing the wave. Slots are indexed, so results land in declared order regardless of
+        which worker finishes first.
+    #>
+    param([Parameter(Mandatory)][object[]]$Steps)
+
+    $pool = $null
+    $running = New-Object System.Collections.Generic.List[object]
+    $outcomes = New-Object 'object[]' $Steps.Count
+    try {
+        $pool = [runspacefactory]::CreateRunspacePool(1, $Steps.Count)
+        $pool.Open()
+        for ($i = 0; $i -lt $Steps.Count; $i++) {
+            $shell = [powershell]::Create()
+            $shell.RunspacePool = $pool
+            $null = $shell.AddScript({
+                    param($ProjectRoot, $ConfigPath, $Config, $StepName, $ActionText)
+                    $Global:ProjectRoot = $ProjectRoot
+                    $Global:ConfigPath = $ConfigPath
+                    $Global:Config = $Config
+                    $Global:CurrentStepSkipReason = $null
+                    foreach ($module in @('Console', 'Core', 'Download', 'Rdp', 'Install', 'SystemSettings', 'Maintenance')) {
+                        . (Join-Path $ProjectRoot ("scripts\{0}.ps1" -f $module))
+                    }
+                    try {
+                        $null = & ([scriptblock]::Create($ActionText))
+                        if (-not [string]::IsNullOrWhiteSpace($Global:CurrentStepSkipReason)) {
+                            return [pscustomobject]@{ Name = $StepName; Outcome = 'Skipped'; SkipReason = [string]$Global:CurrentStepSkipReason; Error = '' }
+                        }
+                        return [pscustomobject]@{ Name = $StepName; Outcome = 'Completed'; SkipReason = ''; Error = '' }
+                    } catch {
+                        return [pscustomobject]@{ Name = $StepName; Outcome = 'Failed'; SkipReason = ''; Error = [string]$_.Exception.Message }
+                    }
+                })
+            # The scriptblock is passed as TEXT: a scriptblock object carries its originating
+            # session state, which does not exist in the target runspace.
+            $null = $shell.AddArgument($Global:ProjectRoot)
+            $null = $shell.AddArgument($Global:ConfigPath)
+            $null = $shell.AddArgument($Global:Config)
+            $null = $shell.AddArgument([string]$Steps[$i].Name)
+            $null = $shell.AddArgument([string]$Steps[$i].Action)
+            $running.Add([pscustomobject]@{ Index = $i; Shell = $shell; Handle = $shell.BeginInvoke() }) | Out-Null
+        }
+
+        foreach ($worker in $running) {
+            try {
+                $result = @($worker.Shell.EndInvoke($worker.Handle)) | Where-Object { $_ -and $_.PSObject.Properties['Outcome'] } | Select-Object -First 1
+                if ($null -eq $result) {
+                    $result = [pscustomobject]@{ Name = [string]$Steps[$worker.Index].Name; Outcome = 'Failed'; SkipReason = ''; Error = 'the parallel worker returned no outcome' }
+                }
+                $outcomes[$worker.Index] = $result
+            } catch {
+                $outcomes[$worker.Index] = [pscustomobject]@{ Name = [string]$Steps[$worker.Index].Name; Outcome = 'Failed'; SkipReason = ''; Error = [string]$_.Exception.Message }
+            } finally {
+                try { $worker.Shell.Dispose() } catch { $null = $_ }
+            }
+        }
+    } catch {
+        Write-Warn ("Parallel execution could not start ({0}); running this group sequentially." -f $_.Exception.Message)
+        for ($i = 0; $i -lt $Steps.Count; $i++) {
+            if ($null -eq $outcomes[$i]) { $outcomes[$i] = Invoke-IsolatedSetupStep -Step $Steps[$i] }
+        }
+    } finally {
+        if ($null -ne $pool) { try { $pool.Close(); $pool.Dispose() } catch { $null = $_ } }
+    }
+    return $outcomes
+}
+
 function Invoke-FullSetup {
     Write-Section "Running Full WinServerSetup"
 
     Invoke-RecordedSetupStep -Name "Apply configured account security" -Action { Invoke-ConfiguredAccountSecurity }
 
-    # Quick wins / settings that don't need network. Apply early.
-    Invoke-RecordedSetupStep -Name "Apply dark mode" -Action { Set-WindowsDarkMode }
-    Invoke-RecordedSetupStep -Name "Show file extensions" -Action { Enable-FileExtensions }
-    Invoke-RecordedSetupStep -Name "Enable Windows long paths" -Action { Enable-LongPathSupport }
-    Invoke-RecordedSetupStep -Name "Add Persian keyboard layout" -Action { Add-PersianKeyboardLayout }
-    Invoke-RecordedSetupStep -Name "Create custom folders and Defender exclusions" -Action { Configure-CustomFoldersAndDefenderExclusions }
+    $parallelEnabled = $Global:Config.parallel -and $Global:Config.parallel.enabled
+    $maxPar          = if ($parallelEnabled) { [int]$Global:Config.parallel.maxParallel } else { 1 }
+    if ($maxPar -lt 1) { $maxPar = 1 }
+
+    # Quick wins / settings that don't need network. Apply early, and concurrently where the
+    # steps genuinely do not touch the same thing.
+    #
+    # Dark mode and file extensions both declare 'explorer' so they can never overlap: dark
+    # mode RESTARTS Explorer, and the file-extension change is only picked up BY that restart,
+    # so running them together can land the write after the restart and silently not apply.
+    # Defender exclusions are tagged too - Add-MpPreference calls serialise anyway, and letting
+    # two run at once buys nothing.
+    #
+    # Installs are deliberately absent from every parallel group in this file. Windows
+    # Installer serialises MSIs behind a machine-global `_MSIExecute` mutex and returns 1618 to
+    # the loser rather than queueing it, so parallel installs would save no time and start
+    # reporting failures that are not failures. The download half is already parallel, in
+    # Start-ApplicationDownloadPrefetch.
+    Invoke-ParallelSetupSteps -MaxParallel $maxPar -Steps @(
+        @{ Name = "Apply dark mode"; Resources = @('explorer'); Action = { Set-WindowsDarkMode } }
+        @{ Name = "Show file extensions"; Resources = @('explorer'); Action = { Enable-FileExtensions } }
+        @{ Name = "Enable Windows long paths"; Resources = @(); Action = { Enable-LongPathSupport } }
+        @{ Name = "Add Persian keyboard layout"; Resources = @(); Action = { Add-PersianKeyboardLayout } }
+        @{ Name = "Create custom folders and Defender exclusions"; Resources = @('defender'); Action = { Configure-CustomFoldersAndDefenderExclusions } }
+    )
 
     # Now run Windows Update in the foreground (heavy, ordered) while safe app
     # downloads run in a separate helper. Registry/configuration steps stay in
     # their normal config-aware functions to avoid duplicated writes.
-    $parallelEnabled = $Global:Config.parallel -and $Global:Config.parallel.enabled
-    $maxPar          = if ($parallelEnabled) { [int]$Global:Config.parallel.maxParallel } else { 1 }
-    if ($maxPar -lt 1) { $maxPar = 1 }
 
     $appPrefetch = $null
     if ($parallelEnabled) {

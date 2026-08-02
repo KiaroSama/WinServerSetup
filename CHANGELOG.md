@@ -2,7 +2,31 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Applications that are already installed are now updated where they are, instead of installed again.** Setup checks for an existing installation first — winget's own package list for winget packages, and the registry uninstall roots for direct installers — and resolves the directory it is actually installed in from `InstallLocation`, `DisplayIcon` or `UninstallString`. An already-present application is upgraded in that directory rather than dropped into the project's default path as a second copy. When the location cannot be resolved from real evidence the existing installation is left alone and the reason is logged: an "update in place" aimed at the wrong tree is worse than not updating at all. A direct installer that reports success but relocated the application is treated as a failure, because that is a duplicate rather than an update.
+
+  Every installer now reports a distinct outcome — installed, updated in place, already current, skipped with a reason, or failed — instead of only installed-or-failed.
+
+- **The Remote Desktop port is now chosen by the operator, and the migration cannot lock you out.** Setup asks which TCP port RDP should listen on before it touches anything — `rdp.newPort` is the offered default, not the decision — and re-prompts on a value that is not a port or is already held by another listener. Because the question comes first, abandoning it leaves the machine exactly as it was found.
+
+  The migration order is the part that matters: the **new** port is opened in the firewall *before* the registry is changed, then the registry is backed up and written, then TermService is restarted, then setup verifies TermService actually owns the new port — and only after that is the **old** port blocked. That last step sits outside the try/catch, so it is unreachable unless verification passed; there is never a window in which the new port is bound but firewalled off. Any failure in the registry/restart/verify window rolls back the registry, the firewall rule and the service, leaving the previous port bound and reachable.
+
+- **A per-run diagnostic log file.** `WinServerSetup_<yyyy-MM-dd_HH-mm-ss>_UTC.log`, created with an atomic `CreateNew` so a previous run's log can never be truncated — not by a same-second restart and not by a second process racing it. Entries are `[timestamp UTC] [LEVEL] [COMPONENT] message`, with the component derived from the call stack so existing call sites gained attribution without being edited. Console output stays concise; the file stays diagnostic. If logging cannot be initialised the run continues on console output alone and says so, rather than silently claiming a log file exists.
+
+  Secret redaction is applied at every sink — console, the in-place status line, and the file log — covering product keys, URL credentials, token-bearing query parameters, `key=value` secrets, secret-shaped command-line parameters, and `Authorization` headers.
+
+- **Safe setup steps now run concurrently.** `Invoke-ParallelSetupSteps` runs the independent configuration steps in bounded waves instead of strictly one after another. Each step declares the resources it touches and two claimants of the same resource never share a wave — dark mode *restarts* Explorer and the file-extension change is only picked up *by* that restart, so running them together could land the write after the restart and silently not apply. The worker count comes from the existing `parallel.maxParallel`; a budget of one executes inline with no runspace at all, and any failure setting up the parallel path degrades to inline execution, so this can never turn a working sequential run into a broken parallel one.
+
+  Installs are deliberately **not** parallelised. Windows Installer serialises every MSI behind a machine-global `_MSIExecute` mutex and returns 1618 to the loser rather than queueing it, so concurrent installs would save no wall time and would start reporting failures that are not failures. The download half was already parallel.
+
+### Fixed
+
+- **Setup no longer copies itself again when it is already installed at the configured target.** The "am I already in the right place?" check compared `Resolve-Path`'s output against the raw configured path. `Resolve-Path` preserves whatever spelling it is handed — an 8.3 short name stays short — and the configured value was normalised by nothing at all, so the decision was made on string *spelling* rather than on identity. A short-name project root, a forward-slash or dot-segment configured path, or a stray trailing space each missed the match and relocated the installation onto itself. Both sides now go through the project's single canonicaliser.
+
 ### Changed
+
+- **The Administrator rename asks for the new name, and always renames the existing account.** `administratorAccount.defaultNewName` is now only the *default offered at the prompt* rather than a value applied silently — previously the configured name was passed straight through, so the prompt never ran. The account to rename is identified by the full built-in-Administrator SID shape (`S-1-5-21-…-500`) instead of a bare `-500` suffix, which also matched unrelated service principals. Non-interactive runs with a configured name now apply it and log that they did so, where they previously skipped the rename entirely.
 
 - **Config keys can now be retired instead of deleted.** A key nothing reads any more could not simply be removed from the schema: unknown properties are rejected outright, so an operator whose `WinServerSetup.config.local.json` still carried it would have their entire run fail on upgrade. A key marked `retired` is accepted, dropped, and reported by name so it eventually gets cleaned up — and it is dropped rather than merely tolerated, because the merge step rejects an override property with no counterpart in the tracked config. Retiring one key does not make its siblings permissive. `rdp.oldPort`, `windowsUpdate.autoReboot` and `windowsTerminal.openSettingsAfterInstall` are the first three: all three were declared and never read. (`defaultApps.openSettingsAfterInstall` is a different key and is still live.)
 

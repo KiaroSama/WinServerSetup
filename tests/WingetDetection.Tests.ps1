@@ -246,12 +246,15 @@ $Global:WingetExecutable = $null
 # These stubs are defined last so the real functions above are unaffected.
 Reset-WingetState
 $script:Warnings = New-Object System.Collections.Generic.List[string]
+$script:Notices = New-Object System.Collections.Generic.List[string]
 function Ensure-Winget { return $true }
 function Test-WingetPackageInstalled { param([string]$Id) return $true }
-function Write-Info { param($Message) }
-function Write-Ok { param($Message) }
+function Write-Info { param($Message) $script:Notices.Add([string]$Message) | Out-Null }
+function Write-Ok { param($Message) $script:Notices.Add([string]$Message) | Out-Null }
 function Write-Warn { param($Message) $script:Warnings.Add([string]$Message) | Out-Null }
-. ([scriptblock]::Create((Import-FunctionUnderTest 'Install-WingetPackages' $setupAsts)))
+foreach ($name in @('Register-AppOutcome', 'Update-WingetPackageInPlace', 'Install-WingetPackages')) {
+    . ([scriptblock]::Create((Import-FunctionUnderTest $name $setupAsts)))
+}
 
 $Global:Config = [pscustomobject]@{ winget = [pscustomobject]@{
             interactiveInstallers   = $false
@@ -259,7 +262,10 @@ $Global:Config = [pscustomobject]@{ winget = [pscustomobject]@{
             packages                = @([pscustomobject]@{ enabled = $true; name = 'Seven Zip'; id = '7zip.7zip' })
         }
 }
-$Global:RunStats = [pscustomobject]@{ InstalledApps = (New-Object System.Collections.Generic.List[string]) }
+$Global:RunStats = [pscustomobject]@{
+    InstalledApps = (New-Object System.Collections.Generic.List[string])
+    FailedApps    = (New-Object System.Collections.Generic.List[string])
+}
 
 # 0x8A15002B - already current. This is the regression: it must not warn.
 $script:WingetExitCode = -1978335189
@@ -274,4 +280,59 @@ Install-WingetPackages
 Assert-Equal 1 $script:Warnings.Count "A real upgrade failure must still be reported."
 Assert-True ($script:Warnings[0] -match 'exited with code 1') "The warning must name the failing exit code."
 
-Write-Host "PASS winget detection: exit-code classification, unpinned source query, registry fallback state, executable resolution order, and the upgrade caller routing through the classifier."
+# ---- 10. An installed package must be UPGRADED where it lives, never installed a second time. ----
+# winget upgrades a package in the location it already occupies, so "in place" here is a matter of
+# calling upgrade rather than install. Re-running install for a package winget already reports
+# installed is what produces a duplicate/parallel version on the machine.
+function Reset-UpgradeState {
+    Reset-WingetState
+    $script:Warnings.Clear()
+    $script:Notices.Clear()
+    $script:GetCommandSource = 'C:\Fake\winget.exe'
+    $Global:RunStats = [pscustomobject]@{
+        InstalledApps = (New-Object System.Collections.Generic.List[string])
+        FailedApps    = (New-Object System.Collections.Generic.List[string])
+    }
+}
+function Get-UpgradeArguments {
+    if ($script:WingetInvocations.Count -eq 0) { return "" }
+    return (@($script:WingetInvocations[0].Arguments) -join ' ')
+}
+
+Reset-UpgradeState
+$Global:Config.winget.upgradeExistingPackages = $true
+$script:WingetExitCode = 0
+Install-WingetPackages
+Assert-Equal 1 $script:WingetInvocations.Count "An already-installed package must produce exactly one winget call."
+Assert-True ((Get-UpgradeArguments) -match '^upgrade\b') `
+    ("An installed package must be upgraded, not installed again. Arguments: {0}" -f (Get-UpgradeArguments))
+Assert-True ((Get-UpgradeArguments) -notmatch '(^|\s)install(\s|$)') `
+    ("A second 'install' for an installed package is a duplicate install, not an update. Arguments: {0}" -f (Get-UpgradeArguments))
+Assert-True ((Get-UpgradeArguments) -match '7zip\.7zip') "The upgrade must name the package it is upgrading."
+Assert-Equal 1 $Global:RunStats.InstalledApps.Count "An upgraded package must stay accounted for."
+Assert-True ((($script:Notices -join ' | ')) -match 'updated in place') `
+    ("An applied upgrade must be reported distinctly. Notices: {0}" -f ($script:Notices -join ' | '))
+
+# 0x8A15002B is the already-current answer, and it is a different outcome from an applied upgrade.
+Reset-UpgradeState
+$script:WingetExitCode = -1978335189
+Install-WingetPackages
+Assert-Equal 0 $script:Warnings.Count "An already-current package must not warn."
+Assert-True ((($script:Notices -join ' | ')) -match 'already current') `
+    ("An already-current package must be reported as such, not as updated. Notices: {0}" -f ($script:Notices -join ' | '))
+Assert-Equal 1 $Global:RunStats.InstalledApps.Count "An already-current package must stay accounted for."
+
+# LOAD-BEARING: with upgrades switched off the existing installation is left completely alone -
+# no winget call at all, and above all no second install.
+Reset-UpgradeState
+$Global:Config.winget.upgradeExistingPackages = $false
+Install-WingetPackages
+Assert-Equal 0 $script:WingetInvocations.Count `
+    ("With upgrades disabled an installed package must not be touched at all. Arguments: {0}" -f (Get-UpgradeArguments))
+Assert-Equal 1 $Global:RunStats.InstalledApps.Count "A package left alone is still installed and must stay accounted for."
+Assert-Equal 0 $Global:RunStats.FailedApps.Count "Declining to upgrade is not a failure."
+Assert-True (($script:Warnings -join ' | ') -match 'left unchanged') `
+    ("Declining to upgrade must say so. Warnings: {0}" -f ($script:Warnings -join ' | '))
+$Global:Config.winget.upgradeExistingPackages = $true
+
+Write-Host "PASS winget detection: exit-code classification, unpinned source query, registry fallback state, executable resolution order, and an installed package upgraded in place instead of installed twice."

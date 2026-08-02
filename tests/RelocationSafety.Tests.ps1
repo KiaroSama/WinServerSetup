@@ -263,6 +263,49 @@ try {
     Assert-Equal 1 $script:CopyAttempts.Count `
         "A sibling target is a legitimate relocation and must still reach the copy - otherwise the guard has simply disabled relocation."
 
+    # =========================================================================================
+    # Already installed at the configured target: recognise it and do NOT copy again.
+    # =========================================================================================
+    # The skip check compared (Resolve-Path $Global:ProjectRoot) against the RAW config string.
+    # Resolve-Path PRESERVES whatever spelling it was handed - an 8.3 alias stays short - and the
+    # config side was normalised by nothing but TrimEnd('\'), so any spelling of the install
+    # directory other than the exact one in the JSON missed the match. The pre-copy guard below
+    # does not catch it either: it tests nested and drive-root pairs, and an identical pair is
+    # neither. Result: robocopy ran with source and destination naming the same directory.
+    $installedDir = New-TestProjectDirectory (Join-Path $testRoot 'relocate-installed')
+    $installedShort = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($installedDir).ShortPath
+
+    $sameDirSpellings = @(
+        @{ Root = $installedDir; Target = $installedDir.Replace('\', '/'); Why = 'a forward-slash target, which is what writing this path into JSON by hand produces' }
+        @{ Root = $installedDir; Target = (Join-Path $installedDir '..\relocate-installed'); Why = 'a target that round-trips through its own parent' }
+        @{ Root = $installedDir; Target = ($installedDir + ' '); Why = 'a target carrying a trailing space' }
+    )
+    # $PSScriptRoot keeps the 8.3 spelling the script was launched with, so this is the real-world
+    # case: C:\PROGRA~1\... on one side, the long form in the config on the other. Included only
+    # when the volume actually mints aliases, since fsutil 8dot3name can turn that off.
+    if ($installedShort -ne $installedDir) {
+        $sameDirSpellings += @{ Root = $installedShort; Target = $installedDir; Why = 'launched through an 8.3 short path while the config holds the long form' }
+    }
+
+    foreach ($spelling in $sameDirSpellings) {
+        # Both sides must really be DIFFERENT strings naming the SAME directory. Without this the
+        # case silently degrades into "a path equals itself" and proves nothing.
+        Assert-True ([string]$spelling.Root -ne [string]$spelling.Target) `
+            ("Fixture check: the two spellings must differ or this case proves nothing: {0}" -f $spelling.Why)
+        $script:CopyAttempts = New-Object System.Collections.Generic.List[string]
+        $Global:ProjectRoot = [string]$spelling.Root
+        $Global:Config = [pscustomobject]@{
+            selfRelocate      = [pscustomobject]@{ enabled = $true }
+            targetProjectRoot = [string]$spelling.Target
+        }
+        $relocated = $null
+        try { $relocated = Invoke-SelfRelocateIfNeeded } catch { $relocated = "threw: $($_.Exception.Message)" }
+        Assert-Equal 0 $script:CopyAttempts.Count `
+            ("Already running from the configured target, so nothing may be copied: {0}. Attempted: {1}" -f $spelling.Why, ($script:CopyAttempts -join ', '))
+        Assert-Equal $false $relocated `
+            ("Already running from the configured target, so relocation must report 'not needed': {0}" -f $spelling.Why)
+    }
+
     # ---- Retained source greps: cheap smoke checks over the parent/child argument contract,
     #      which is exercised only by a real relocation. ----
     Assert-True ($source -match '\[string\]\$RelocationReadyPath') "Relocated child must receive a readiness-marker path."
