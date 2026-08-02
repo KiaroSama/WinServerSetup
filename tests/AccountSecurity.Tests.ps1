@@ -28,6 +28,11 @@ function Assert-Throws {
 # ---------------------------------------------------------------------------
 Assert-True ($source -match "-500") "Built-in Administrator discovery must use RID 500, not the current name."
 Assert-True ($source -match 'Rename-LocalUser') "Administrator rename must use the local-account API."
+# The whole point of the feature is that the EXISTING administrator is renamed. Creating a new
+# account (or deleting the old one) would leave the machine's real administrator untouched under
+# a name nobody expects, which is the exact defect this file guards against.
+Assert-True ($source -notmatch 'New-LocalUser') "The built-in Administrator must be renamed in place, never re-created."
+Assert-True ($source -notmatch 'Remove-LocalUser') "The built-in Administrator must be renamed in place, never deleted and replaced."
 Assert-True ($source -match 'Write-AccountSecurityBackup') "Account and policy changes need recoverable backups."
 Assert-True ($source -match 'secedit\.exe') "Local lockout policy backup/restore must use locale-independent security policy export/import."
 Assert-True ($source -match 'PartOfDomain') "Domain-joined machines require a warning boundary."
@@ -106,6 +111,7 @@ $script:GroupEnumerationFails = $false
 $script:DomainJoined = $false
 $script:CurrentSid = 'S-1-5-21-11-22-33-1001'
 $script:RenameCalls = New-Object System.Collections.Generic.List[object]
+$script:NewUserCalls = New-Object System.Collections.Generic.List[object]
 $script:RenameFailFor = @()
 $script:SetUserCalls = New-Object System.Collections.Generic.List[object]
 $script:SetUserFails = $false
@@ -165,6 +171,14 @@ function Rename-LocalUser {
     $target = @($script:Accounts | Where-Object { [string]$_.SID -eq [string]$SID })
     if ($target.Count -eq 0) { throw "No local account with SID $SID." }
     $target[0].Name = $NewName
+}
+# Shadowed so a regression that creates an account instead of renaming one is recorded here
+# rather than executed against the machine running the suite. It throws as well as records: an
+# unshadowed New-LocalUser would create a real local account on this host.
+function New-LocalUser {
+    param([string]$Name, [System.Security.SecureString]$Password, [string]$Description, [switch]$NoPassword, $ErrorAction)
+    $script:NewUserCalls.Add([pscustomobject]@{ Name = $Name }) | Out-Null
+    throw "The built-in Administrator must be renamed, not re-created ('$Name')."
 }
 function Set-LocalUser {
     param([string]$SID, [string]$Name, [System.Security.SecureString]$Password, $ErrorAction)
@@ -242,6 +256,7 @@ function Reset-TestState {
     $script:DomainJoined = $false
     $script:CurrentSid = 'S-1-5-21-11-22-33-1001'
     $script:RenameCalls.Clear()
+    $script:NewUserCalls.Clear()
     $script:RenameFailFor = @()
     $script:SetUserCalls.Clear()
     $script:SetUserFails = $false
@@ -256,6 +271,9 @@ function Reset-TestState {
     $script:ProcessExitCode = 0
     $script:ProcessDisposed = $false
     $Global:NoPause = $false
+    # Every block starts from a machine that HAS a configured name, so a block asserting the
+    # "nothing configured" behaviour has to clear it explicitly and cannot pass by accident.
+    $Global:Config.administratorAccount.defaultNewName = 'PromptedAdmin'
     Remove-Item -LiteralPath (Join-Path $testRoot 'backups') -Recurse -Force -ErrorAction SilentlyContinue
 }
 
@@ -322,6 +340,38 @@ try {
     $observable = @($logText, (Get-BackupText), ($script:SeceditCalls -join "`n"), (($script:SetUserCalls | ConvertTo-Json -Depth 4)), (($script:RenameCalls | ConvertTo-Json -Depth 4)), (($result | ConvertTo-Json -Depth 4))) -join "`n"
     Assert-True ($observable -notmatch [regex]::Escape($secretValue)) "The password value must never appear in logs, backups, arguments or results."
     Assert-True ((Get-BackupText) -notmatch '(?i)password') "Recovery records must not even mention a password field."
+
+    # --- the existing account is RENAMED, never replaced by a new one --------
+    # Requirement: "rename exactly the current administrator account, do not create a new user."
+    # A rename must leave the account population unchanged, move the ORIGINAL name off the
+    # machine, and land the new name on the same SID that carried the old one.
+    Reset-TestState
+    Set-InteractiveRename
+    $result = Rename-BuiltinAdministratorAccount -NewName 'ServerAdmin'
+    Assert-Equal 0 $script:NewUserCalls.Count "The administrator must be renamed in place; creating an account is the defect this guards."
+    Assert-Equal 2 (@($script:Accounts)).Count "A rename must not add an account to the machine."
+    Assert-Equal 1 (@($script:Accounts | Where-Object { [string]$_.SID -eq 'S-1-5-21-11-22-33-500' })).Count "The RID-500 account must still be the only one with that SID."
+    Assert-Equal 'ServerAdmin' ([string](@($script:Accounts | Where-Object { [string]$_.SID -eq 'S-1-5-21-11-22-33-500' })[0].Name)) "The SAME RID-500 SID must carry the new name after the rename."
+    Assert-Equal 0 (@($script:Accounts | Where-Object { [string]$_.Name -eq 'Administrator' })).Count "The original name must be gone, not left behind on a second account."
+    Assert-Equal 'S-1-5-21-11-22-33-500' $script:RenameCalls[0].SID "The rename must be issued against the RID-500 SID, never a display name."
+    Assert-Equal $true $result.Verified "A rename of the real RID-500 account must verify."
+
+    # --- the target is the RID-500 SID, not anything that merely ends in -500 -
+    Assert-True (Test-BuiltinAdministratorSid 'S-1-5-21-11-22-33-500') "The machine's RID-500 SID must be recognised as the built-in Administrator."
+    foreach ($notAdmin in @('S-1-5-21-11-22-33-1500', 'S-1-5-21-11-22-33-1000', 'S-1-5-21-11-22-33-501', 'S-1-5-32-544', 'S-1-5-80-1-2-3-4-500', '', 'Administrator')) {
+        Assert-True (-not (Test-BuiltinAdministratorSid $notAdmin)) "A SID that is not the machine's RID-500 account must never be the rename target: '$notAdmin'"
+    }
+
+    # Listed FIRST so a suffix-only match plus Select-Object -First 1 would pick the wrong
+    # principal, and made a group member so it would sail through verification unnoticed.
+    Reset-TestState
+    $script:Accounts = @([pscustomobject]@{ Name = 'Decoy'; SID = 'S-1-5-80-1-2-3-4-500'; Disabled = $false }) + $script:Accounts
+    $script:GroupMembers = @('S-1-5-21-11-22-33-500', 'S-1-5-80-1-2-3-4-500')
+    Set-InteractiveRename
+    $null = Rename-BuiltinAdministratorAccount -NewName 'ServerAdmin'
+    Assert-Equal 'Decoy' ([string]$script:Accounts[0].Name) "A principal whose SID merely ends in -500 must never be the account that gets renamed."
+    Assert-Equal 'ServerAdmin' ([string](@($script:Accounts | Where-Object { [string]$_.SID -eq 'S-1-5-21-11-22-33-500' })[0].Name)) "The machine's RID-500 account must be the one renamed."
+    Assert-Equal 'S-1-5-21-11-22-33-500' $script:RenameCalls[0].SID "The rename must target the RID-500 SID even when another principal sorts ahead of it."
 
     # --- reboot signal when renaming the signed-in account -------------------
     Reset-TestState
@@ -439,10 +489,42 @@ try {
 
     Reset-TestState
     $Global:NoPause = $true
+    $Global:Config.administratorAccount.defaultNewName = ''
     $result = Rename-BuiltinAdministratorAccount
     Assert-Equal $false $result.Changed "Noninteractive mode without a configured name must skip."
     Assert-Equal 0 $script:HostPrompts.Count "Noninteractive mode must not prompt for a name."
     Assert-True (($script:LogLines -join "`n") -match 'Skipped the Administrator rename') "The skipped rename must be reported explicitly."
+
+    # --- noninteractive WITH a configured name falls back to it and says so ---
+    # There is no console to ask, so the configured value is the only remaining source. It must
+    # still be applied - silently skipping would leave a provisioning run half-done - and the
+    # substitution has to be visible in the log rather than looking like an operator decision.
+    Reset-TestState
+    $Global:NoPause = $true
+    $Global:Config.administratorAccount.defaultNewName = 'ConfiguredAdmin'
+    $result = Rename-BuiltinAdministratorAccount
+    Assert-Equal $true $result.Changed "Noninteractive mode must fall back to the configured name instead of skipping the rename."
+    Assert-Equal 'ConfiguredAdmin' $result.NewName "The configured name must be the one applied."
+    Assert-Equal 'ConfiguredAdmin' ([string]$script:Accounts[0].Name) "The RID-500 account must actually carry the configured name."
+    Assert-Equal 0 $script:HostPrompts.Count "The noninteractive fallback must not open a prompt."
+    Assert-Equal 0 $script:SecurePromptCount "The noninteractive fallback must not open a secure prompt."
+    Assert-True (($script:LogLines -join "`n") -match "configured name 'ConfiguredAdmin'") "Falling back to configuration must be logged, not silent."
+
+    # --- full setup ASKS for the name; configuration only supplies the default -
+    # The reported defect: a configured defaultNewName was handed straight to the rename, so a
+    # full setup renamed the administrator without ever asking. The operator's answer must win,
+    # and the prompt must happen even when a name is configured.
+    Reset-TestState
+    $Global:Config.administratorAccount.defaultNewName = 'ConfiguredAdmin'
+    $script:HostAnswers.Enqueue('ChosenByOperator')
+    Set-InteractiveRename
+    Invoke-ConfiguredAccountSecurity
+    Assert-True (($script:HostPrompts -join "`n") -match 'New name for the built-in Administrator account') "Full setup must ASK for the new Administrator name instead of taking it silently from configuration."
+    Assert-Equal 1 $script:RenameCalls.Count "Exactly one rename must be issued."
+    Assert-Equal 'S-1-5-21-11-22-33-500' $script:RenameCalls[0].SID "The rename must target the RID-500 SID."
+    Assert-Equal 'ChosenByOperator' $script:RenameCalls[0].NewName "The operator's answer must be the applied name, not the configured one."
+    Assert-Equal 'ChosenByOperator' ([string]$script:Accounts[0].Name) "The RID-500 account must carry the name the operator typed."
+    Assert-Equal 0 $script:NewUserCalls.Count "Full setup must rename the existing administrator, never create one."
 
     # --- lockout: threshold to 0, duration untouched -------------------------
     Reset-TestState
@@ -552,7 +634,7 @@ try {
     & $realBoundedGpupdate
     Assert-Equal $true $script:ProcessDisposed "A successful gpupdate must still release the process handle."
 
-    Write-Host "PASS RID-500 rename with confirmed hidden password, transactional rollback, leak-free logging, preserved lockout duration and bounded pre-verification policy refresh."
+    Write-Host "PASS RID-500 rename-never-create with an operator-chosen name, confirmed hidden password, transactional rollback, leak-free logging, preserved lockout duration and bounded pre-verification policy refresh."
 } finally {
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
