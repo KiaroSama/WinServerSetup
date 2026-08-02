@@ -529,14 +529,31 @@ function Write-BlockerState {
 }
 
 function Get-NewFailedLogonEvents {
-    # H-04: MaxEvents is the outermost bound. Lookback alone does not limit anything during a
-    # flood - a minute of it can hold hundreds of thousands of 4625 records - so every query
-    # here is bounded by count as well as by time.
+    <#
+        H-04: MaxEvents is the outermost bound. Lookback alone does not limit anything during a
+        flood - a minute of it can hold hundreds of thousands of 4625 records - so every query
+        here is bounded by count as well as by time.
+
+        FU-03: and every bounded query is read OLDEST-FIRST. Get-WinEvent returns newest records
+        first by default, so -MaxEvents used to cap the NEWEST slice: during a backlog larger
+        than the cap this run received records from the far end of the log while the caller
+        bookmarked the maximum RecordId it had seen, and everything between the previous bookmark
+        and that slice was never read by any run, ever. Oldest-first makes the returned batch
+        start where the bookmark stopped, so the cap becomes "read this much of the backlog now,
+        the rest next run" instead of "skip the backlog".
+
+        Verified on Windows PowerShell 5.1 and PowerShell 7: -Oldest is honoured in both the
+        -FilterXPath (GetLogSet) and -FilterHashtable (HashQuerySet) shapes used here, and the
+        default really is newest-first. The caller does not trust that on its own - it re-sorts
+        ascending and refuses to advance the bookmark across a truncated batch that came back
+        newest-first anyway.
+    #>
     param([long]$LastRecordId, [int]$LookbackMinutes, [int]$MaxEvents = 20000)
 
     if ($LastRecordId -gt 0) {
         # @() must wrap the call, not the return: Windows PowerShell 5.1 unwraps a
         # single-element array on output, and a bare scalar has no .Count there.
+        # No -Oldest here on purpose: this probe wants the NEWEST record, to detect a log reset.
         $latest = @(Invoke-SecurityLogQuery @{ LogName = 'Security'; MaxEvents = 1 })
         if ($latest.Count -gt 0 -and [long]$latest[0].RecordId -ge $LastRecordId) {
             # -FilterXPath takes raw XPath, not XML-escaped text: '&gt;' is rejected as an
@@ -545,6 +562,7 @@ function Get-NewFailedLogonEvents {
                 LogName     = 'Security'
                 FilterXPath = "*[System[(EventID=4625) and (EventRecordID > $LastRecordId)]]"
                 MaxEvents   = $MaxEvents
+                Oldest      = $true
             }
         }
         Write-LogLine "Security event log was cleared or reset; rebuilding the rolling window." "WARNING"
@@ -552,6 +570,7 @@ function Get-NewFailedLogonEvents {
     return Invoke-SecurityLogQuery @{
         FilterHashtable = @{ LogName = 'Security'; Id = 4625; StartTime = (Get-Date).AddMinutes(-$LookbackMinutes) }
         MaxEvents       = $MaxEvents
+        Oldest          = $true
     }
 }
 
@@ -564,6 +583,59 @@ function Format-RdpOffenderSummary {
     # These are authentication failures, not a confirmed denial-of-service; the wording stays
     # factual so reports do not overstate what the evidence shows.
     return "{0} failed login attempts; logon types: {1}; evidence: {2}; targeted users: {3}" -f $Offender.Count, $types, $evidence, $users
+}
+
+function Get-VerifiedRdpPort {
+    <#
+        FU-02: the ONE port a managed block rule may be written against.
+
+        Every rule used to be scoped to $Config.rdp.newPort. That is only the port this tool
+        WANTS RDP on. With rdp.enabled=false the tool does not own the port at all, so
+        installation deliberately accepts whatever the registry and the live listener agree on -
+        and the blocker then went on filtering rdp.newPort, publishing block rules for a port
+        nothing listens on while the real RDP port stayed open to the same attacker.
+
+        So the port is resolved from the machine on every run: the RDP-Tcp registry value, then
+        proof that TermService itself owns that listener. Anything less is a guess, and a guess
+        here produces a security control that looks healthy and filters nothing - which is why
+        every failure below throws rather than falling back to the configured port.
+
+        Deliberately self-contained: the blocker runs as a standalone scheduled task in its own
+        process and cannot dot-source scripts\Rdp.ps1, the same reason the other standalone
+        scripts in this repository carry their own copies of small helpers.
+    #>
+    param([string]$RegistryPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp')
+
+    $port = 0
+    try {
+        $port = [int](Get-ItemProperty -Path $RegistryPath -Name 'PortNumber' -ErrorAction Stop).PortNumber
+    } catch {
+        throw ("The live RDP port could not be read from {0}\PortNumber: {1}" -f $RegistryPath, $_.Exception.Message)
+    }
+    if ($port -lt 1 -or $port -gt 65535) {
+        throw ("The RDP-Tcp registry PortNumber is {0}, which is outside 1-65535." -f $port)
+    }
+
+    # @() at the call site: Windows PowerShell 5.1 unwraps a single-element result, and a bare
+    # scalar has no .Count there.
+    $service = @()
+    try { $service = @(Get-CimInstance -ClassName Win32_Service -Filter "Name='TermService'" -ErrorAction Stop) }
+    catch { throw ("TermService could not be queried to verify the RDP listener: {0}" -f $_.Exception.Message) }
+    if ($service.Count -eq 0) { throw "TermService is not installed on this host, so no RDP listener can be verified." }
+    $servicePid = [int]$service[0].ProcessId
+    if ($servicePid -le 0) {
+        throw ("TermService is not running, so nothing owns the RDP listener on TCP {0}." -f $port)
+    }
+
+    $owned = @()
+    # Get-NetTCPConnection raises an error when no socket matches, which is one of the
+    # disagreements this has to report - not an exception to leak as-is.
+    try { $owned = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop | Where-Object { [int]$_.OwningProcess -eq $servicePid }) }
+    catch { $owned = @() }
+    if ($owned.Count -eq 0) {
+        throw ("TermService (PID {0}) does not own a listener on TCP {1}; refusing to write firewall rules for an unverified RDP port." -f $servicePid, $port)
+    }
+    return $port
 }
 
 function Test-ManagedRuleOwned {
@@ -627,9 +699,18 @@ function New-ManagedBlockRule {
 }
 
 function Ensure-ManagedBlockRule {
-    # Returns $true only when a NEW managed rule was created, so the caller can hold the total
-    # against maxManagedRules without re-enumerating the firewall for every offender.
-    param([string]$IpAddress, [string]$RulePrefix, [int]$RdpPort, [bool]$BlockAllInbound, $Offender)
+    <#
+        Returns $true only when a NEW managed rule was created, so the caller can hold the total
+        against maxManagedRules without re-enumerating the firewall for every offender.
+
+        FU-05: -AllowNewRule is what maxManagedRules actually governs. The cap used to be tested
+        by the caller BEFORE this function ran, and hitting it broke out of the offender loop
+        entirely - so from the moment the rule count reached the cap, no existing owned rule was
+        ever validated or repaired again. Flipping blockAllInbound then left every rule pinned to
+        its old shape permanently. The budget only limits how many ADDRESSES may be blocked;
+        reconciling a rule that already exists costs no budget at all.
+    #>
+    param([string]$IpAddress, [string]$RulePrefix, [int]$RdpPort, [bool]$BlockAllInbound, $Offender, [bool]$AllowNewRule = $true)
     $displayName = "$RulePrefix $IpAddress"
     $existing = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue)
 
@@ -645,6 +726,8 @@ function Ensure-ManagedBlockRule {
         Write-LogLine "Already protected: $IpAddress ($(Format-RdpOffenderSummary $Offender))."
         return $false
     }
+
+    if ($existing.Count -eq 0 -and -not $AllowNewRule) { return $false }
 
     $temporaryName = "$displayName replacement-$([guid]::NewGuid().ToString('N'))"
     if ($existing.Count -gt 0) {
@@ -678,11 +761,66 @@ function Remove-ExpiredManagedRules {
     }
 }
 
+function Start-BlockerDeadlineGuard {
+    <#
+        FU-04: maxRunSeconds was only ever compared BETWEEN synchronous calls, so one blocking
+        event-log or firewall call could overrun the budget without any bound at all. The only
+        thing that eventually stopped such a run was the scheduled task's ExecutionTimeLimit -
+        and with MultipleInstances=IgnoreNew every trigger until then was suppressed, so the
+        control was silently off for minutes while still looking registered and healthy.
+
+        The guard is a watchdog on its own runspace, so it is not blocked by whatever the main
+        thread is waiting inside. It waits on the completion signal for exactly the budget; if
+        the run has not finished by then it records the deadline where an operator - and a test -
+        can see it, and ends the process.
+
+        Ending the process is only correct when the process exists SOLELY for this run, which is
+        why the caller arms this from the scheduled-task entry point and never when the script is
+        dot-sourced into a session that owns other work.
+    #>
+    param(
+        [Parameter(Mandatory)][double]$Seconds,
+        [Parameter(Mandatory)][string]$MarkerPath
+    )
+    # Self-cleaning: the marker means "the most recent armed run was killed", so a stale one from
+    # an earlier kill must not be mistaken for this run's outcome.
+    Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
+
+    $signal = New-Object System.Threading.ManualResetEventSlim($false)
+    $worker = [powershell]::Create()
+    # Deliberately self-contained: the script text is re-parsed in the watchdog's own runspace,
+    # so it may only use .NET types and the arguments it is handed.
+    $null = $worker.AddScript({
+            param($Completed, $WaitMilliseconds, $Path, $Budget)
+            if ($Completed.Wait([int]$WaitMilliseconds)) { return }
+            $line = "[{0}] [CRITICAL] [RDP-BLOCKER] The run exceeded maxRunSeconds ({1}s) inside a blocking call and was ended by the deadline guard." -f `
+            ((Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")), $Budget
+            try { [System.IO.File]::WriteAllText($Path, $line) } catch { $null = $_ }
+            [Environment]::Exit(0)
+        }).AddArgument($signal).AddArgument([int][math]::Max(1, [math]::Round($Seconds * 1000))).AddArgument($MarkerPath).AddArgument($Seconds)
+    return [pscustomobject]@{ Signal = $signal; Worker = $worker; Handle = $worker.BeginInvoke() }
+}
+
+function Stop-BlockerDeadlineGuard {
+    # FU-04: releasing the watchdog is unconditional cleanup, so nothing here may throw and no
+    # runspace, thread or wait handle may outlive the run that armed it.
+    param($Guard)
+    if ($null -eq $Guard) { return }
+    try { $Guard.Signal.Set() } catch { $null = $_ }
+    try { $null = $Guard.Worker.EndInvoke($Guard.Handle) } catch { $null = $_ }
+    try { $Guard.Worker.Dispose() } catch { $null = $_ }
+    try { $Guard.Signal.Dispose() } catch { $null = $_ }
+}
+
 function Invoke-RdpBruteforceBlocker {
-    param([string]$ResolvedConfigPath = "")
+    # -EnforceHardDeadline arms the watchdog that ends the PROCESS at maxRunSeconds (FU-04). The
+    # scheduled-task entry point passes it because that process exists only for this run; a
+    # dot-sourced session keeps the between-call budget alone.
+    param([string]$ResolvedConfigPath = "", [switch]$EnforceHardDeadline)
 
     $mutex = $null
     $mutexAcquired = $false
+    $deadlineGuard = $null
     try {
         $projectRoot = Resolve-ProjectRoot
         if ([string]::IsNullOrWhiteSpace($ResolvedConfigPath)) { $ResolvedConfigPath = Join-Path $projectRoot "WinServerSetup.config.json" }
@@ -709,6 +847,18 @@ function Invoke-RdpBruteforceBlocker {
 
         $statePath = [string]$settings.statePath
         if ([string]::IsNullOrWhiteSpace($statePath)) { $statePath = Join-Path $projectRoot "state\rdp-blocker-state.json" }
+
+        # FU-04: armed before the first call that can block - which includes the port
+        # verification below, since a CIM or socket query can hang just as an event-log read can.
+        if ($EnforceHardDeadline) {
+            $deadlineGuard = Start-BlockerDeadlineGuard -Seconds ([double]$limits['maxRunSeconds']) -MarkerPath ("{0}.deadline" -f $statePath)
+        }
+
+        # FU-02: resolve the port the machine is ACTUALLY serving RDP on before a single event is
+        # read, so a disagreement costs nothing and advances nothing. Throwing lands in the catch
+        # below, which logs the reason and returns 1 - fail closed, because a block rule on the
+        # wrong port is worse than no rule: it looks like protection and provides none.
+        $rdpPort = Get-VerifiedRdpPort
 
         # H-04: every cap that is hit is recorded here as well as logged, so a scheduled run
         # that had to truncate is detectable afterwards instead of looking like a clean run.
@@ -761,10 +911,26 @@ function Invoke-RdpBruteforceBlocker {
             }
         }
 
+        # FU-03: the bookmark may only ever advance across records this run actually READ, so the
+        # batch is walked oldest-first and $processedRecordId is simply the last record handled.
+        # Sorting here rather than trusting the provider keeps that true even if the query came
+        # back in some other order, and it is what makes the deadline break below leave a
+        # CONTIGUOUS bookmark instead of the maximum RecordId of a half-processed batch.
+        $ordered = @($newEvents | Sort-Object -Property RecordId)
+        if ($caps.EventsTruncated -and $ordered.Count -gt 1 -and
+            [long]$newEvents[0].RecordId -gt [long]$newEvents[$newEvents.Count - 1].RecordId) {
+            # A truncated batch that arrived newest-first means -Oldest was not honoured, so the
+            # records between the bookmark and this slice were never read. Processing it would
+            # either skip them for good or double-count these on the next run, so the run declines
+            # the batch entirely and leaves the bookmark where it is.
+            Write-LogLine ("The Security log returned a truncated newest-first batch, so the records between RecordId {0} and {1} were not read; skipping this batch rather than stepping the bookmark over them." -f $state.LastRecordId, $ordered[0].RecordId) "WARNING"
+            $ordered = @()
+        }
+
         $whitelistHits = @{}
         $processedRecordId = [long]$state.LastRecordId
         $processed = 0
-        foreach ($securityEvent in $newEvents) {
+        foreach ($securityEvent in $ordered) {
             $processed++
             # Checked in blocks rather than per event: the check itself must not become the cost.
             if (($processed % 500) -eq 0 -and $runtime.Elapsed.TotalSeconds -ge $maxRunSeconds) {
@@ -869,12 +1035,16 @@ function Invoke-RdpBruteforceBlocker {
                     Write-LogLine ("Stopped applying firewall rules at the maxRunSeconds budget ({0}s); the remaining offenders carry over to the next run." -f $maxRunSeconds) "WARNING"
                     break
                 }
-                if ($managedRuleCount -ge [int]$limits['maxManagedRules']) {
+                # FU-05: the cap gates only the creation of a rule for a NEW address. Every
+                # offender is still handed to Ensure-ManagedBlockRule, because an EXISTING owned
+                # rule must go on being validated and repaired at a full cap - that is the one
+                # place a blockAllInbound flip is ever reconciled.
+                $allowNewRule = ($managedRuleCount -lt [int]$limits['maxManagedRules'])
+                if (-not $allowNewRule -and -not $caps.RulesCapped) {
                     $caps.RulesCapped = $true
-                    Write-LogLine ("Managed firewall rules have reached maxManagedRules ({0}); no further rules are created this run. Existing blocks stay in force - raise the cap or shorten ruleRetentionDays." -f $limits['maxManagedRules']) "WARNING"
-                    break
+                    Write-LogLine ("Managed firewall rules have reached maxManagedRules ({0}); no rule is created for a new address this run, though existing managed rules are still validated and repaired. Raise the cap or shorten ruleRetentionDays." -f $limits['maxManagedRules']) "WARNING"
                 }
-                if (Ensure-ManagedBlockRule $offender.IpAddress ([string]$settings.rulePrefix) ([int]$config.rdp.newPort) ([bool]$settings.blockAllInbound) $offender) {
+                if (Ensure-ManagedBlockRule $offender.IpAddress ([string]$settings.rulePrefix) $rdpPort ([bool]$settings.blockAllInbound) $offender $allowNewRule) {
                     $managedRuleCount++
                 }
             }
@@ -890,11 +1060,12 @@ function Invoke-RdpBruteforceBlocker {
         Write-LogLine "Error: $($_.Exception.Message); stack=$($_.ScriptStackTrace)" "ERROR"
         return 1
     } finally {
+        Stop-BlockerDeadlineGuard $deadlineGuard
         if ($mutexAcquired -and $null -ne $mutex) { $mutex.ReleaseMutex() }
         if ($null -ne $mutex) { $mutex.Dispose() }
     }
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    exit (Invoke-RdpBruteforceBlocker -ResolvedConfigPath $ConfigPath)
+    exit (Invoke-RdpBruteforceBlocker -ResolvedConfigPath $ConfigPath -EnforceHardDeadline)
 }

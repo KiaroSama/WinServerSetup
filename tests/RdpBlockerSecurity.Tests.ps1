@@ -53,6 +53,9 @@ $script:FirewallRules = New-Object System.Collections.Generic.List[object]
 $script:NewRuleCalls = New-Object System.Collections.Generic.List[object]
 $script:LogLines = New-Object System.Collections.Generic.List[string]
 $script:TcpConnectionCalls = 0
+$script:RegistryPort = 5801
+$script:TermServicePid = 4321
+$script:ListenerOwnerByPort = @{ 5801 = 4321 }
 
 function Read-JsonFile { param([string]$Path) return $script:Config }
 function Write-LogLine {
@@ -60,8 +63,35 @@ function Write-LogLine {
     $script:LogLines.Add("[$Level] $Message") | Out-Null
 }
 function Get-NetTCPConnection {
-    $script:TcpConnectionCalls++
-    throw "Get-NetTCPConnection must not be called by the blocker."
+    <#
+        The blocker may consult TCP sockets for exactly ONE thing: proving that TermService owns
+        the live RDP listener before a rule is written against that port (FU-02). Using
+        established sessions as offender evidence stays forbidden - that is what let a connected
+        attacker bypass the blocker - so any call that is not the bounded listener probe is
+        counted and rejected.
+    #>
+    param($State, $LocalPort, $OwningProcess, $ErrorAction)
+    if ([string]$State -ne 'Listen' -or -not $LocalPort) {
+        $script:TcpConnectionCalls++
+        throw "Established TCP sessions must not be consulted by the blocker."
+    }
+    if (-not $script:ListenerOwnerByPort.ContainsKey([int]$LocalPort)) {
+        throw "No MSFT_NetTCPConnection objects found with property 'LocalPort' equal to '$LocalPort'."
+    }
+    return @([pscustomobject]@{
+            LocalPort = [int]$LocalPort; State = 'Listen'
+            OwningProcess = [int]$script:ListenerOwnerByPort[[int]$LocalPort]
+        })
+}
+# FU-02: the machine's own view of the RDP port. The blocker verifies these on every run and
+# scopes its rules to the result, so the fixtures agree with the port the cases assert on.
+function Get-ItemProperty {
+    param([string]$Path, [string]$Name, $ErrorAction)
+    return [pscustomobject]@{ PortNumber = $script:RegistryPort }
+}
+function Get-CimInstance {
+    param([string]$ClassName, [string]$Filter, $ErrorAction)
+    return [pscustomobject]@{ Name = 'TermService'; ProcessId = $script:TermServicePid }
 }
 function New-TestRdpEvent {
     param([long]$RecordId, [string]$IpAddress)
@@ -79,7 +109,9 @@ function New-TestRdpEvent {
 }
 
 function Get-WinEvent {
-    param($FilterHashtable, $LogName, $FilterXPath, $MaxEvents, $ErrorAction)
+    # -Oldest is part of the real signature and the blocker now passes it on every Security read
+    # (FU-03), so the mock has to bind it for parameter binding to match production.
+    param($FilterHashtable, $LogName, $FilterXPath, $MaxEvents, [switch]$Oldest, $ErrorAction)
     # The RdpCoreTS channel is a separate log from Security; return only what was seeded for it.
     $channel = if ($FilterHashtable) { [string]$FilterHashtable.LogName } else { [string]$LogName }
     if ($channel -like '*RdpCoreTS*') { return @($script:RdpEvents) }
@@ -186,6 +218,9 @@ function Reset-TestState {
     $script:NewRuleCalls.Clear()
     $script:LogLines.Clear()
     $script:TcpConnectionCalls = 0
+    $script:RegistryPort = 5801
+    $script:TermServicePid = 4321
+    $script:ListenerOwnerByPort = @{ 5801 = 4321 }
     Remove-Item -LiteralPath (Join-Path $testRoot "state.json") -Force -ErrorAction SilentlyContinue
 }
 

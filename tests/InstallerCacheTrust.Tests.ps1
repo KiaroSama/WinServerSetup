@@ -186,5 +186,32 @@ try {
 
     Write-Host "PASS H-01 installer cache trust: unsigned executables rejected without a trust anchor, unapproved signers rejected, user-writable cache roots detected, hardening verified, reparse points refused fail-closed, and artifact replacement detectable."
 } finally {
+    # H-01.5 hardens its directory down to SYSTEM and Administrators, so a non-elevated run keeps
+    # no right on it at all and Remove-Item cannot even enumerate it - which aborts the whole
+    # sandbox cleanup and strands %TEMP%\WinServerSetup-H01-<guid>. The parent's DELETE_CHILD is
+    # no help: with zero rights the open of the child is denied before that right is consulted
+    # (which is why the same idiom does work in RdpBlockerTaskContract.Tests.ps1, whose hardening
+    # leaves BUILTIN\Users read+execute). What does work at either privilege level is that this
+    # process still OWNS the directory, and an owner implicitly holds WRITE_DAC. Set-Acl cannot
+    # spend it - it round-trips the SACL and fails without SeSecurityPrivilege - but persisting a
+    # freshly built DirectorySecurity writes the DACL section alone. 5.1 exposes that as
+    # DirectoryInfo.SetAccessControl; 7 moved it to an extension type.
+    $hardenedCache = Join-Path $testRoot 'hardened-cache'
+    if ([System.IO.Directory]::Exists($hardenedCache)) {
+        try {
+            $reopened = New-Object System.Security.AccessControl.DirectorySecurity
+            $reopened.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+                        [System.Security.AccessControl.FileSystemRights]::FullControl,
+                        [System.Security.AccessControl.InheritanceFlags]::None,
+                        [System.Security.AccessControl.PropagationFlags]::None,
+                        [System.Security.AccessControl.AccessControlType]::Allow)))
+            $hardenedInfo = New-Object System.IO.DirectoryInfo($hardenedCache)
+            if ($hardenedInfo.PSObject.Methods['SetAccessControl']) { $hardenedInfo.SetAccessControl($reopened) }
+            else { [System.IO.FileSystemAclExtensions]::SetAccessControl($hardenedInfo, $reopened) }
+        } catch {
+            Write-Host "NOTE: could not reopen $hardenedCache for cleanup: $($_.Exception.Message)"
+        }
+    }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
