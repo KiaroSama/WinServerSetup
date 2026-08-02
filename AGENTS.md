@@ -76,9 +76,10 @@ The runner's summary line reports both a suite count and a failure count
 (`HOST=...  SUITES=n  FAILED=0`). Gate on `FAILED=0`; the suite count grows as suites
 are added, so do not treat any particular number as the pass condition.
 
-Shared assertions live in `tests\_Common.ps1` — `Assert-True`, `Assert-Equal` and
-`Import-FunctionUnderTest`. Dot-source it **after** `$projectRoot` (and `$mainScript`,
-where the suite takes a `-MainScript` override) and **before** the first assertion:
+Shared test helpers live in `tests\_Common.ps1` — `Assert-True`, `Assert-Equal`,
+`Get-SetupSourceFile`, `Get-SetupAst` and `Import-FunctionUnderTest`. Dot-source it
+**after** `$projectRoot` (and `$mainScript`, where the suite takes a `-MainScript`
+override) and **before** the first assertion:
 
 ```powershell
 . (Join-Path $PSScriptRoot '_Common.ps1')
@@ -91,6 +92,20 @@ one. `Import-FunctionUnderTest` takes the parsed ASTs as a second argument —
 `$setupAsts` implicitly; reaching across the file boundary works at runtime but is
 invisible to PSScriptAnalyzer, which then flags each suite's own `$setupAsts` as
 assigned-and-never-used.
+
+A suite that lifts functions out of the setup partition loads it in two lines. Wrap
+both in `@()` — PowerShell enumerates a collection on return, so a tree reduced to one
+file would otherwise hand back a bare string:
+
+```powershell
+$setupSourceFiles = @(Get-SetupSourceFile -ProjectRoot $projectRoot -MainScript $mainScript)
+$setupAsts = @(Get-SetupAst -Files $setupSourceFiles -Because 'its download path can be tested')
+```
+
+`Get-SetupSourceFile` returns paths rather than ASTs because several suites also join
+the raw text for retained source assertions. `-Because` completes the sentence
+"`<file>` must parse before …", which is what a suite reports if the partition itself
+fails to parse.
 
 ## PowerShell 5.1 traps
 
