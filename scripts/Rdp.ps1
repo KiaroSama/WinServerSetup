@@ -653,6 +653,38 @@ function Copy-TaskTargetToStaging {
     return (ConvertTo-CanonicalPath $destination)
 }
 
+function Resolve-StagedBlockerStatePath {
+    <#
+        The one place the staged task's state path is decided, resolved to an absolute canonical
+        path at registration time.
+
+        A configured rdpBruteforceBlocker.statePath is honoured as-is when it is already rooted.
+        An empty or relative one resolves against the STAGING root's parent - the directory the
+        staged blocker will itself compute as its project root - so the path recorded here is the
+        path the task actually writes.
+    #>
+    param([Parameter(Mandatory)][string]$StagingRoot)
+
+    $configured = ''
+    if ($Global:Config -and $Global:Config.rdpBruteforceBlocker) {
+        $configured = [string]$Global:Config.rdpBruteforceBlocker.statePath
+    }
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        if (-not [System.IO.Path]::IsPathRooted($configured)) {
+            throw "rdpBruteforceBlocker.statePath must be an absolute path when set; got '$configured'."
+        }
+        return (ConvertTo-CanonicalPath $configured)
+    }
+
+    # Staging root is <...>\WinServerSetup\tasks; the staged blocker's Resolve-ProjectRoot returns
+    # its parent, so that is where its default state directory lives.
+    $stagedProjectRoot = Split-Path -Parent (ConvertTo-CanonicalPath $StagingRoot)
+    if ([string]::IsNullOrWhiteSpace($stagedProjectRoot)) {
+        throw "Could not derive the staged project root from staging root '$StagingRoot'."
+    }
+    return (ConvertTo-CanonicalPath (Join-Path $stagedProjectRoot 'state\rdp-blocker-state.json'))
+}
+
 function Save-StagedTaskConfig {
     <#
         Writes the EFFECTIVE blocker configuration next to the staged script.
@@ -672,9 +704,26 @@ function Save-StagedTaskConfig {
         [Parameter(Mandatory)][string]$FileName
     )
     $destination = Join-Path $StagingRoot $FileName
+
+    # The staged blocker derives its own default state path from where IT lives, not from the
+    # checkout: Resolve-ProjectRoot returns the parent of scripts\, which for a staged copy is
+    # %ProgramData%\WinServerSetup. An empty statePath therefore meant the task wrote its state
+    # and its deadline marker under %ProgramData%, while anything reasoning from
+    # $Global:ProjectRoot looked under the checkout - two different files, and a health check that
+    # could report healthy while a real deadline marker still stood.
+    #
+    # Resolving it to an ABSOLUTE path here removes the ambiguity for good: the staged config
+    # states exactly one location, and every consumer reads that instead of recomputing a default
+    # from whichever root it happens to know about. -Force so this both overwrites an existing
+    # statePath and adds one when the source config omits it - the omitted case being precisely
+    # the default that produced the mismatch.
+    $blockerSettings = $Global:Config.rdpBruteforceBlocker | Select-Object -Property *
+    $blockerSettings | Add-Member -NotePropertyName 'statePath' `
+        -NotePropertyValue (Resolve-StagedBlockerStatePath -StagingRoot $StagingRoot) -Force
+
     $effective = [pscustomobject]@{
         rdp                  = $Global:Config.rdp
-        rdpBruteforceBlocker = $Global:Config.rdpBruteforceBlocker
+        rdpBruteforceBlocker = $blockerSettings
     }
     Set-Content -LiteralPath $destination -Value ($effective | ConvertTo-Json -Depth 10) -Encoding UTF8
     return (ConvertTo-CanonicalPath $destination)
@@ -684,19 +733,29 @@ function Get-BlockerDeadlineMarkerPath {
     <#
         FU-04: where the blocker's deadline guard records that a run was killed mid-pass.
 
-        It has to derive the same path the blocker itself uses, from the same two sources in the
-        same order: rdpBruteforceBlocker.statePath when set, otherwise the project default. Any
-        drift between the two would make the health check watch a file nobody writes, which reads
-        as healthy for the wrong reason.
+        Read from the trust manifest recorded at registration, NOT recomputed here. Recomputing
+        was the defect: the health check runs from the checkout, so an empty statePath resolved
+        against $Global:ProjectRoot, while the STAGED task resolves against
+        %ProgramData%\WinServerSetup. Two different files - and a health check watching a file
+        nobody writes reports healthy while a real deadline marker still stands.
+
+        Returns '' when no manifest exists or the recorded path fails validation. The caller
+        already treats a missing manifest as unverifiable and fails the contract, so an empty
+        result here never silently means "healthy".
     #>
-    $statePath = ''
-    if ($Global:Config -and $Global:Config.rdpBruteforceBlocker) {
-        $statePath = [string]$Global:Config.rdpBruteforceBlocker.statePath
-    }
-    if ([string]::IsNullOrWhiteSpace($statePath)) {
-        if ([string]::IsNullOrWhiteSpace($Global:ProjectRoot)) { return '' }
-        $statePath = Join-Path $Global:ProjectRoot 'state\rdp-blocker-state.json'
-    }
+    param([Parameter(Mandatory)][string]$TaskName)
+
+    $manifest = Get-TaskTrustManifest -TaskName $TaskName
+    if ($null -eq $manifest) { return '' }
+
+    $statePath = [string]$manifest.StatePath
+    if ([string]::IsNullOrWhiteSpace($statePath)) { return '' }
+
+    # A manifest is only as good as what it says. A relative or non-canonical path would make
+    # this watch something other than the recorded contract, so it is rejected rather than used.
+    if (-not [System.IO.Path]::IsPathRooted($statePath)) { return '' }
+    if ($statePath -ne (ConvertTo-CanonicalPath $statePath)) { return '' }
+
     return ("{0}.deadline" -f $statePath)
 }
 
@@ -891,7 +950,18 @@ function Test-RdpBlockerTaskHealth {
     # LastTaskResult only carries the exit code - and the marker outlives the run, so it is the
     # durable evidence that this control stopped mid-pass. Only a later run that completes
     # successfully removes it.
-    $markerPath = Get-BlockerDeadlineMarkerPath
+    # The recorded path must also agree with the staged config this task was registered against;
+    # a manifest naming a state file outside the staged tree is not describing this task.
+    $markerPath = Get-BlockerDeadlineMarkerPath -TaskName $TaskName
+    if ([string]::IsNullOrWhiteSpace($markerPath)) {
+        $reasons.Add("the trust manifest records no usable absolute state path, so a deadline kill could not be detected") | Out-Null
+    } elseif (-not [string]::IsNullOrWhiteSpace([string]$manifest.ConfigPath)) {
+        $stagedRoot = Split-Path -Parent (Split-Path -Parent ([string]$manifest.ConfigPath))
+        $stateRoot = Split-Path -Parent (Split-Path -Parent $markerPath)
+        if (-not [string]::Equals($stagedRoot, $stateRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $reasons.Add(("the recorded state path {0} does not sit under the staged task tree {1}" -f $markerPath, $stagedRoot)) | Out-Null
+        }
+    }
     if (-not [string]::IsNullOrWhiteSpace($markerPath) -and (Test-Path -LiteralPath $markerPath)) {
         $detail = ''
         try { $detail = (Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop).Trim() } catch { $detail = '<marker unreadable>' }
@@ -928,6 +998,9 @@ function Install-RdpBruteforceBlocker {
     $stagingRoot = Get-TaskStagingRoot
     $scriptPath = Copy-TaskTargetToStaging -StagingRoot $stagingRoot -SourcePath $sourceScript
     $configPath = Save-StagedTaskConfig -StagingRoot $stagingRoot -FileName 'Block-RdpBruteforce.config.json'
+    # FU-04: resolved AFTER staging, from the staging root, so it names the file the staged task
+    # actually writes rather than a default recomputed from the checkout.
+    $stagedStatePath = Resolve-StagedBlockerStatePath -StagingRoot $stagingRoot
     # H-02 / FU-01: every path this SYSTEM task executes or reads. Each one is re-validated for
     # reparse points, a non-administrative writer, a trusted OWNER and no replace-capable
     # principal on any parent - independently of the hardening that just ran.
@@ -958,6 +1031,10 @@ function Install-RdpBruteforceBlocker {
             ScriptPath                = $scriptPath
             ConfigPath                = $configPath
             ScriptSha256              = (Get-Sha256Hex -Path $scriptPath)
+            # FU-04: the absolute state path the STAGED task writes. Recorded rather than
+            # recomputed later, because the health check runs from the checkout and would
+            # otherwise derive a different default and watch a file nobody writes.
+            StatePath                 = $stagedStatePath
             IntervalMinutes           = $interval
             ExecutionTimeLimitMinutes = $limitMinutes
             RdpPort                   = $rdpPort
